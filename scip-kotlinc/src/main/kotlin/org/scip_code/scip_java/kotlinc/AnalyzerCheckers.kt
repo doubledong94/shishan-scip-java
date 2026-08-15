@@ -31,10 +31,12 @@ import org.jetbrains.kotlin.fir.types.FirTypeRef
 import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.name.ClassId
 import org.jetbrains.kotlin.name.FqName
+import org.scip_code.scip_java.shared.ExternalSymbolsCache
 
 open class AnalyzerCheckers(session: FirSession) : FirAdditionalCheckersExtension(session) {
     companion object {
         val visitors: MutableMap<KtSourceFile, ScipVisitor> = mutableMapOf()
+        val externalSymbols = ExternalSymbolsCache()
 
         private fun getIdentifier(element: KtSourceElement): KtSourceElement =
             element.treeStructure
@@ -99,7 +101,7 @@ open class AnalyzerCheckers(session: FirSession) : FirAdditionalCheckersExtensio
         override fun check(declaration: FirFile) {
             val ktFile = declaration.sourceFile ?: return
             val lineMap = LineMap(declaration)
-            val visitor = ScipVisitor(sourceroot, ktFile, lineMap, globals)
+            val visitor = ScipVisitor(sourceroot, ktFile, lineMap, globals, externals = externalSymbols)
             visitors[ktFile] = visitor
         }
     }

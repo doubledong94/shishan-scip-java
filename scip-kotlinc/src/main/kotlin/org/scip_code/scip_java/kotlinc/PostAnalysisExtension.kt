@@ -14,6 +14,7 @@ import org.jetbrains.kotlin.config.CommonConfigurationKeys
 import org.jetbrains.kotlin.config.CompilerConfiguration
 import org.jetbrains.kotlin.ir.declarations.IrModuleFragment
 import org.scip_code.scip.Document
+import org.scip_code.scip.Index
 import org.scip_code.scip_java.shared.ScipShardPaths
 import org.scip_code.scip_java.shared.ScipShardWriter
 
@@ -36,7 +37,11 @@ class PostAnalysisExtension(
                 try {
                     val document = visitor.build()
                     scipShardPathForFile(ktSourceFile)?.let { outPath ->
-                        ScipShardWriter.writeShard(outPath, document)
+                        ScipShardWriter.writeShard(
+                            outPath,
+                            document,
+                            AnalyzerCheckers.externalSymbols.symbols(),
+                        )
                     }
                     callback(document)
                 } catch (e: Exception) {
@@ -47,6 +52,7 @@ class PostAnalysisExtension(
             handleException(e)
         }
         AnalyzerCheckers.visitors.clear()
+        AnalyzerCheckers.externalSymbols.clear()
     }
 
     private fun scipShardPathForFile(file: KtSourceFile): Path? {

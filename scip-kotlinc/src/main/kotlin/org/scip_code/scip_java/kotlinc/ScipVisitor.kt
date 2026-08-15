@@ -11,6 +11,7 @@ import org.jetbrains.kotlin.fir.symbols.impl.FirCallableSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirClassLikeSymbol
 import org.jetbrains.kotlin.name.FqName
 import org.scip_code.scip.Document
+import org.scip_code.scip_java.shared.ExternalSymbolsCache
 
 /**
  * Per-file accumulator of SCIP occurrences and symbols. The FIR checkers in [AnalyzerCheckers] call
@@ -22,9 +23,10 @@ class ScipVisitor(
     lineMap: LineMap,
     globals: GlobalSymbolsCache,
     locals: LocalSymbolsCache = LocalSymbolsCache(),
+    externals: ExternalSymbolsCache = ExternalSymbolsCache(),
 ) {
     private val cache = SymbolsCache(globals, locals)
-    private val documentBuilder = ScipTextDocumentBuilder(sourceroot, file, lineMap, cache)
+    private val documentBuilder = ScipTextDocumentBuilder(sourceroot, file, lineMap, cache, externals)
 
     private data class SymbolDescriptorPair(
         val firBasedSymbol: FirBasedSymbol<*>?,

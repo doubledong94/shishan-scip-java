@@ -176,6 +176,12 @@ docker exec scip-debug bash -lc 'cd /sources && \
 - `dump-json`:读任意 `.scip`(合并的 index 或单个 shard),用 protojson 打成 JSON 输出到 stdout。
   - JSON 里每个 occurrence 带 `singleLineRange`(行号/列号,不用字节偏移),好对照源码;
   - 符号是展开形式(`scip-java maven . . com/google/common/base/Joiner#on().B`),外部依赖引用会以 `scip-java maven . . <外部包路径>...` 出现。
+  - **`externalSymbols`(Index 顶层)是"被引用但本代码库未定义"的符号表**。两个编译插件在遇到非 local、非包路径的全局符号时记录候选;聚合器再减去文档实际定义的符号,剩下的写入 `externalSymbols`。因此它带 kind/displayName/signatureDocumentation,可直接用于生成自己的语义产物:
+    ```json
+    {"symbol":"scip-java maven . . com/google/common/base/Joiner#on().",
+     "kind":"StaticMethod","displayName":"on",
+     "signatureDocumentation":{"language":"java","text":"public static Joiner on(String arg0)"}}
+    ```
 - 注意:容器里 `/usr/bin/scip-java` wrapper 的 `Using JVM version` 提示已改为打到 **stderr**,`dump-json` 的 stdout 是干净 JSON,可 `>` 重定向到文件。
 
 > 两个 shard 需要分别调试时,Java 和 Kotlin 各调一次,产物分开(都在 `META-INF/scip` 下,`relativePath` 区分 `src/main/java` 与 `src/main/kotlin`)。

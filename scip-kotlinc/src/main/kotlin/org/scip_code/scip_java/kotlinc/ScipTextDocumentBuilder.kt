@@ -27,6 +27,7 @@ import org.scip_code.scip.SymbolRole
 import org.scip_code.scip.relationship
 import org.scip_code.scip.signature
 import org.scip_code.scip.symbolInformation
+import org.scip_code.scip_java.shared.ExternalSymbolsCache
 import org.scip_code.scip_java.shared.ScipDocumentBuilder
 import org.scip_code.scip_java.shared.ScipRange
 import org.scip_code.scip_java.shared.ScipShardPaths
@@ -37,6 +38,7 @@ class ScipTextDocumentBuilder(
     private val file: KtSourceFile,
     private val lineMap: LineMap,
     private val cache: SymbolsCache,
+    private val externals: ExternalSymbolsCache,
 ) {
     private val documentBuilder = ScipDocumentBuilder()
     private val fileText = file.getContentsAsStream().reader().readText()
@@ -55,6 +57,7 @@ class ScipTextDocumentBuilder(
         if (isDefinition) {
             documentBuilder.addSymbol(symbolInformation(firBasedSymbol, symbol, element))
         }
+        recordExternalCandidate(firBasedSymbol, symbol)
     }
 
     @OptIn(SymbolInternals::class)
@@ -99,6 +102,33 @@ class ScipTextDocumentBuilder(
                 }
             }
         }
+    }
+
+    /**
+     * Records [firBasedSymbol] as an external-symbol candidate unless it is local or a package
+     * path. The aggregator subtracts symbols the codebase itself defines, so this is intentionally
+     * called for every global symbol encountered (definitions and references alike).
+     */
+    @OptIn(SymbolInternals::class)
+    private fun recordExternalCandidate(firBasedSymbol: FirBasedSymbol<*>?, symbol: Symbol) {
+        if (firBasedSymbol == null) return
+        val symbolString = symbol.toString()
+        if (symbolString.isEmpty() || symbolString.endsWith("/") || symbol.isLocal()) return
+        if (externals.contains(symbolString)) return
+        externals.add(
+            symbolInformation {
+                this.symbol = symbolString
+                displayName = displayName(firBasedSymbol)
+                renderSignature(firBasedSymbol.fir)?.let {
+                    signatureDocumentation = signature {
+                        language = "kotlin"
+                        text = it
+                    }
+                }
+                docComment(firBasedSymbol.fir)?.let { documentation += it }
+                this.kind = scipKind(firBasedSymbol.fir)
+            },
+        )
     }
 
     private fun occurrence(

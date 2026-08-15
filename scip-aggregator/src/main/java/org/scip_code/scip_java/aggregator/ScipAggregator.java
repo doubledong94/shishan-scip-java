@@ -12,10 +12,13 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.stream.Stream;
@@ -82,7 +85,11 @@ public class ScipAggregator {
     writer.emitTyped(metadataIndex());
 
     Map<String, List<String>> inverseReferences = computeInverseReferences(shards, rewriter);
-    shardStream(shards).forEach(shard -> processShard(shard, rewriter, inverseReferences));
+    Map<String, SymbolInformation> externalCandidates = new ConcurrentHashMap<>();
+    Set<String> definedSymbols = ConcurrentHashMap.newKeySet();
+    shardStream(shards)
+        .forEach(shard -> processShard(shard, rewriter, inverseReferences, externalCandidates, definedSymbols));
+    emitExternalSymbols(externalCandidates, definedSymbols);
     writer.build();
     options.reporter().endProcessing();
   }
@@ -134,12 +141,61 @@ public class ScipAggregator {
   }
 
   private void processShard(
-      Path shardPath, SymbolRewriter rewriter, Map<String, List<String>> inverseReferences) {
-    for (Document shard : readShard(shardPath)) {
-      Document rewritten = rewriteDocument(shard, rewriter, inverseReferences);
-      writer.emitTyped(Index.newBuilder().addDocuments(rewritten).build());
-      options.reporter().processedOneItem();
+      Path shardPath,
+      SymbolRewriter rewriter,
+      Map<String, List<String>> inverseReferences,
+      Map<String, SymbolInformation> externalCandidates,
+      Set<String> definedSymbols) {
+    for (Index shardIndex : readShards(shardPath)) {
+      for (Document shard : shardIndex.getDocumentsList()) {
+        Document rewritten = rewriteDocument(shard, rewriter, inverseReferences);
+        writer.emitTyped(Index.newBuilder().addDocuments(rewritten).build());
+        options.reporter().processedOneItem();
+        for (SymbolInformation info : rewritten.getSymbolsList()) {
+          if (!info.getSymbol().isEmpty()) definedSymbols.add(info.getSymbol());
+        }
+      }
+      for (SymbolInformation info : shardIndex.getExternalSymbolsList()) {
+        String rewritten = rewriter.rewrite(info.getSymbol());
+        if (rewritten.isEmpty()) continue;
+        externalCandidates.putIfAbsent(rewritten, rebuildExternal(rewritten, info));
+      }
     }
+  }
+
+  /**
+   * Emits the aggregated {@code external_symbols}: every candidate external symbol the shards
+   * referenced that none of the documents actually defines, excluding local symbols and bare package
+   * paths. Unknown fields (relationships, enclosing symbol) are intentionally dropped because they
+   * would reference symbols whose package context the aggregator can't reliably infer.
+   */
+  private void emitExternalSymbols(
+      Map<String, SymbolInformation> candidates, Set<String> definedSymbols) {
+    if (candidates.isEmpty()) return;
+    List<SymbolInformation> externals = new ArrayList<>();
+    for (Map.Entry<String, SymbolInformation> entry : candidates.entrySet()) {
+      String symbol = entry.getKey();
+      if (definedSymbols.contains(symbol)) continue;
+      if (ScipSymbols.isLocal(symbol)) continue;
+      if (symbol.endsWith("/")) continue;
+      externals.add(entry.getValue());
+    }
+    if (externals.isEmpty()) return;
+    externals.sort(Comparator.comparing(SymbolInformation::getSymbol));
+    writer.emitTyped(Index.newBuilder().addAllExternalSymbols(externals).build());
+  }
+
+  private static SymbolInformation rebuildExternal(String symbol, SymbolInformation info) {
+    SymbolInformation.Builder builder =
+        SymbolInformation.newBuilder()
+            .setSymbol(symbol)
+            .setDisplayName(info.getDisplayName())
+            .setKind(info.getKind());
+    if (info.hasSignatureDocumentation()) {
+      builder.setSignatureDocumentation(info.getSignatureDocumentation());
+    }
+    builder.addAllDocumentation(info.getDocumentationList());
+    return builder.build();
   }
 
   private Document rewriteDocument(
@@ -213,15 +269,17 @@ public class ScipAggregator {
     if (!options.emitInverseRelationships()) return Collections.emptyMap();
     Map<String, List<String>> result = new HashMap<>();
     for (Path shard : shards) {
-      for (Document doc : readShard(shard)) {
-        for (SymbolInformation info : doc.getSymbolsList()) {
-          if (!supportsReferenceRelationship(info)) continue;
-          if (info.getSymbol().isEmpty() || ScipSymbols.isLocal(info.getSymbol())) continue;
-          for (Relationship rel : info.getRelationshipsList()) {
-            if (!rel.getIsImplementation()) continue;
-            if (ScipSymbols.isLocal(rel.getSymbol())) continue;
-            if (isIgnoredOverriddenSymbol(rel.getSymbol())) continue;
-            result.computeIfAbsent(rel.getSymbol(), k -> new ArrayList<>()).add(info.getSymbol());
+      for (Index shardIndex : readShards(shard)) {
+        for (Document doc : shardIndex.getDocumentsList()) {
+          for (SymbolInformation info : doc.getSymbolsList()) {
+            if (!supportsReferenceRelationship(info)) continue;
+            if (info.getSymbol().isEmpty() || ScipSymbols.isLocal(info.getSymbol())) continue;
+            for (Relationship rel : info.getRelationshipsList()) {
+              if (!rel.getIsImplementation()) continue;
+              if (ScipSymbols.isLocal(rel.getSymbol())) continue;
+              if (isIgnoredOverriddenSymbol(rel.getSymbol())) continue;
+              result.computeIfAbsent(rel.getSymbol(), k -> new ArrayList<>()).add(info.getSymbol());
+            }
           }
         }
       }
@@ -246,10 +304,10 @@ public class ScipAggregator {
     return options.parallel() ? shards.parallelStream() : shards.stream();
   }
 
-  private Collection<Document> readShard(Path shardPath) {
+  private Collection<Index> readShards(Path shardPath) {
     try {
       if (JAR_PATTERN.matches(shardPath)) return readShardsFromJar(shardPath);
-      return Index.parseFrom(parseFromBytes(Files.readAllBytes(shardPath))).getDocumentsList();
+      return List.of(Index.parseFrom(parseFromBytes(Files.readAllBytes(shardPath))));
     } catch (IOException e) {
       options.reporter().error("invalid SCIP shard: " + shardPath);
       options.reporter().error(e);
@@ -257,15 +315,15 @@ public class ScipAggregator {
     }
   }
 
-  private Collection<Document> readShardsFromJar(Path jarFile) throws IOException {
-    List<Document> result = new ArrayList<>();
+  private Collection<Index> readShardsFromJar(Path jarFile) throws IOException {
+    List<Index> result = new ArrayList<>();
     try (JarFile jar = new JarFile(jarFile.toFile())) {
       Enumeration<JarEntry> entries = jar.entries();
       while (entries.hasMoreElements()) {
         JarEntry entry = entries.nextElement();
         if (!entry.getName().endsWith(".scip")) continue;
         byte[] bytes = InputStreamBytes.readAll(jar.getInputStream(entry));
-        result.addAll(Index.parseFrom(parseFromBytes(bytes)).getDocumentsList());
+        result.add(Index.parseFrom(parseFromBytes(bytes)));
       }
     }
     return result;

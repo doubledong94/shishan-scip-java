@@ -45,6 +45,7 @@ import org.scip_code.scip.Relationship;
 import org.scip_code.scip.Signature;
 import org.scip_code.scip.SymbolInformation;
 import org.scip_code.scip.SymbolRole;
+import org.scip_code.scip_java.shared.ExternalSymbolsCache;
 import org.scip_code.scip_java.shared.LocalSymbolsCache;
 import org.scip_code.scip_java.shared.ScipDocumentBuilder;
 import org.scip_code.scip_java.shared.ScipRange;
@@ -67,6 +68,7 @@ final class ScipVisitor extends TreePathScanner<Void, Void> {
   private final Elements elements;
   private final CompilationUnitTree compUnitTree;
   private final ScipDocumentBuilder documentBuilder;
+  private final ExternalSymbolsCache externals;
   private final ScipJavaSignatureFormatter signatureFormatter;
   private final LinkedHashMap<Tree, TreePath> nodes = new LinkedHashMap<>();
   private final LinkedHashMap<Element, Tree> declTrees = new LinkedHashMap<>();
@@ -80,7 +82,8 @@ final class ScipVisitor extends TreePathScanner<Void, Void> {
       Types types,
       Trees trees,
       Elements elements,
-      ScipDocumentBuilder documentBuilder) {
+      ScipDocumentBuilder documentBuilder,
+      ExternalSymbolsCache externals) {
     this.globals = globals;
     this.locals = locals;
     this.types = types;
@@ -88,6 +91,7 @@ final class ScipVisitor extends TreePathScanner<Void, Void> {
     this.elements = elements;
     this.compUnitTree = compUnitTree;
     this.documentBuilder = documentBuilder;
+    this.externals = externals;
     this.signatureFormatter = new ScipJavaSignatureFormatter(trees, compUnitTree);
     this.source = readSource();
   }
@@ -265,6 +269,7 @@ final class ScipVisitor extends TreePathScanner<Void, Void> {
   private void emitOccurrence(Element sym, ScipRange range, int role, ScipRange enclosingRange) {
     String symbol = scipSymbol(sym);
     if (symbol.isEmpty()) return;
+    recordExternalCandidate(sym, symbol);
     Occurrence.Builder b = Occurrence.newBuilder().setSymbol(symbol).setSymbolRoles(role);
     if (range.isSingleLine()) {
       b.setSingleLineRange(range.toSingleLineRange());
@@ -312,6 +317,7 @@ final class ScipVisitor extends TreePathScanner<Void, Void> {
     if (sym instanceof TypeElement typeElement) {
       for (TypeElement parent : parentTypeElements(typeElement)) {
         String parentSymbol = scipSymbol(parent);
+        recordExternalCandidate(parent, parentSymbol);
         if (parentSymbol.isEmpty()) continue;
         builder.addRelationships(
             Relationship.newBuilder().setSymbol(parentSymbol).setIsImplementation(true));
@@ -342,6 +348,34 @@ final class ScipVisitor extends TreePathScanner<Void, Void> {
     }
 
     documentBuilder.addSymbol(builder.build());
+  }
+
+  /**
+   * Records {@code sym} as an external-symbol candidate unless it is local or a package path. The
+   * aggregator subtracts symbols the codebase itself defines, so this is intentionally called for
+   * every non-package global symbol encountered (definitions and references alike).
+   */
+  private void recordExternalCandidate(Element sym, String symbol) {
+    if (symbol.isEmpty() || ScipSymbols.isLocal(symbol) || symbol.endsWith("/")) return;
+    if (externals.contains(symbol)) return;
+    SymbolInformation.Builder builder =
+        SymbolInformation.newBuilder().setSymbol(symbol).setDisplayName(displayName(sym));
+    SymbolInformation.Kind kind = scipKind(sym);
+    if (kind != SymbolInformation.Kind.UnspecifiedKind) builder.setKind(kind);
+    String signatureText = signatureFormatter.format(sym, null);
+    if (!signatureText.isEmpty()) {
+      builder.setSignatureDocumentation(
+          Signature.newBuilder().setLanguage("java").setText(signatureText));
+    }
+    externals.add(builder.build());
+  }
+
+  private static String displayName(Element sym) {
+    Element display = sym;
+    if (sym.getKind() == ElementKind.CONSTRUCTOR && sym.getEnclosingElement() != null) {
+      display = sym.getEnclosingElement();
+    }
+    return display.getSimpleName().toString();
   }
 
   private SymbolInformation.Kind scipKind(Element sym) {

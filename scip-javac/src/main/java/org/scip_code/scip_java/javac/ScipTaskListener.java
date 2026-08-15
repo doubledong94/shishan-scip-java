@@ -20,6 +20,8 @@ import javax.lang.model.util.Elements;
 import javax.lang.model.util.Types;
 import javax.tools.JavaFileObject;
 import org.scip_code.scip.Document;
+import org.scip_code.scip.Index;
+import org.scip_code.scip_java.shared.ExternalSymbolsCache;
 import org.scip_code.scip_java.shared.LocalSymbolsCache;
 import org.scip_code.scip_java.shared.NoRelativePathMode;
 import org.scip_code.scip_java.shared.ScipDocumentBuilder;
@@ -39,6 +41,8 @@ public final class ScipTaskListener implements TaskListener {
   private final Types types;
   private final Trees trees;
   private final Elements elements;
+  // External-symbol candidates, shared across every source file of this compilation.
+  private final ExternalSymbolsCache externals = new ExternalSymbolsCache();
   // Javac fires ANALYZE once per top-level type; accumulate across rounds per output path.
   private final Map<Path, PerSourceState> perSourceState = new HashMap<>();
   private int noRelativePathCounter = 0;
@@ -127,7 +131,8 @@ public final class ScipTaskListener implements TaskListener {
             types,
             trees,
             elements,
-            state.documentBuilder);
+            state.documentBuilder,
+            externals);
     visitor.visitCompilationUnit();
     String relativePath = scipRelativePath(e);
     String text = options.includeText ? visitor.getSource() : "";
@@ -142,7 +147,7 @@ public final class ScipTaskListener implements TaskListener {
 
   private void writeShard(TaskEvent event, Path output, Document document) {
     try {
-      ScipShardWriter.writeShard(output, document);
+      ScipShardWriter.writeShard(output, document, externals.symbols());
     } catch (IOException e) {
       reportException(e, event);
     }
