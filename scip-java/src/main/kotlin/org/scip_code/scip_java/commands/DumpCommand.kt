@@ -33,7 +33,10 @@ class DumpCommand : CliktCommand(name = "dump-json") {
         }
         val json: String
         if (indexFile.fileName.toString().endsWith(".tree")) {
-            val tree = Struct.parseFrom(Files.readAllBytes(indexFile))
+            // 语法树嵌套很深，默认 recursion limit(100) 读不回（同聚合器的修复）。
+            val input = com.google.protobuf.CodedInputStream.newInstance(Files.readAllBytes(indexFile))
+            input.setRecursionLimit(1_000_000)
+            val tree = Struct.parseFrom(input)
             json = JsonFormat.printer().print(tree)
         } else {
             val index = Index.parseFrom(Files.readAllBytes(indexFile))
