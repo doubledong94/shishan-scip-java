@@ -395,6 +395,7 @@ final class ScipVisitor extends TreePathScanner<Void, Void> {
       }
       case FIELD -> isStatic ? SymbolInformation.Kind.StaticField : SymbolInformation.Kind.Field;
       case LOCAL_VARIABLE -> SymbolInformation.Kind.Variable;
+      case PARAMETER -> SymbolInformation.Kind.Parameter;
       case TYPE_PARAMETER -> SymbolInformation.Kind.TypeParameter;
       default -> SymbolInformation.Kind.UnspecifiedKind;
     };

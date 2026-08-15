@@ -5,6 +5,7 @@ import static org.scip_code.scip_java.javac.Debugging.pprint;
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import javax.lang.model.element.Element;
+import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.ModuleElement;
 import javax.lang.model.element.PackageElement;
@@ -80,7 +81,7 @@ public final class GlobalSymbolsCache {
 
   private boolean isLocalVariable(Element sym) {
     return switch (sym.getKind()) {
-      case PARAMETER, EXCEPTION_PARAMETER, LOCAL_VARIABLE -> true;
+      case EXCEPTION_PARAMETER, LOCAL_VARIABLE -> true;
       default -> false;
     };
   }
@@ -102,6 +103,10 @@ public final class GlobalSymbolsCache {
       return new ScipSymbols.Descriptor(
           ScipSymbols.Descriptor.Kind.TypeParameter, sym.getSimpleName().toString());
     } else if (sym instanceof VariableElement) {
+      if (sym.getKind() == ElementKind.PARAMETER) {
+        return new ScipSymbols.Descriptor(
+            ScipSymbols.Descriptor.Kind.Parameter, sym.getSimpleName().toString());
+      }
       return new ScipSymbols.Descriptor(
           ScipSymbols.Descriptor.Kind.Term, sym.getSimpleName().toString());
     } else {

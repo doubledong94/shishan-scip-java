@@ -30,8 +30,12 @@ class DumpCommand : CliktCommand(name = "dump-json") {
             throw ProgramResult(1)
         }
         val index = Index.parseFrom(Files.readAllBytes(indexFile))
-        app.env.standardOutput.println(
-            JsonFormat.printer().includingDefaultValueFields().print(index),
-        )
+        val json =
+            JsonFormat.printer().includingDefaultValueFields().print(index)
+                // protojson escapes <, >, & for HTML safety; unescape for human readability.
+                .replace("\\u003c", "<")
+                .replace("\\u003e", ">")
+                .replace("\\u0026", "&")
+        app.env.standardOutput.println(json)
     }
 }
