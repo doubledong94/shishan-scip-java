@@ -16,22 +16,36 @@ import org.intellij.lang.annotations.Language
 import org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi
 import org.junit.jupiter.api.io.TempDir
 import org.scip_code.scip.Document
+import org.scip_code.scip.Occurrence
 import org.scip_code.scip.SymbolInformation.Kind
 import org.scip_code.scip.SyntaxKind
 import org.scip_code.scip_java.kotlinc.*
+import org.scip_code.scip_java.shared.SyntaxTree
 
 @OptIn(ExperimentalCompilerApi::class)
 class AnalyzerTest {
-    fun compileScip(path: Path, @Language("kotlin") code: String): Document {
+    /** Holds a compiled document plus the syntax tree that replaces its flat occurrences. */
+    data class ScipResult(val document: Document, val tree: SyntaxTree.Node) {
+        /** The flat occurrence view reconstructed from the tree, for test assertions. */
+        val occurrences: List<Occurrence>
+            get() = SyntaxTree.flatten(tree)
+    }
+
+    fun compileScip(path: Path, @Language("kotlin") code: String): ScipResult {
         val buildPath = File(path.resolve("build").toString()).apply { mkdir() }
         val source = SourceFile.testKt(code)
         lateinit var document: Document
+        lateinit var tree: SyntaxTree.Node
 
         val result =
             KotlinCompilation()
                 .apply {
                     sources = listOf(source)
-                    compilerPluginRegistrars = listOf(AnalyzerRegistrar { document = it })
+                    compilerPluginRegistrars =
+                        listOf(AnalyzerRegistrar { doc, t ->
+                            document = doc
+                            tree = t
+                        })
                     verbose = false
                     pluginOptions =
                         listOf(
@@ -45,8 +59,16 @@ class AnalyzerTest {
 
         result.exitCode shouldBe KotlinCompilation.ExitCode.OK
         document shouldNotBe null
-        return document
+        return ScipResult(document, tree)
     }
+
+    /** Test convenience: the SCIP occurrence list reconstructed from the tree. */
+    private val ScipResult.occurrencesList: List<Occurrence>
+        get() = occurrences
+
+    /** Test convenience: the SCIP symbol list from the underlying document. */
+    private val ScipResult.symbolsList: List<org.scip_code.scip.SymbolInformation>
+        get() = document.symbolsList
 
     @Test
     fun `basic test`(@TempDir path: Path) {
@@ -1331,7 +1353,7 @@ class AnalyzerTest {
                 .apply {
                     sources = listOf(SourceFile.testKt(""))
                     compilerPluginRegistrars =
-                        listOf(AnalyzerRegistrar { throw Exception("sample text") })
+                        listOf(AnalyzerRegistrar { _, _ -> throw Exception("sample text") })
                     verbose = false
                     messageOutputStream = java.io.OutputStream.nullOutputStream()
                     pluginOptions =
@@ -3047,9 +3069,9 @@ class AnalyzerTest {
         document.symbolsList.shouldContainAll(*symbols)
     }
 
-    private fun Document.assertDocumentation(symbol: String, expectedDocumentation: String) {
+    private fun ScipResult.assertDocumentation(symbol: String, expectedDocumentation: String) {
         val info =
-            this.symbolsList.find { it.symbol == symbol }
+            this.document.symbolsList.find { it.symbol == symbol }
                 ?: fail("no scipSymbol for symbol $symbol")
         val obtainedDocumentation = info.documentationList.joinToString("\n").trim()
         assertEquals(expectedDocumentation, obtainedDocumentation)

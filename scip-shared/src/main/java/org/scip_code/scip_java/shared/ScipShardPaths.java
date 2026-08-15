@@ -49,6 +49,20 @@ public final class ScipShardPaths {
   }
 
   /**
+   * Returns the on-disk {@code .tree} sidecar path for a source file expressed as a path relative
+   * to the source root. The syntax tree that replaces the flat {@code occurrences} list is written
+   * alongside each {@code .scip} shard so the aggregator can merge them independently.
+   */
+  public static Path treePathForRelativeSource(Path targetRoot, Path relativeSourcePath) {
+    String filename = relativeSourcePath.getFileName().toString() + ".tree";
+    return targetRoot
+        .resolve("META-INF")
+        .resolve("scip")
+        .resolve(relativeSourcePath)
+        .resolveSibling(filename);
+  }
+
+  /**
    * Returns the unix-style {@code Document.relative_path} for the given absolute source file. When
    * the file lives under {@code sourceRoot}, the path is source-root-relative; otherwise it is the
    * file's absolute path. Both cases are joined with {@code '/'} regardless of platform.

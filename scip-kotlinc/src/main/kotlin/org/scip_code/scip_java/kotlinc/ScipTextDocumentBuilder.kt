@@ -4,6 +4,8 @@ import java.nio.file.Path
 import java.nio.file.Paths
 import org.jetbrains.kotlin.KtSourceElement
 import org.jetbrains.kotlin.KtSourceFile
+import org.jetbrains.kotlin.com.intellij.lang.LighterASTNode
+import org.jetbrains.kotlin.com.intellij.openapi.util.Ref
 import org.jetbrains.kotlin.fir.FirElement
 import org.jetbrains.kotlin.fir.FirPackageDirective
 import org.jetbrains.kotlin.fir.analysis.checkers.context.CheckerContext
@@ -20,7 +22,6 @@ import org.jetbrains.kotlin.fir.types.impl.FirImplicitAnyTypeRef
 import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.text
 import org.scip_code.scip.Document
-import org.scip_code.scip.Occurrence
 import org.scip_code.scip.SymbolInformation
 import org.scip_code.scip.SymbolInformation.Kind
 import org.scip_code.scip.SymbolRole
@@ -32,19 +33,33 @@ import org.scip_code.scip_java.shared.ExternalSymbolsCache
 import org.scip_code.scip_java.shared.ScipDocumentBuilder
 import org.scip_code.scip_java.shared.ScipRange
 import org.scip_code.scip_java.shared.ScipShardPaths
+import org.scip_code.scip_java.shared.SyntaxTree
 
-/** Builds a SCIP [Document] for a single Kotlin source file. */
+/** Builds a SCIP [Document] (symbols only) and a full [SyntaxTree] for a single Kotlin source file. */
 class ScipTextDocumentBuilder(
     private val sourceroot: Path,
     private val file: KtSourceFile,
     private val lineMap: LineMap,
     private val cache: SymbolsCache,
     private val externals: ExternalSymbolsCache,
+    private val fileRoot: KtSourceElement?,
 ) {
     private val documentBuilder = ScipDocumentBuilder()
     private val fileText = file.getContentsAsStream().reader().readText()
+    private val occurrences: MutableMap<Long, MutableList<SyntaxTree.OccurrenceData>> = HashMap()
+    private val nodesByOffset: MutableMap<Long, MutableList<SyntaxTree.Node>> = HashMap()
+    private var treeRoot: SyntaxTree.Node? = null
 
     fun build(): Document = documentBuilder.build("kotlin", relativePath(), fileText)
+
+    /** The full per-file syntax tree, built once on first access. */
+    fun tree(): SyntaxTree.Node {
+        if (treeRoot == null) {
+            treeRoot = buildTree()
+            attachOccurrences()
+        }
+        return treeRoot!!
+    }
 
     context(context: CheckerContext)
     fun emitScipData(
@@ -54,9 +69,15 @@ class ScipTextDocumentBuilder(
         isDefinition: Boolean,
         enclosingSource: KtSourceElement? = null,
     ) {
-        documentBuilder.addOccurrence(
-            occurrence(firBasedSymbol, symbol, element, isDefinition, enclosingSource)
-        )
+        val key = offsetKey(element.startOffset, element.endOffset)
+        val occurrence = SyntaxTree.OccurrenceData()
+        occurrence.symbol = symbol.toString()
+        occurrence.role = if (isDefinition) SymbolRole.Definition.number else 0
+        val syntaxKind = syntaxKind(firBasedSymbol, symbol, element, isDefinition)
+        if (syntaxKind != SyntaxKind.UnspecifiedSyntaxKind) occurrence.syntaxKind = syntaxKind.name
+        occurrence.range = range(element)
+        if (enclosingSource != null) occurrence.enclosingRange = enclosingRange(enclosingSource)
+        occurrences.computeIfAbsent(key) { mutableListOf() }.add(occurrence)
         if (isDefinition) {
             documentBuilder.addSymbol(symbolInformation(firBasedSymbol, symbol, element))
         }
@@ -134,29 +155,62 @@ class ScipTextDocumentBuilder(
         )
     }
 
-    private fun occurrence(
-        firBasedSymbol: FirBasedSymbol<*>?,
-        symbol: Symbol,
-        element: KtSourceElement,
-        isDefinition: Boolean,
-        enclosingSource: KtSourceElement?,
-    ): Occurrence {
-        val builder = Occurrence.newBuilder().setSymbol(symbol.toString())
-        if (isDefinition) builder.setSymbolRoles(SymbolRole.Definition.number)
-        val syntaxKind = syntaxKind(firBasedSymbol, symbol, element, isDefinition)
-        if (syntaxKind != SyntaxKind.UnspecifiedSyntaxKind) builder.syntaxKind = syntaxKind
-        val range = range(element)
-        if (range.isSingleLine) builder.singleLineRange = range.toSingleLineRange()
-        else builder.multiLineRange = range.toMultiLineRange()
-        if (enclosingSource != null) {
-            val enclosingRange = enclosingRange(enclosingSource)
-            if (enclosingRange.isSingleLine) {
-                builder.singleLineEnclosingRange = enclosingRange.toSingleLineRange()
-            } else {
-                builder.multiLineEnclosingRange = enclosingRange.toMultiLineRange()
+    // =======================================
+    // Syntax tree
+    // =======================================
+
+    private fun buildTree(): SyntaxTree.Node {
+        val root = fileRoot ?: return SyntaxTree.Node("FILE")
+        val structure = root.treeStructure
+        val node = root.lighterASTNode
+        return buildNode(node, structure)
+    }
+
+    private fun buildNode(
+        node: LighterASTNode,
+        structure: org.jetbrains.kotlin.com.intellij.util.diff.FlyweightCapableTreeStructure<LighterASTNode>,
+    ): SyntaxTree.Node {
+        val treeNode = SyntaxTree.Node(kindName(node))
+        treeNode.range = rangeForOffsets(node.startOffset, node.endOffset)
+        nodesByOffset.computeIfAbsent(offsetKey(node.startOffset, node.endOffset)) { mutableListOf() }
+            .add(treeNode)
+        val ref = Ref<Array<LighterASTNode>>()
+        val childCount = structure.getChildren(node, ref)
+        val children = ref.get()
+        if (children != null) {
+            for (i in 0 until childCount) {
+                treeNode.children.add(buildNode(children[i], structure))
             }
         }
-        return builder.build()
+        structure.disposeChildren(children, childCount)
+        return treeNode
+    }
+
+    /**
+     * Attaches the resolved-symbol data recorded by [emitScipData] to the tree node(s) whose
+     * offsets match the source element. Preorder construction means the last node registered for a
+     * given offset pair is the deepest one (e.g. an identifier token inside a composite node).
+     */
+    private fun attachOccurrences() {
+        for ((key, datas) in occurrences) {
+            val candidates = nodesByOffset[key] ?: continue
+            val node = candidates.last()
+            node.occurrences.addAll(datas)
+        }
+    }
+
+    private fun kindName(node: LighterASTNode): String =
+        node.tokenType?.toString() ?: "UNKNOWN"
+
+    private fun offsetKey(start: Int, end: Int): Long =
+        (start.toLong() shl 32) or (end.toLong() and 0xFFFFFFFFL)
+
+    private fun rangeForOffsets(start: Int, end: Int): ScipRange {
+        val startLine = lineMap.lineNumberForOffset(start) - 1
+        val startCol = lineMap.columnForOffset(start)
+        val endLine = lineMap.lineNumberForOffset(end) - 1
+        val endCol = lineMap.columnForOffset(end)
+        return ScipRange.range(startLine, startCol, endLine, endCol)
     }
 
     private fun range(element: KtSourceElement): ScipRange {

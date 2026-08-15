@@ -31,6 +31,7 @@ import org.scip_code.scip.SymbolInformation
 import org.scip_code.scip_java.kotlinc.*
 import org.scip_code.scip_java.kotlinc.AnalyzerCheckers.Companion.visitors
 import org.scip_code.scip_java.shared.ScipOptions
+import org.scip_code.scip_java.shared.SyntaxTree
 
 data class ExpectedSymbols(
     val testName: String,
@@ -53,13 +54,18 @@ data class ExpectedSymbols(
 fun SourceFile.Companion.testKt(@Language("kotlin") contents: String): SourceFile =
     kotlin("Test.kt", contents)
 
-@ExperimentalCompilerApi
+@OptIn(ExperimentalCompilerApi::class)
 fun List<ExpectedSymbols>.mapCheckExpectedSymbols(): List<DynamicTest> =
     this.flatMap { (testName, source, symbolsData, scipData) ->
         val globals = GlobalSymbolsCache(testing = true)
         val locals = LocalSymbolsCache()
         lateinit var document: Document
-        val compilation = configureTestCompiler(source, globals, locals) { document = it }
+        lateinit var tree: SyntaxTree.Node
+        val compilation =
+            configureTestCompiler(source, globals, locals) { doc, t ->
+                document = doc
+                tree = t
+            }
         listOf(
             dynamicTest("$testName - compilation") {
                 val result = shouldNotThrowAny { compilation.compile() }
@@ -78,7 +84,7 @@ fun List<ExpectedSymbols>.mapCheckExpectedSymbols(): List<DynamicTest> =
                     println(
                         "checking scip: ${expectedOccurrences?.size ?: 0} occurrences and ${expectedSymbols?.size ?: 0} symbols"
                     )
-                    checkContainsExpectedScip(document, expectedOccurrences, expectedSymbols)
+                    checkContainsExpectedScip(document, tree, expectedOccurrences, expectedSymbols)
                 } ?: assumeFalse(true)
             },
         )
@@ -96,11 +102,18 @@ fun checkContainsExpectedSymbols(
 
 fun checkContainsExpectedScip(
     document: Document,
+    tree: SyntaxTree.Node?,
     expectedOccurrences: List<Occurrence>?,
     expectedSymbols: List<SymbolInformation>?,
 ) {
-    assertSoftly(document.occurrencesList) {
-        expectedOccurrences?.let { this.shouldContainInOrder(it) }
+    if (expectedOccurrences != null && tree != null) {
+        assertSoftly(SyntaxTree.flatten(tree)) {
+            expectedOccurrences?.let { this.shouldContainInOrder(it) }
+        }
+    } else if (expectedOccurrences != null) {
+        assertSoftly(document.occurrencesList) {
+            expectedOccurrences?.let { this.shouldContainInOrder(it) }
+        }
     }
     assertSoftly(document.symbolsList) { expectedSymbols?.let { this.shouldContainInOrder(it) } }
 }
@@ -110,7 +123,7 @@ private fun configureTestCompiler(
     source: SourceFile,
     globals: GlobalSymbolsCache,
     locals: LocalSymbolsCache,
-    hook: (Document) -> Unit = {},
+    hook: (Document, SyntaxTree.Node) -> Unit = { _, _ -> },
 ): KotlinCompilation {
     val compilation =
         KotlinCompilation().apply {
@@ -136,7 +149,8 @@ private class TestAnalyzerDeclarationCheckers(
                 override fun check(declaration: FirFile) {
                     val ktFile = declaration.sourceFile ?: return
                     val lineMap = LineMap(declaration)
-                    val visitor = ScipVisitor(sourceRoot, ktFile, lineMap, globals, locals)
+                    val visitor =
+                        ScipVisitor(sourceRoot, ktFile, lineMap, globals, locals, fileRoot = declaration.source)
                     visitors[ktFile] = visitor
                 }
             },
@@ -179,7 +193,7 @@ fun scipVisitorAnalyzer(
     globals: GlobalSymbolsCache,
     locals: LocalSymbolsCache,
     sourceroot: Path,
-    hook: (Document) -> Unit = {},
+    hook: (Document, SyntaxTree.Node) -> Unit = { _, _ -> },
 ): CompilerPluginRegistrar {
     return object : CompilerPluginRegistrar() {
         override fun ExtensionStorage.registerExtensions(configuration: CompilerConfiguration) {

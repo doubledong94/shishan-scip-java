@@ -1,6 +1,8 @@
 package org.scip_code.scip_java.aggregator;
 
 import com.google.protobuf.CodedInputStream;
+import com.google.protobuf.Struct;
+import com.google.protobuf.Value;
 import java.io.IOException;
 import java.nio.file.FileSystems;
 import java.nio.file.FileVisitResult;
@@ -33,6 +35,7 @@ import org.scip_code.scip.SyntaxKind;
 import org.scip_code.scip.TextEncoding;
 import org.scip_code.scip.ToolInfo;
 import org.scip_code.scip_java.shared.ScipSymbols;
+import org.scip_code.scip_java.shared.SyntaxTree;
 
 /**
  * Aggregates per-source SCIP shards (one {@link Index} per {@code *.scip} file emitted by the
@@ -45,15 +48,22 @@ import org.scip_code.scip_java.shared.ScipSymbols;
  *   <li>optionally adds inverse-reference relationships across documents, and
  *   <li>emits a single {@link Index} with leading {@link Metadata}.
  * </ul>
+ *
+ * <p>In addition, each source file's {@code *.tree} sidecar (the syntax tree that replaced the flat
+ * {@code occurrences} list) is read, its node symbols rewritten, and all trees merged into a single
+ * {@code *.tree.json} output next to the index.
  */
 public class ScipAggregator {
   private static final PathMatcher JAR_PATTERN =
       FileSystems.getDefault().getPathMatcher("glob:**.jar");
   private static final PathMatcher SCIP_PATTERN =
       FileSystems.getDefault().getPathMatcher("glob:**.scip");
+  private static final PathMatcher TREE_PATTERN =
+      FileSystems.getDefault().getPathMatcher("glob:**.tree");
 
   private final ScipWriter writer;
   private final ScipAggregatorOptions options;
+  private final List<Struct> mergedTrees = new ArrayList<>();
 
   public ScipAggregator(ScipWriter writer, ScipAggregatorOptions options) {
     this.writer = writer;
@@ -91,6 +101,7 @@ public class ScipAggregator {
     shardStream(shards)
         .forEach(shard -> processShard(shard, rewriter, inverseReferences, externalCandidates, definedSymbols));
     emitExternalSymbols(externalCandidates, definedSymbols);
+    emitMergedTrees(rewriter);
     writer.build();
     options.reporter().endProcessing();
   }
@@ -124,6 +135,65 @@ public class ScipAggregator {
             .warning("ignoring target root that does not exist or is not a directory: " + root);
     }
     return shards;
+  }
+
+  /**
+   * Finds every {@code *.tree} sidecar under {@code options.targetroots()} and merges it into the
+   * output tree, rewriting node symbols with {@code rewriter}.
+   */
+  private void emitMergedTrees(SymbolRewriter rewriter) throws IOException {
+    List<Path> trees = new ArrayList<>();
+    SimpleFileVisitor<Path> visitor =
+        new SimpleFileVisitor<Path>() {
+          @Override
+          public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+            if (TREE_PATTERN.matches(file)) trees.add(file);
+            return FileVisitResult.CONTINUE;
+          }
+
+          @Override
+          public FileVisitResult visitFileFailed(Path file, IOException exc) {
+            options.reporter().error(exc);
+            return FileVisitResult.CONTINUE;
+          }
+        };
+    for (Path root : options.targetroots()) {
+      if (Files.isDirectory(root)) Files.walkFileTree(root, visitor);
+    }
+    if (trees.isEmpty()) return;
+    Collections.sort(trees);
+
+    Struct.Builder documents = Struct.newBuilder();
+    for (Path treePath : trees) {
+      try {
+        Struct documentStruct = Struct.parseFrom(Files.readAllBytes(treePath));
+        String relativePath = SyntaxTree.documentRelativePath(documentStruct);
+        if (relativePath.isEmpty()) continue;
+        SyntaxTree.Node node = SyntaxTree.documentTree(documentStruct);
+        if (node == null) continue;
+        SyntaxTree.Node rewritten =
+            SyntaxTree.rewriteSymbols(node, symbol -> rewriter.rewrite(symbol));
+        documents.putFields(
+            relativePath,
+            Value.newBuilder()
+                .setStructValue(SyntaxTree.toStruct(rewritten))
+                .build());
+      } catch (IOException e) {
+        options.reporter().error("invalid SCIP tree sidecar: " + treePath);
+        options.reporter().error(e);
+      }
+    }
+    Path treeOutput = treeOutputPath();
+    byte[] bytes = documents.build().toByteArray();
+    Files.createDirectories(treeOutput.getParent());
+    Files.write(treeOutput, bytes);
+  }
+
+  private Path treeOutputPath() {
+    Path output = options.output();
+    String name = output.getFileName().toString();
+    String treeName = name.endsWith(".scip") ? name.substring(0, name.length() - ".scip".length()) : name;
+    return output.resolveSibling(treeName + ".tree");
   }
 
   private Index metadataIndex() {

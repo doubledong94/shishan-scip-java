@@ -28,6 +28,7 @@ import org.scip_code.scip_java.shared.ScipDocumentBuilder;
 import org.scip_code.scip_java.shared.ScipShardPaths;
 import org.scip_code.scip_java.shared.ScipShardWriter;
 import org.scip_code.scip_java.shared.ScipSymbols;
+import org.scip_code.scip_java.shared.SyntaxTree;
 import org.scip_code.scip_java.shared.UriScheme;
 
 /**
@@ -138,6 +139,21 @@ public final class ScipTaskListener implements TaskListener {
     String text = options.includeText ? visitor.getSource() : "";
     Document document = state.documentBuilder.build("java", relativePath, text);
     writeShard(e, output, document);
+    writeTree(e, output, visitor.tree());
+  }
+
+  private void writeTree(TaskEvent event, Path output, SyntaxTree.Node tree) {
+    if (tree == null) return;
+    try {
+      Path treePath =
+          ScipShardPaths.treePathForRelativeSource(
+              options.targetroot, Paths.get(scipRelativePath(event)));
+      ScipShardWriter.writeTree(
+          treePath,
+          SyntaxTree.toDocumentStruct(scipRelativePath(event), "java", tree));
+    } catch (IOException e) {
+      reportException(e, event);
+    }
   }
 
   private String scipRelativePath(TaskEvent e) {

@@ -17,6 +17,7 @@ import org.scip_code.scip.Document
 import org.scip_code.scip.Index
 import org.scip_code.scip_java.shared.ScipShardPaths
 import org.scip_code.scip_java.shared.ScipShardWriter
+import org.scip_code.scip_java.shared.SyntaxTree
 
 /**
  * Writes per-source SCIP shards once the FIR checkers have finished and the IR phase begins.
@@ -29,7 +30,7 @@ class PostAnalysisExtension(
     private val configuration: CompilerConfiguration,
     private val sourceRoot: Path,
     private val targetRoot: Path,
-    private val callback: (Document) -> Unit,
+    private val callback: (Document, SyntaxTree.Node) -> Unit,
 ) : IrGenerationExtension {
     override fun generate(moduleFragment: IrModuleFragment, pluginContext: IrPluginContext) {
         try {
@@ -42,8 +43,19 @@ class PostAnalysisExtension(
                             document,
                             AnalyzerCheckers.externalSymbols.symbols(),
                         )
+                        ScipShardWriter.writeTree(
+                            ScipShardPaths.treePathForRelativeSource(
+                                targetRoot,
+                                Paths.get(scipRelativePath(ktSourceFile)),
+                            ),
+                            SyntaxTree.toDocumentStruct(
+                                scipRelativePath(ktSourceFile),
+                                "kotlin",
+                                visitor.tree(),
+                            ),
+                        )
                     }
-                    callback(document)
+                    callback(document, visitor.tree())
                 } catch (e: Exception) {
                     handleException(e)
                 }
@@ -53,6 +65,15 @@ class PostAnalysisExtension(
         }
         AnalyzerCheckers.visitors.clear()
         AnalyzerCheckers.externalSymbols.clear()
+    }
+
+    private fun scipRelativePath(file: KtSourceFile): String {
+        val normalizedPath = Paths.get(file.path).normalize()
+        return if (normalizedPath.startsWith(sourceRoot)) {
+            sourceRoot.relativize(normalizedPath).toString()
+        } else {
+            normalizedPath.toString()
+        }
     }
 
     private fun scipShardPathForFile(file: KtSourceFile): Path? {

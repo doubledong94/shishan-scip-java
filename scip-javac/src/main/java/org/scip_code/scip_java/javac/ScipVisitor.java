@@ -40,7 +40,6 @@ import javax.lang.model.type.TypeMirror;
 import javax.lang.model.util.Elements;
 import javax.lang.model.util.Types;
 import javax.tools.Diagnostic;
-import org.scip_code.scip.Occurrence;
 import org.scip_code.scip.Relationship;
 import org.scip_code.scip.Signature;
 import org.scip_code.scip.SymbolInformation;
@@ -51,10 +50,12 @@ import org.scip_code.scip_java.shared.LocalSymbolsCache;
 import org.scip_code.scip_java.shared.ScipDocumentBuilder;
 import org.scip_code.scip_java.shared.ScipRange;
 import org.scip_code.scip_java.shared.ScipSymbols;
+import org.scip_code.scip_java.shared.SyntaxTree;
 
 /**
- * Walks a typechecked compilation unit and feeds SCIP {@link Occurrence}/{@link SymbolInformation}
- * messages into a {@link ScipDocumentBuilder}.
+ * Walks a typechecked compilation unit and feeds SCIP {@link SymbolInformation} messages into a
+ * {@link ScipDocumentBuilder}, and a full {@link SyntaxTree} that replaces the flat SCIP
+ * {@code occurrences} list.
  *
  * <p>Replaces the old {@code ScipVisitor} + {@code ScipSignatures} + {@code ScipTrees} chain that
  * first produced SCIP protos and then converted them to SCIP. Symbols are emitted in their
@@ -73,6 +74,8 @@ final class ScipVisitor extends TreePathScanner<Void, Void> {
   private final ScipJavaSignatureFormatter signatureFormatter;
   private final LinkedHashMap<Tree, TreePath> nodes = new LinkedHashMap<>();
   private final LinkedHashMap<Element, Tree> declTrees = new LinkedHashMap<>();
+  private final Map<Tree, SyntaxTree.Node> nodeByTree = new java.util.IdentityHashMap<>();
+  private SyntaxTree.Node treeRoot;
 
   private String source;
 
@@ -99,7 +102,43 @@ final class ScipVisitor extends TreePathScanner<Void, Void> {
 
   void visitCompilationUnit() {
     scan(compUnitTree, null);
+    buildTree();
     resolveNodes();
+  }
+
+  /** The full per-file syntax tree, populated after {@link #visitCompilationUnit()}. */
+  SyntaxTree.Node tree() {
+    return treeRoot;
+  }
+
+  /**
+   * Reconstructs the full syntax tree from the nodes the scanner visited (preorder). Each node
+   * records its kind and full source span; resolved-symbol data is attached afterwards by {@link
+   * #emitOccurrence}.
+   */
+  private void buildTree() {
+    for (Map.Entry<Tree, TreePath> entry : nodes.entrySet()) {
+      Tree tree = entry.getKey();
+      TreePath path = entry.getValue();
+      SyntaxTree.Node node = new SyntaxTree.Node(tree.getKind().name());
+      node.range = computeNodeRange(tree);
+      nodeByTree.put(tree, node);
+      TreePath parentPath = path.getParentPath();
+      if (parentPath == null) {
+        treeRoot = node;
+      } else {
+        SyntaxTree.Node parent = nodeByTree.get(parentPath.getLeaf());
+        if (parent != null) parent.children.add(node);
+      }
+    }
+  }
+
+  /** Full source span of a syntax node (not narrowed to a symbol name). */
+  private ScipRange computeNodeRange(Tree tree) {
+    SourcePositions sourcePositions = trees.getSourcePositions();
+    int start = (int) sourcePositions.getStartPosition(compUnitTree, tree);
+    int end = (int) sourcePositions.getEndPosition(compUnitTree, tree);
+    return lineMapRange(start, end);
   }
 
   // =======================================
@@ -272,22 +311,16 @@ final class ScipVisitor extends TreePathScanner<Void, Void> {
     String symbol = scipSymbol(sym);
     if (symbol.isEmpty()) return;
     recordExternalCandidate(sym, symbol);
-    Occurrence.Builder b = Occurrence.newBuilder().setSymbol(symbol).setSymbolRoles(role);
+    SyntaxTree.Node node = nodeByTree.get(tree);
+    if (node == null) return;
+    SyntaxTree.OccurrenceData occurrence = new SyntaxTree.OccurrenceData();
+    occurrence.symbol = symbol;
+    occurrence.role = role;
     SyntaxKind syntaxKind = syntaxKind(tree, sym, role);
-    if (syntaxKind != SyntaxKind.UnspecifiedSyntaxKind) b.setSyntaxKind(syntaxKind);
-    if (range.isSingleLine()) {
-      b.setSingleLineRange(range.toSingleLineRange());
-    } else {
-      b.setMultiLineRange(range.toMultiLineRange());
-    }
-    if (enclosingRange != null) {
-      if (enclosingRange.isSingleLine()) {
-        b.setSingleLineEnclosingRange(enclosingRange.toSingleLineRange());
-      } else {
-        b.setMultiLineEnclosingRange(enclosingRange.toMultiLineRange());
-      }
-    }
-    documentBuilder.addOccurrence(b.build());
+    if (syntaxKind != SyntaxKind.UnspecifiedSyntaxKind) occurrence.syntaxKind = syntaxKind.name();
+    occurrence.range = range;
+    occurrence.enclosingRange = enclosingRange;
+    node.occurrences.add(occurrence);
   }
 
   private void emitSymbolInformation(Element sym, Tree tree) {

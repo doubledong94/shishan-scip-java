@@ -1,5 +1,6 @@
 package org.scip_code.scip_java.shared;
 
+import com.google.protobuf.Struct;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -31,6 +32,12 @@ public final class ScipShardWriter {
     Index.Builder builder = Index.newBuilder().addDocuments(document);
     if (!externalSymbols.isEmpty()) builder.addAllExternalSymbols(externalSymbols);
     writeShard(output, builder.build());
+  }
+
+  /** Writes a serialized {@link Struct} tree sidecar (the replacement for flat occurrences). */
+  public static void writeTree(Path output, Struct tree) throws IOException {
+    Files.createDirectories(output.getParent());
+    Files.write(output, tree.toByteArray());
   }
 
   private static void writeShard(Path output, Index index) throws IOException {

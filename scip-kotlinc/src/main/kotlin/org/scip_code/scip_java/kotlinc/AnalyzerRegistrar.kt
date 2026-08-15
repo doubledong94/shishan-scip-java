@@ -7,9 +7,12 @@ import org.jetbrains.kotlin.config.CompilerConfiguration
 import org.jetbrains.kotlin.fir.extensions.FirExtensionRegistrarAdapter
 import org.scip_code.scip.Document
 import org.scip_code.scip_java.shared.ScipOptions
+import org.scip_code.scip_java.shared.SyntaxTree
 
 @OptIn(ExperimentalCompilerApi::class)
-class AnalyzerRegistrar(private val callback: (Document) -> Unit = {}) : CompilerPluginRegistrar() {
+class AnalyzerRegistrar(
+    private val callback: (Document, SyntaxTree.Node) -> Unit = { _, _ -> },
+) : CompilerPluginRegistrar() {
     override fun ExtensionStorage.registerExtensions(configuration: CompilerConfiguration) {
         val options =
             ScipOptions().apply {

@@ -101,7 +101,15 @@ open class AnalyzerCheckers(session: FirSession) : FirAdditionalCheckersExtensio
         override fun check(declaration: FirFile) {
             val ktFile = declaration.sourceFile ?: return
             val lineMap = LineMap(declaration)
-            val visitor = ScipVisitor(sourceroot, ktFile, lineMap, globals, externals = externalSymbols)
+            val visitor =
+                ScipVisitor(
+                    sourceroot,
+                    ktFile,
+                    lineMap,
+                    globals,
+                    externals = externalSymbols,
+                    fileRoot = declaration.source,
+                )
             visitors[ktFile] = visitor
         }
     }
