@@ -166,7 +166,10 @@ public class ScipAggregator {
     Struct.Builder documents = Struct.newBuilder();
     for (Path treePath : trees) {
       try {
-        Struct documentStruct = Struct.parseFrom(Files.readAllBytes(treePath));
+        com.google.protobuf.CodedInputStream input =
+            com.google.protobuf.CodedInputStream.newInstance(Files.readAllBytes(treePath));
+        input.setRecursionLimit(1_000_000);
+        Struct documentStruct = Struct.parseFrom(input);
         String relativePath = SyntaxTree.documentRelativePath(documentStruct);
         if (relativePath.isEmpty()) continue;
         SyntaxTree.Node node = SyntaxTree.documentTree(documentStruct);
