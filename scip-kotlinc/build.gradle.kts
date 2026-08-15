@@ -31,3 +31,15 @@ tasks.named<Test>("test") {
 tasks.named<ShadowJar>("shadowJar") {
     mergeServiceFiles()
 }
+
+// Debug variant: the same fat jar but WITHOUT relocation, so that classes keep
+// their original package names (org.scip_code.scip_java.kotlinc.ScipVisitor, ...).
+// IDE debuggers (e.g. IntelliJ) set breakpoints against the project's source
+// files, so this jar lets breakpoints hit without a `shaded.` name mapping.
+val shadowJarDebug by tasks.registering(ShadowJar::class) {
+    dependsOn(tasks.classes)
+    archiveClassifier.set("all-debug")
+    mergeServiceFiles()
+    from(sourceSets.main.get().output)
+    configurations = listOf(project.configurations.runtimeClasspath.get())
+}

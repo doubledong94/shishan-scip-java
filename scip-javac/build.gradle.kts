@@ -42,3 +42,15 @@ tasks.named<ShadowJar>("shadowJar") {
         exclude("org.scip_code.scip_java.javac.InjectScipOptions")
     }
 }
+
+// Debug variant: the same fat jar but WITHOUT relocation, so that classes keep
+// their original package names (org.scip_code.scip_java.javac.ScipVisitor, ...).
+// IDE debuggers (e.g. IntelliJ) set breakpoints against the project's source
+// files, so this jar lets breakpoints hit without the `shaded.` name mapping.
+val shadowJarDebug by tasks.registering(ShadowJar::class) {
+    dependsOn(tasks.classes)
+    archiveClassifier.set("all-debug")
+    mergeServiceFiles()
+    from(sourceSets.main.get().output)
+    configurations = listOf(project.configurations.runtimeClasspath.get())
+}

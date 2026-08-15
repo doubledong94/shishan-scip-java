@@ -26,7 +26,7 @@ LAST_CODE="-1"
 for JVM_VERSION in $JVM_VERSIONS
 do 
 	if [ "$LAST_CODE" != "0" ]; then
-		echo "Using JVM version '$JVM_VERSION'"
+		echo "Using JVM version '$JVM_VERSION'" >&2
 
 		eval "$(coursier java --jvm "$JVM_VERSION" --env --jvm-index https://github.com/coursier/jvm-index/blob/master/index.json)"
 

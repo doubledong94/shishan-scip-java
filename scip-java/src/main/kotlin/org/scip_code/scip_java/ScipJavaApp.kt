@@ -15,6 +15,7 @@ import java.nio.file.Paths
 import org.scip_code.scip_java.buildtools.ProcessResult
 import org.scip_code.scip_java.buildtools.ProcessRunner
 import org.scip_code.scip_java.commands.AggregateCommand
+import org.scip_code.scip_java.commands.DumpCommand
 import org.scip_code.scip_java.commands.IndexCommand
 import org.scip_code.scip_java.commands.SnapshotCommand
 
@@ -66,7 +67,7 @@ class ScipJavaApp {
         val processedArgs = applyGlobalCwd(rewriteNestedOptions(args))
         val root = RootCommand(this)
         root.versionOption(ScipJava.version, names = setOf("--version", "-v"))
-        root.subcommands(IndexCommand(), AggregateCommand(), SnapshotCommand())
+        root.subcommands(IndexCommand(), AggregateCommand(), SnapshotCommand(), DumpCommand())
         return try {
             root.parse(processedArgs)
             // Commands signal failure only by throwing; reaching here is a clean exit.

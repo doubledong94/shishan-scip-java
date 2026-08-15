@@ -25,6 +25,7 @@ dependencies {
     implementation(libs.kotlin.scripting.dependencies)
     implementation(libs.kotlin.scripting.dependencies.maven)
     implementation(libs.kotlinx.serialization.json.jvm)
+    implementation(libs.protobuf.java.util)
 
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlin.test.junit5)

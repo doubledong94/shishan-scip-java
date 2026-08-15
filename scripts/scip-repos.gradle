@@ -1,0 +1,30 @@
+def trim = { String u -> u.replaceAll(/\/+$/, '') }
+
+def mirrors = [
+  "https://dl.google.com/dl/android/maven2": "https://maven.aliyun.com/repository/google",
+  "https://repo.maven.apache.org/maven2":    "https://mirrors.cloud.tencent.com/nexus/repository/maven-public",
+  "https://repo1.maven.org/maven2":          "https://mirrors.cloud.tencent.com/nexus/repository/maven-public",
+  "https://plugins.gradle.org/m2":           "https://maven.aliyun.com/repository/gradle-plugin"
+]
+
+def redirect = { repo ->
+  if (repo instanceof MavenArtifactRepository) {
+    def u = trim(repo.url.toString())
+    mirrors.each { from, to ->
+      if (u.startsWith(from)) {
+        repo.setUrl(to)
+        println "scip-mirror: ${u} -> ${to}"
+      }
+    }
+  }
+}
+
+settingsEvaluated { settings ->
+  settings.pluginManagement.repositories.all(redirect)
+  settings.dependencyResolutionManagement.repositories.all(redirect)
+}
+
+allprojects {
+  buildscript.repositories.all(redirect)
+  repositories.all(redirect)
+}
