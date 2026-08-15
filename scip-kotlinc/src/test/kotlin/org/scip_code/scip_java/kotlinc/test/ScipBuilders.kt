@@ -3,6 +3,7 @@ package org.scip_code.scip_java.kotlinc.test
 import org.scip_code.scip.Occurrence
 import org.scip_code.scip.SymbolInformation
 import org.scip_code.scip.SymbolRole
+import org.scip_code.scip.SyntaxKind
 import org.scip_code.scip.relationship
 import org.scip_code.scip.signature
 import org.scip_code.scip.symbolInformation
@@ -48,6 +49,12 @@ class ScipRangeBuilder {
 class ScipOccurrenceBuilder {
     var role: Int = REFERENCE
     var symbol: String = ""
+    /**
+     * Optional explicit [SyntaxKind]. When unset, [deriveSyntaxKind] infers it from [symbol] and
+     * [role], so existing fixtures keep passing without listing it on every occurrence. `local N`
+     * symbols are ambiguous and must set this explicitly.
+     */
+    var syntaxKind: SyntaxKind? = null
     private var range: ScipRange? = null
     private var enclosingRange: ScipRange? = null
 
@@ -61,6 +68,8 @@ class ScipOccurrenceBuilder {
 
     internal fun build(): Occurrence {
         val builder = Occurrence.newBuilder().setSymbol(symbol).setSymbolRoles(role)
+        val kind = syntaxKind ?: deriveSyntaxKind(symbol, role)
+        if (kind != SyntaxKind.UnspecifiedSyntaxKind) builder.syntaxKind = kind
         range?.let {
             if (it.isSingleLine) builder.singleLineRange = it.toSingleLineRange()
             else builder.multiLineRange = it.toMultiLineRange()
@@ -72,6 +81,26 @@ class ScipOccurrenceBuilder {
         return builder.build()
     }
 }
+
+/**
+ * Mirrors [org.scip_code.scip_java.kotlinc.ScipTextDocumentBuilder.syntaxKind] for the symbol
+ * shapes used by the fixtures: namespaces, types, functions, parameters, type parameters and
+ * properties are unambiguous from the symbol string; only `local N` symbols need an explicit
+ * [ScipOccurrenceBuilder.syntaxKind].
+ */
+internal fun deriveSyntaxKind(symbol: String, role: Int): SyntaxKind =
+    when {
+        symbol.startsWith("local ") -> SyntaxKind.UnspecifiedSyntaxKind
+        symbol.endsWith("/") -> SyntaxKind.IdentifierNamespace
+        symbol.endsWith("#") -> SyntaxKind.IdentifierType
+        symbol.endsWith(").") ->
+            if (role == DEFINITION) SyntaxKind.IdentifierFunctionDefinition
+            else SyntaxKind.IdentifierFunction
+        symbol.endsWith(")") -> SyntaxKind.IdentifierParameter
+        symbol.endsWith("]") -> SyntaxKind.IdentifierType
+        symbol.endsWith(".") -> SyntaxKind.Identifier
+        else -> SyntaxKind.UnspecifiedSyntaxKind
+    }
 
 @ScipBuilderDsl
 class ScipSymbolInformationBuilder {

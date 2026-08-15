@@ -29,6 +29,7 @@ import org.scip_code.scip.Occurrence;
 import org.scip_code.scip.ProtocolVersion;
 import org.scip_code.scip.Relationship;
 import org.scip_code.scip.SymbolInformation;
+import org.scip_code.scip.SyntaxKind;
 import org.scip_code.scip.TextEncoding;
 import org.scip_code.scip.ToolInfo;
 import org.scip_code.scip_java.shared.ScipSymbols;
@@ -211,6 +212,9 @@ public class ScipAggregator {
           Occurrence.newBuilder()
               .setSymbol(rewriter.rewrite(occ.getSymbol()))
               .setSymbolRoles(occ.getSymbolRoles());
+      if (occ.getSyntaxKind() != SyntaxKind.UnspecifiedSyntaxKind) {
+        rebuilt.setSyntaxKind(occ.getSyntaxKind());
+      }
       switch (occ.getTypedRangeCase()) {
         case SINGLE_LINE_RANGE -> rebuilt.setSingleLineRange(occ.getSingleLineRange());
         case MULTI_LINE_RANGE -> rebuilt.setMultiLineRange(occ.getMultiLineRange());

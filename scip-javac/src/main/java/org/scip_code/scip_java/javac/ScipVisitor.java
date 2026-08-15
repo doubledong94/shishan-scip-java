@@ -45,6 +45,7 @@ import org.scip_code.scip.Relationship;
 import org.scip_code.scip.Signature;
 import org.scip_code.scip.SymbolInformation;
 import org.scip_code.scip.SymbolRole;
+import org.scip_code.scip.SyntaxKind;
 import org.scip_code.scip_java.shared.ExternalSymbolsCache;
 import org.scip_code.scip_java.shared.LocalSymbolsCache;
 import org.scip_code.scip_java.shared.ScipDocumentBuilder;
@@ -193,7 +194,7 @@ final class ScipVisitor extends TreePathScanner<Void, Void> {
       TreePath typeTreePath = nodes.get(node.getInitializer());
       Element typeSym = trees.getElement(typeTreePath);
       if (typeSym != null && range != null) {
-        emitOccurrence(typeSym, range, 0, null);
+        emitOccurrence(typeSym, node.getInitializer(), range, 0, null);
       }
     }
   }
@@ -254,7 +255,7 @@ final class ScipVisitor extends TreePathScanner<Void, Void> {
   private ScipRange emitDefinition(Element sym, Tree tree, Name name, CompilerRange kind) {
     ScipRange range = computeRange(tree, kind, sym, name == null ? null : name.toString());
     if (range == null) return null;
-    emitOccurrence(sym, range, SymbolRole.Definition_VALUE, computeEnclosingRange(tree));
+    emitOccurrence(sym, tree, range, SymbolRole.Definition_VALUE, computeEnclosingRange(tree));
     declTrees.put(sym, tree);
     emitSymbolInformation(sym, tree);
     return range;
@@ -263,14 +264,17 @@ final class ScipVisitor extends TreePathScanner<Void, Void> {
   private void emitReference(Element sym, Tree tree, Name name, CompilerRange kind) {
     ScipRange range = computeRange(tree, kind, sym, name == null ? null : name.toString());
     if (range == null) return;
-    emitOccurrence(sym, range, 0 /* reference */, null);
+    emitOccurrence(sym, tree, range, 0 /* reference */, null);
   }
 
-  private void emitOccurrence(Element sym, ScipRange range, int role, ScipRange enclosingRange) {
+  private void emitOccurrence(
+      Element sym, Tree tree, ScipRange range, int role, ScipRange enclosingRange) {
     String symbol = scipSymbol(sym);
     if (symbol.isEmpty()) return;
     recordExternalCandidate(sym, symbol);
     Occurrence.Builder b = Occurrence.newBuilder().setSymbol(symbol).setSymbolRoles(role);
+    SyntaxKind syntaxKind = syntaxKind(tree, sym, role);
+    if (syntaxKind != SyntaxKind.UnspecifiedSyntaxKind) b.setSyntaxKind(syntaxKind);
     if (range.isSingleLine()) {
       b.setSingleLineRange(range.toSingleLineRange());
     } else {
@@ -385,7 +389,7 @@ final class ScipVisitor extends TreePathScanner<Void, Void> {
     boolean isDefault = mods.contains(Modifier.DEFAULT);
     return switch (sym.getKind()) {
       case ENUM -> SymbolInformation.Kind.Enum;
-      case CLASS -> SymbolInformation.Kind.Class;
+      case CLASS, RECORD -> SymbolInformation.Kind.Class;
       case INTERFACE, ANNOTATION_TYPE -> SymbolInformation.Kind.Interface;
       case CONSTRUCTOR -> SymbolInformation.Kind.Constructor;
       case METHOD -> {
@@ -394,10 +398,56 @@ final class ScipVisitor extends TreePathScanner<Void, Void> {
         yield SymbolInformation.Kind.Method;
       }
       case FIELD -> isStatic ? SymbolInformation.Kind.StaticField : SymbolInformation.Kind.Field;
-      case LOCAL_VARIABLE -> SymbolInformation.Kind.Variable;
+      case ENUM_CONSTANT -> SymbolInformation.Kind.EnumMember;
+      case LOCAL_VARIABLE, EXCEPTION_PARAMETER, RESOURCE_VARIABLE, BINDING_VARIABLE ->
+          SymbolInformation.Kind.Variable;
       case PARAMETER -> SymbolInformation.Kind.Parameter;
       case TYPE_PARAMETER -> SymbolInformation.Kind.TypeParameter;
       default -> SymbolInformation.Kind.UnspecifiedKind;
+    };
+  }
+
+  /** Classifies an occurrence's token, for editors that render it by [SyntaxKind]. */
+  private static SyntaxKind syntaxKind(Tree tree, Element sym, int role) {
+    if (tree != null) {
+      switch (tree.getKind()) {
+        case STRING_LITERAL -> {
+          return SyntaxKind.StringLiteral;
+        }
+        case CHAR_LITERAL -> {
+          return SyntaxKind.CharacterLiteral;
+        }
+        case INT_LITERAL, LONG_LITERAL, FLOAT_LITERAL, DOUBLE_LITERAL -> {
+          return SyntaxKind.NumericLiteral;
+        }
+        case BOOLEAN_LITERAL -> {
+          return SyntaxKind.BooleanLiteral;
+        }
+        case NULL_LITERAL -> {
+          return SyntaxKind.IdentifierNull;
+        }
+        case PRIMITIVE_TYPE -> {
+          return SyntaxKind.IdentifierBuiltinType;
+        }
+        case IDENTIFIER -> {
+          String name = ((IdentifierTree) tree).getName().toString();
+          if (name.equals("this") || name.equals("super")) return SyntaxKind.Keyword;
+        }
+        default -> {}
+      }
+    }
+    if (sym == null) return SyntaxKind.UnspecifiedSyntaxKind;
+    boolean isDefinition = role == SymbolRole.Definition_VALUE;
+    return switch (sym.getKind()) {
+      case METHOD, CONSTRUCTOR ->
+          isDefinition ? SyntaxKind.IdentifierFunctionDefinition : SyntaxKind.IdentifierFunction;
+      case PARAMETER -> SyntaxKind.IdentifierParameter;
+      case LOCAL_VARIABLE, EXCEPTION_PARAMETER -> SyntaxKind.IdentifierLocal;
+      case FIELD, ENUM_CONSTANT -> SyntaxKind.IdentifierConstant;
+      case CLASS, INTERFACE, ENUM, RECORD, ANNOTATION_TYPE -> SyntaxKind.IdentifierType;
+      case TYPE_PARAMETER -> SyntaxKind.IdentifierType;
+      case PACKAGE, MODULE -> SyntaxKind.IdentifierNamespace;
+      default -> SyntaxKind.Identifier;
     };
   }
 

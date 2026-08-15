@@ -24,6 +24,7 @@ import org.scip_code.scip.Occurrence
 import org.scip_code.scip.SymbolInformation
 import org.scip_code.scip.SymbolInformation.Kind
 import org.scip_code.scip.SymbolRole
+import org.scip_code.scip.SyntaxKind
 import org.scip_code.scip.relationship
 import org.scip_code.scip.signature
 import org.scip_code.scip.symbolInformation
@@ -53,7 +54,9 @@ class ScipTextDocumentBuilder(
         isDefinition: Boolean,
         enclosingSource: KtSourceElement? = null,
     ) {
-        documentBuilder.addOccurrence(occurrence(symbol, element, isDefinition, enclosingSource))
+        documentBuilder.addOccurrence(
+            occurrence(firBasedSymbol, symbol, element, isDefinition, enclosingSource)
+        )
         if (isDefinition) {
             documentBuilder.addSymbol(symbolInformation(firBasedSymbol, symbol, element))
         }
@@ -132,6 +135,7 @@ class ScipTextDocumentBuilder(
     }
 
     private fun occurrence(
+        firBasedSymbol: FirBasedSymbol<*>?,
         symbol: Symbol,
         element: KtSourceElement,
         isDefinition: Boolean,
@@ -139,6 +143,8 @@ class ScipTextDocumentBuilder(
     ): Occurrence {
         val builder = Occurrence.newBuilder().setSymbol(symbol.toString())
         if (isDefinition) builder.setSymbolRoles(SymbolRole.Definition.number)
+        val syntaxKind = syntaxKind(firBasedSymbol, symbol, element, isDefinition)
+        if (syntaxKind != SyntaxKind.UnspecifiedSyntaxKind) builder.syntaxKind = syntaxKind
         val range = range(element)
         if (range.isSingleLine) builder.singleLineRange = range.toSingleLineRange()
         else builder.multiLineRange = range.toMultiLineRange()
@@ -213,6 +219,31 @@ class ScipTextDocumentBuilder(
             is FirPackageDirective -> Kind.Package
             else -> Kind.UNRECOGNIZED
         }
+
+    /** Classifies an occurrence's token, for editors that render it by [SyntaxKind]. */
+    private fun syntaxKind(
+        firBasedSymbol: FirBasedSymbol<*>?,
+        symbol: Symbol,
+        element: KtSourceElement,
+        isDefinition: Boolean,
+    ): SyntaxKind {
+        val text = element.text?.toString()
+        if (text == "this" || text == "super") return SyntaxKind.Keyword
+        return when (firBasedSymbol) {
+            is FirValueParameterSymbol -> SyntaxKind.IdentifierParameter
+            is FirTypeParameterSymbol -> SyntaxKind.IdentifierType
+            is FirClassLikeSymbol -> SyntaxKind.IdentifierType
+            is FirFunctionSymbol<*>, is FirPropertyAccessorSymbol ->
+                if (isDefinition) SyntaxKind.IdentifierFunctionDefinition
+                else SyntaxKind.IdentifierFunction
+            is FirPropertySymbol, is FirVariableSymbol ->
+                if (symbol.isLocal()) SyntaxKind.IdentifierLocal else SyntaxKind.Identifier
+            null ->
+                if (symbol.toString().endsWith("/")) SyntaxKind.IdentifierNamespace
+                else SyntaxKind.UnspecifiedSyntaxKind
+            else -> SyntaxKind.UnspecifiedSyntaxKind
+        }
+    }
 
     /** Strips the `/**`, leading `*`s, and `*/` from a kdoc block, returning just the body text. */
     private fun stripKdoc(kdoc: String): String {

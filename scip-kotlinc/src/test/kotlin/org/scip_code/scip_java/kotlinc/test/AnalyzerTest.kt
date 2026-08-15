@@ -17,6 +17,7 @@ import org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi
 import org.junit.jupiter.api.io.TempDir
 import org.scip_code.scip.Document
 import org.scip_code.scip.SymbolInformation.Kind
+import org.scip_code.scip.SyntaxKind
 import org.scip_code.scip_java.kotlinc.*
 
 @OptIn(ExperimentalCompilerApi::class)
@@ -231,6 +232,7 @@ class AnalyzerTest {
                 scipOccurrence {
                     role = DEFINITION
                     symbol = "local 0"
+                    syntaxKind = SyntaxKind.IdentifierType
                     range {
                         startLine = 3
                         startCharacter = 8
@@ -248,6 +250,7 @@ class AnalyzerTest {
                 scipOccurrence {
                     role = DEFINITION
                     symbol = "local 1"
+                    syntaxKind = SyntaxKind.IdentifierFunctionDefinition
                     range {
                         startLine = 3
                         startCharacter = 8
@@ -265,6 +268,7 @@ class AnalyzerTest {
                 scipOccurrence {
                     role = DEFINITION
                     symbol = "local 2"
+                    syntaxKind = SyntaxKind.IdentifierFunctionDefinition
                     range {
                         startLine = 4
                         startCharacter = 8
@@ -335,6 +339,7 @@ class AnalyzerTest {
                 scipOccurrence {
                     role = DEFINITION
                     symbol = "local 0"
+                    syntaxKind = SyntaxKind.IdentifierLocal
                     range {
                         startLine = 3
                         startCharacter = 8
@@ -353,6 +358,7 @@ class AnalyzerTest {
                 scipOccurrence {
                     role = DEFINITION
                     symbol = "local 1"
+                    syntaxKind = SyntaxKind.IdentifierParameter
                     range {
                         startLine = 3
                         startCharacter = 14
@@ -381,6 +387,7 @@ class AnalyzerTest {
                 scipOccurrence {
                     role = REFERENCE
                     symbol = "local 1"
+                    syntaxKind = SyntaxKind.IdentifierParameter
                     range {
                         startLine = 3
                         startCharacter = 24
@@ -455,6 +462,7 @@ class AnalyzerTest {
                 scipOccurrence {
                     role = DEFINITION
                     symbol = "local 0"
+                    syntaxKind = SyntaxKind.IdentifierFunctionDefinition
                     range {
                         startLine = 3
                         startCharacter = 8
@@ -472,6 +480,7 @@ class AnalyzerTest {
                 scipOccurrence {
                     role = DEFINITION
                     symbol = "local 1"
+                    syntaxKind = SyntaxKind.IdentifierFunctionDefinition
                     range {
                         startLine = 4
                         startCharacter = 8
@@ -500,6 +509,7 @@ class AnalyzerTest {
                 scipOccurrence {
                     role = REFERENCE
                     symbol = "local 0"
+                    syntaxKind = SyntaxKind.IdentifierFunction
                     range {
                         startLine = 5
                         startCharacter = 4
@@ -997,6 +1007,7 @@ class AnalyzerTest {
                 scipOccurrence {
                     role = DEFINITION
                     symbol = "local 1"
+                    syntaxKind = SyntaxKind.IdentifierType
                     range {
                         startLine = 7
                         startCharacter = 12
@@ -1013,6 +1024,7 @@ class AnalyzerTest {
                 scipOccurrence {
                     role = DEFINITION
                     symbol = "local 2"
+                    syntaxKind = SyntaxKind.IdentifierFunctionDefinition
                     range {
                         startLine = 7
                         startCharacter = 12
@@ -1039,6 +1051,7 @@ class AnalyzerTest {
                 scipOccurrence {
                     role = DEFINITION
                     symbol = "local 3"
+                    syntaxKind = SyntaxKind.IdentifierFunctionDefinition
                     range {
                         startLine = 8
                         startCharacter = 21
@@ -1055,6 +1068,7 @@ class AnalyzerTest {
                 scipOccurrence {
                     role = DEFINITION
                     symbol = "local 5"
+                    syntaxKind = SyntaxKind.IdentifierType
                     range {
                         startLine = 10
                         startCharacter = 12
@@ -1071,6 +1085,7 @@ class AnalyzerTest {
                 scipOccurrence {
                     role = DEFINITION
                     symbol = "local 6"
+                    syntaxKind = SyntaxKind.IdentifierFunctionDefinition
                     range {
                         startLine = 10
                         startCharacter = 12
@@ -1097,6 +1112,7 @@ class AnalyzerTest {
                 scipOccurrence {
                     role = DEFINITION
                     symbol = "local 7"
+                    syntaxKind = SyntaxKind.IdentifierFunctionDefinition
                     range {
                         startLine = 11
                         startCharacter = 21
@@ -2371,6 +2387,7 @@ class AnalyzerTest {
                 scipOccurrence {
                     role = DEFINITION
                     symbol = "local 2"
+                    syntaxKind = SyntaxKind.IdentifierFunctionDefinition
                     range {
                         startLine = 4
                         startCharacter = 21
