@@ -6,10 +6,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
 import org.gradle.api.DefaultTask;
 import org.gradle.api.Project;
+import org.gradle.api.artifacts.Configuration;
 import org.gradle.api.publish.PublishingExtension;
 import org.gradle.api.publish.maven.MavenPublication;
 import org.gradle.api.tasks.SourceSet;
@@ -106,33 +109,44 @@ public class WriteDependencies extends DefaultTask {
                   + "\"\nContinuing without cross-repository support.");
     }
 
+    // Snapshot the resolvable configuration names before resolving them.
+    // Resolving a configuration lazily registers new configurations, so
+    // iterating the container while resolving throws
+    // ConcurrentModificationException.
+    List<String> resolvableConfigNames = new ArrayList<>();
     project
         .getConfigurations()
         .forEach(
             conf -> {
               if (conf.isCanBeResolved()) {
-                try {
-                  conf.getResolvedConfiguration()
-                      .getResolvedArtifacts()
-                      .forEach(
-                          artifact ->
-                              deps.add(
-                                  String.join(
-                                      "\t",
-                                      artifact.getModuleVersion().getId().getGroup(),
-                                      artifact.getModuleVersion().getId().getName(),
-                                      artifact.getModuleVersion().getId().getVersion(),
-                                      artifact.getFile().getAbsolutePath())));
-                } catch (Exception exc) {
-                  getLogger()
-                      .warn(
-                          "Skipping configuration '"
-                              + conf.getName()
-                              + "' due to resolution failure: "
-                              + exc.getMessage());
-                }
+                resolvableConfigNames.add(conf.getName());
               }
             });
+
+    for (String confName : resolvableConfigNames) {
+      Configuration conf = project.getConfigurations().findByName(confName);
+      if (conf == null) continue;
+      try {
+        conf.getResolvedConfiguration()
+            .getResolvedArtifacts()
+            .forEach(
+                artifact ->
+                    deps.add(
+                        String.join(
+                            "\t",
+                            artifact.getModuleVersion().getId().getGroup(),
+                            artifact.getModuleVersion().getId().getName(),
+                            artifact.getModuleVersion().getId().getVersion(),
+                            artifact.getFile().getAbsolutePath())));
+      } catch (Exception exc) {
+        getLogger()
+            .warn(
+                "Skipping configuration '"
+                    + conf.getName()
+                    + "' due to resolution failure: "
+                    + exc.getMessage());
+      }
+    }
 
     Files.write(dependenciesPath, deps, StandardOpenOption.APPEND, StandardOpenOption.CREATE);
   }

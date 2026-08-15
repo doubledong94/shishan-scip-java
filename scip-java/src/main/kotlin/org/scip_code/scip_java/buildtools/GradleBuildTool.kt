@@ -87,6 +87,11 @@ This means our SCIP compiler plugin was not attached to one or more JavaCompile 
         val cmd = mutableListOf<String>()
         cmd += gradleCommand
         cmd += "--no-daemon"
+        // Builds that enable the configuration cache (e.g. okhttp sets
+        // org.gradle.configuration-cache=true with problems=fail) reject the
+        // scip plugin's `WriteDependencies` task, which calls Task.project at
+        // execution time. Disable it for the indexing build.
+        cmd += "--no-configuration-cache"
         cmd += "--init-script"
         cmd += script
         cmd += "-Pkotlin.compiler.execution.strategy=in-process"
@@ -116,6 +121,13 @@ This means our SCIP compiler plugin was not attached to one or more JavaCompile 
              import org.scip_code.scip_java.gradle.ScipGradlePlugin
 
              allprojects {
+               // Skip build-infra included builds (e.g. okhttp's build-logic): their
+               // precompiled Kotlin DSL plugins wire freeCompilerArgs lazily, which the
+               // scip plugin's eager read breaks (Gradle: querying a mapped provider
+               // value before the accessor task has completed is not supported).
+               if (project.rootProject.name == "build-logic") {
+                 return
+               }
                project.ext["scipTarget"] = "${targetroot()}"
                project.ext["javacPluginJar"] = "$pluginpath"
                project.ext["dependenciesOut"] = "$dependenciesPath"
