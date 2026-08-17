@@ -211,6 +211,126 @@ class GraphExtractorTest {
     assertTrue(argLinked, "kotlin argument ARG_OF the call");
   }
 
+  @Test
+  void extractsRuntimeEdges() {
+    // class A { int f; void m() { f = g; if (f>0) a.b(); else if (x>1) c(); } }
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    cls.children.add(node("VARIABLE", 2, def("pkg/A#f.", "IdentifierConstant", 2)));
+
+    SyntaxTree.Node method =
+        node("METHOD", 3, def("pkg/A#m().", "IdentifierFunctionDefinition", 3));
+
+    // f = g
+    SyntaxTree.Node assign = node("ASSIGNMENT", 4);
+    assign.children.add(node("IDENTIFIER", 5, ref("pkg/A#f.", "IdentifierConstant", 5)));
+    assign.children.add(node("IDENTIFIER", 6, ref("pkg/G#g.", "IdentifierConstant", 6)));
+    method.children.add(assign);
+
+    // if (f > 0) a.b(); else if (x > 1) c();
+    SyntaxTree.Node ifNode = node("IF", 7);
+    SyntaxTree.Node condExpr = node("BINARY_EXPRESSION", 8);
+    condExpr.children.add(node("IDENTIFIER", 9, ref("pkg/A#f.", "IdentifierConstant", 9)));
+    ifNode.children.add(condExpr);
+    SyntaxTree.Node thenBlock = node("BLOCK", 10);
+    SyntaxTree.Node call = node("CALL_EXPRESSION", 11);
+    SyntaxTree.Node dot = node("DOT_QUALIFIED_EXPRESSION", 12);
+    dot.children.add(node("REFERENCE_EXPRESSION", 13, ref("pkg/B#a.", "IdentifierConstant", 13)));
+    dot.children.add(node("IDENTIFIER", 14, ref("pkg/B#b().", "IdentifierFunction", 14)));
+    call.children.add(dot);
+    thenBlock.children.add(call);
+    ifNode.children.add(thenBlock);
+    SyntaxTree.Node elseIf = node("IF", 15);
+    elseIf.children.add(node("IDENTIFIER", 16, ref("pkg/C#x.", "IdentifierConstant", 16)));
+    ifNode.children.add(elseIf);
+    method.children.add(ifNode);
+
+    cls.children.add(method);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#f.", info(SymbolInformation.Kind.Field, "f"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    symbols.put("pkg/G#g.", info(SymbolInformation.Kind.Field, "g"));
+    symbols.put("pkg/B#a.", info(SymbolInformation.Kind.Field, "a"));
+    symbols.put("pkg/B#b().", info(SymbolInformation.Kind.Method, "b"));
+    symbols.put("pkg/C#c().", info(SymbolInformation.Kind.Method, "c"));
+    symbols.put("pkg/C#x.", info(SymbolInformation.Kind.Field, "x"));
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    // Runtime nodes are distinct from the declaration node.
+    assertTrue(hasNode(sink, GraphModel.LABEL_FIELD, "test::pkg/A#f."), "field declaration");
+    List<Map<String, Object>> fieldRuntimes =
+        nodesOf(sink, GraphModel.LABEL_VALUE).stream()
+            .filter(v -> GraphModel.VALUE_KIND_FIELD.equals(v.get("kind")))
+            .toList();
+    assertEquals(
+        5,
+        fieldRuntimes.size(),
+        "five runtime field values: f-write, g-read, f-read, a-read(receiver), x-read(else cond)");
+    assertTrue(
+        fieldRuntimes.stream().noneMatch(v -> "test::pkg/A#f.".equals(v.get("_id"))),
+        "runtime values must not collide with the declaration id");
+
+    // FLOWS from assignment (g -> f) and last-write (f write -> f read in condition).
+    boolean assignFlow =
+        edgesOf(sink, GraphModel.REL_FLOWS).stream()
+            .anyMatch(e -> ((String) e.get("_to")).contains("Foo.java#5:0:FIELD"));
+    assertTrue(assignFlow, "assignment g flows into f write (line 5)");
+    boolean lastWriteFlow =
+        edgesOf(sink, GraphModel.REL_FLOWS).stream()
+            .anyMatch(
+                e ->
+                    ((String) e.get("_from")).contains("Foo.java#5:0:FIELD")
+                        && ((String) e.get("_to")).contains("Foo.java#9:0:FIELD"));
+    assertTrue(lastWriteFlow, "f write (line 5) flows into f read (line 9)");
+
+    // CONTROLS: f value guards the if condition.
+    String ifCond =
+        conditionsOfKind(sink, GraphModel.CONDITION_KIND_IF).stream()
+            .filter(c -> ((String) c.get("_id")).contains("Foo.java#7"))
+            .findFirst()
+            .map(c -> (String) c.get("_id"))
+            .orElseThrow();
+    boolean controls =
+        edgesOf(sink, GraphModel.REL_CONTROLS).stream()
+            .anyMatch(
+                e ->
+                    ((String) e.get("_from")).contains("Foo.java#9:0:FIELD")
+                        && ifCond.equals(e.get("_to")));
+    assertTrue(controls, "f value controls the if branch");
+
+    // REF: receiver a reaches the called method b.
+    boolean ref =
+        edgesOf(sink, GraphModel.REL_REF).stream()
+            .anyMatch(e -> ((String) e.get("_from")).contains("Foo.java#13:0:FIELD"));
+    assertTrue(ref, "receiver a REF the call");
+
+    // ELSE: else-if chain.
+    String elseIfCond =
+        conditionsOfKind(sink, GraphModel.CONDITION_KIND_IF).stream()
+            .filter(c -> ((String) c.get("_id")).contains("Foo.java#15"))
+            .findFirst()
+            .map(c -> (String) c.get("_id"))
+            .orElseThrow();
+    assertTrue(hasEdge(sink, GraphModel.REL_ELSE, ifCond, elseIfCond), "else-if chain");
+  }
+
+  private static List<Map<String, Object>> conditionsOfKind(MemorySink sink, String kind) {
+    return nodesOf(sink, GraphModel.LABEL_CONDITION).stream()
+        .filter(c -> kind.equals(c.get("kind")))
+        .toList();
+  }
+
+  private static List<Map<String, Object>> edgesOf(MemorySink sink, String type) {
+    return sink.edges.stream().filter(e -> type.equals(e.get("_type"))).toList();
+  }
+
   private static boolean hasNode(MemorySink sink, String label, String id) {
     for (Map<String, Object> row : sink.nodes) {
       if (label.equals(row.get("_label")) && id.equals(row.get("_id"))) return true;

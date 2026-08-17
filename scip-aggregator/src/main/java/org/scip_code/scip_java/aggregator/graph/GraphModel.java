@@ -38,6 +38,9 @@ public final class GraphModel {
   public static final String REL_SCOPED_BY = "SCOPED_BY";
   public static final String REL_ARG_OF = "ARG_OF";
   public static final String REL_RET_OF = "RET_OF";
+  public static final String REL_FLOWS = "FLOWS";
+  public static final String REL_CONTROLS = "CONTROLS";
+  public static final String REL_REF = "REF";
 
   // Value kinds (mirror the old viewer's KEY_TYPE_* concepts, subset relevant to the indexer).
   public static final String VALUE_KIND_PARAM = "PARAM";

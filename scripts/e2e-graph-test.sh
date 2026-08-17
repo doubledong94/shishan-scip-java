@@ -113,13 +113,17 @@ METHOD_N=$(q "MATCH (m:Method {projectId:'$PROJECT'}) RETURN count(m)")
 CALLS_N=$(q "MATCH (:CalledMethod {projectId:'$PROJECT'})-[:CALLS]->(:Method) RETURN count(*)")
 IF_N=$(q "MATCH (c:Condition {projectId:'$PROJECT', kind:'IF'}) RETURN count(c)")
 FIELDS_N=$(q "MATCH (f:Field {projectId:'$PROJECT'}) RETURN count(f)")
+FLOWS_N=$(q "MATCH (:Value {projectId:'$PROJECT'})-[:FLOWS]->(:Value {projectId:'$PROJECT'}) RETURN count(*)")
+CONTROLS_N=$(q "MATCH (:Value {projectId:'$PROJECT'})-[:CONTROLS]->(:Condition {projectId:'$PROJECT'}) RETURN count(*)")
 
-echo "  Class=$CLASS_N Method=$METHOD_N Field=$FIELDS_N CalledMethod->CALLS=$CALLS_N Condition(IF)=$IF_N"
+echo "  Class=$CLASS_N Method=$METHOD_N Field=$FIELDS_N CALLS=$CALLS_N IF=$IF_N FLOWS=$FLOWS_N CONTROLS=$CONTROLS_N"
 
 [ "${CLASS_N:-0}" -ge 1 ] || { echo "FAIL: 期望至少 1 个 Class"; exit 1; }
 [ "${METHOD_N:-0}" -ge 3 ] || { echo "FAIL: 期望至少 3 个 Method（构造器+incr+bar）"; exit 1; }
 [ "${FIELDS_N:-0}" -ge 1 ] || { echo "FAIL: 期望至少 1 个 Field"; exit 1; }
 [ "${CALLS_N:-0}" -ge 2 ] || { echo "FAIL: 期望至少 2 条 CALLS（incr(x)/incr(1)）"; exit 1; }
 [ "${IF_N:-0}" -ge 1 ] || { echo "FAIL: 期望至少 1 个 IF 分支"; exit 1; }
+[ "${FLOWS_N:-0}" -ge 1 ] || { echo "FAIL: 期望至少 1 条 FLOWS（数据流）"; exit 1; }
+[ "${CONTROLS_N:-0}" -ge 1 ] || { echo "FAIL: 期望至少 1 条 CONTROLS（条件控制）"; exit 1; }
 
 echo "PASS"

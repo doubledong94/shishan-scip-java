@@ -18,20 +18,29 @@ import org.scip_code.scip_java.shared.SyntaxTree;
  * <p>Handles both compiler front-ends:
  *
  * <ul>
- *   <li>javac: definition occurrences sit on the structural node itself ({@code CLASS} / {@code
- *       METHOD} / {@code VARIABLE});
+ *   <li>javac: definitions sit on the structural node itself ({@code CLASS}/{@code METHOD}/{@code
+ *       VARIABLE});
  *   <li>scip-kotlinc: the tree is the Kotlin PSI lighter-AST; definitions sit on the name {@code
- *       IDENTIFIER} token under the structural node ({@code CLASS} / {@code FUN} / ...), and method
- *       / call nodes are named {@code FUN} / {@code CALL_EXPRESSION}.
+ *       IDENTIFIER} under the structural node ({@code CLASS}/{@code FUN}/...), and call/assignment
+ *       nodes are named {@code CALL_EXPRESSION} / {@code BINARY_EXPRESSION} (with an {@code
+ *       OPERATION_REFERENCE} carrying the operator).
  * </ul>
  *
- * <p>Declaration nodes are created from definition occurrences (classified by SCIP {@code
- * syntaxKind}); containment ({@code DECLARES} / {@code HAS_PARAM}) is derived from the SCIP symbol
- * hierarchy in a post-pass (robust across both front-ends), while the tree provides the branch and
- * call structure ({@code Condition} with {@code ROOT}/{@code SUB}/{@code LEADS_TO}, {@code
- * CalledMethod} with {@code CALLS}/{@code ARG_OF}/{@code SCOPED_BY}). Data-flow ({@code FLOWS}),
- * {@code CONTROLS}, {@code REF} and precise else-if ({@code ELSE}) edges are deferred to a later
- * pass.
+ * <p>Two kinds of nodes exist per the graph model ({@code shishanMcp/doc/GRAPH_MODEL.md}):
+ *
+ * <ul>
+ *   <li><b>declaration nodes</b> ({@code Class}/{@code Method}/{@code Field}/{@code Value(PARAM/…)})
+ *       — one per defined symbol;
+ *   <li><b>runtime nodes</b> ({@code Value} reads/writes, {@code CalledMethod}/{@code
+ *       CalledParam}/{@code CalledReturn}) — one per occurrence, mirroring the old viewer's
+ *       {@code runtimeKey = key(structure;sentence;index)} model.
+ * </ul>
+ *
+ * <p>Edges: declarations wired by {@code DECLARES}/{@code HAS_PARAM} (SCIP symbol hierarchy) and
+ * {@code EXTENDS}/{@code OVERRIDES}; runtime layer wired by {@code FLOWS} (assignment, last-write,
+ * argument passing, return), {@code CONTROLS} (value guards a branch), {@code REF} (receiver
+ * reaches a call), {@code ROOT}/{@code SUB}/{@code ELSE}/{@code LEADS_TO} (branches) and {@code
+ * CALLS}/{@code ARG_OF}/{@code SCOPED_BY} (calls).
  */
 public final class GraphExtractor {
 
@@ -44,6 +53,10 @@ public final class GraphExtractor {
 
   private final Deque<String> methodRootConds = new ArrayDeque<>();
   private final Deque<String> conds = new ArrayDeque<>();
+  // Last-write per variable symbol, one frame per method (walk order == source order).
+  private final Deque<Map<String, String>> lastWriteFrames = new ArrayDeque<>();
+  // Runtime ids that are assignment targets (writes).
+  private final java.util.Set<String> writeRuntimeIds = new java.util.HashSet<>();
 
   public GraphExtractor(
       GraphSink writer, String project, Map<String, SymbolInformation> symbols) {
@@ -76,17 +89,10 @@ public final class GraphExtractor {
   // ---------------------------------------------------------------------------
 
   public void extractFile(String file, SyntaxTree.Node root) {
-    walk(file, root);
+    walk(file, root, null, -1);
   }
 
-  /**
-   * Emits the declaration-relationship edges:
-   *
-   * <ul>
-   *   <li>{@code DECLARES} / {@code HAS_PARAM} derived from the SCIP symbol hierarchy;
-   *   <li>{@code EXTENDS} / {@code OVERRIDES} from {@link SymbolInformation} relationships.
-   * </ul>
-   */
+  /** Emits declaration-relationship edges ({@code DECLARES}/{@code HAS_PARAM}/{@code EXTENDS}/{@code OVERRIDES}). */
   public void emitRelationships() {
     for (Map.Entry<String, String> entry : createdSymbolLabel.entrySet()) {
       String symbol = entry.getKey();
@@ -140,33 +146,38 @@ public final class GraphExtractor {
   // Tree walk
   // ---------------------------------------------------------------------------
 
-  private void walk(String file, SyntaxTree.Node node) {
-    enter(file, node);
-    for (SyntaxTree.Node child : node.children) {
-      walk(file, child);
+  private void walk(String file, SyntaxTree.Node node, SyntaxTree.Node parent, int index) {
+    enter(file, node, parent, index);
+    List<SyntaxTree.Node> children = node.children;
+    for (int i = 0; i < children.size(); i++) {
+      walk(file, children.get(i), node, i);
     }
     exit(node);
   }
 
-  private void enter(String file, SyntaxTree.Node node) {
-    // Method scope: a structural method node (javac METHOD / Kotlin FUN) anchors a root condition
-    // so body-level calls can be SCOPED_BY it.
+  private void enter(String file, SyntaxTree.Node node, SyntaxTree.Node parent, int index) {
     if (isMethodKind(node.kind)) {
       SyntaxTree.OccurrenceData def = structuralDefinition(node);
       if (def != null) pushMethodScope(file, node, def);
     }
 
-    // Create a declaration node for every definition occurrence (MERGE dedups by id when a
-    // structural node and its name token carry the same definition).
     SyntaxTree.OccurrenceData def = definition(node);
     if (def != null) createDeclaration(file, node, def);
 
+    if (isAssignment(node)) {
+      handleAssignment(file, node);
+    }
     if (isInvocationKind(node.kind)) {
-      enterInvocation(file, node);
+      enterInvocation(file, node, parent);
     }
     if (isConditionKind(node.kind)) {
-      enterCondition(file, node);
+      enterCondition(file, node, parent, index);
     }
+    if (isReturnKind(node.kind)) {
+      handleReturn(file, node);
+    }
+
+    emitReferenceValues(file, node);
   }
 
   private void exit(SyntaxTree.Node node) {
@@ -174,6 +185,7 @@ public final class GraphExtractor {
     if (isMethodKind(node.kind)) {
       if (!methodRootConds.isEmpty()) methodRootConds.pop();
       if (!conds.isEmpty()) conds.pop(); // method root condition
+      if (!lastWriteFrames.isEmpty()) lastWriteFrames.pop();
     }
   }
 
@@ -194,6 +206,7 @@ public final class GraphExtractor {
     writer.addEdge(GraphModel.REL_ROOT, GraphModel.LABEL_METHOD, id, GraphModel.LABEL_CONDITION, rootCond);
     methodRootConds.push(rootCond);
     conds.push(rootCond);
+    lastWriteFrames.push(new LinkedHashMap<>());
   }
 
   private void createDeclaration(String file, SyntaxTree.Node node, SyntaxTree.OccurrenceData def) {
@@ -239,10 +252,132 @@ public final class GraphExtractor {
   }
 
   // ---------------------------------------------------------------------------
+  // Runtime value nodes (reads / writes), mirroring the old viewer's runtime items
+  // ---------------------------------------------------------------------------
+
+  private void emitReferenceValues(String file, SyntaxTree.Node node) {
+    for (SyntaxTree.OccurrenceData occ : node.occurrences) {
+      if (occ.role != 0) continue;
+      String kind = valueKindFor(occ.syntaxKind);
+      if (kind == null) continue;
+      String id = runtimeId(project, file, occ.range, kind);
+      boolean isWrite = writeRuntimeIds.contains(id);
+      Map<String, Object> props = new LinkedHashMap<>();
+      props.put("name", shortName(occ.symbol));
+      props.put("symbol", occ.symbol);
+      props.put("file", file);
+      props.put("line", rangeLine(occ));
+      props.put("kind", kind);
+      props.put("access", isWrite ? "write" : "read");
+      writer.addNode(GraphModel.LABEL_VALUE, id, props);
+
+      String scope = innermostCond();
+      if (scope != null) {
+        writer.addEdge(GraphModel.REL_SCOPED_BY, GraphModel.LABEL_VALUE, id, GraphModel.LABEL_CONDITION, scope);
+      }
+
+      if (isWrite) {
+        if (!lastWriteFrames.isEmpty()) lastWriteFrames.peek().put(occ.symbol, id);
+      } else {
+        String lastWrite =
+            lastWriteFrames.isEmpty() ? null : lastWriteFrames.peek().get(occ.symbol);
+        if (lastWrite != null && !lastWrite.equals(id)) {
+          writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, lastWrite, GraphModel.LABEL_VALUE, id);
+        }
+      }
+    }
+  }
+
+  /** Kind of a runtime value reference (read/write of a field/param/localvar), or null. */
+  private static String valueKindFor(String syntaxKind) {
+    if (syntaxKind == null) return null;
+    return switch (syntaxKind) {
+      case "IdentifierConstant" -> GraphModel.VALUE_KIND_FIELD;
+      case "Identifier" -> GraphModel.VALUE_KIND_FIELD; // Kotlin non-local property
+      case "IdentifierParameter" -> GraphModel.VALUE_KIND_PARAM;
+      case "IdentifierLocal" -> GraphModel.VALUE_KIND_LOCAL_VAR;
+      default -> null;
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Assignments → FLOWS
+  // ---------------------------------------------------------------------------
+
+  private void handleAssignment(String file, SyntaxTree.Node node) {
+    List<SyntaxTree.Node> operands = assignmentOperands(node);
+    if (operands.size() < 2) return;
+    SyntaxTree.Node lhs = operands.get(0);
+    SyntaxTree.Node rhs = operands.get(operands.size() - 1);
+    String lhsId = firstValueRuntimeId(file, lhs);
+    String rhsId = firstValueRuntimeId(file, rhs);
+    if (lhsId != null) writeRuntimeIds.add(lhsId);
+    if (lhsId != null && rhsId != null) {
+      writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, rhsId, GraphModel.LABEL_VALUE, lhsId);
+    }
+  }
+
+  private static List<SyntaxTree.Node> assignmentOperands(SyntaxTree.Node node) {
+    List<SyntaxTree.Node> out = new ArrayList<>();
+    for (SyntaxTree.Node child : node.children) {
+      if (child.kind.equals("WHITE_SPACE") || child.kind.equals("OPERATION_REFERENCE")) continue;
+      out.add(child);
+    }
+    return out;
+  }
+
+  private String firstValueRuntimeId(String file, SyntaxTree.Node subtree) {
+    SyntaxTree.OccurrenceData occ = firstValueReference(subtree);
+    if (occ == null) return null;
+    String kind = valueKindFor(occ.syntaxKind);
+    if (kind == null) return null;
+    return runtimeId(project, file, occ.range, kind);
+  }
+
+  private static SyntaxTree.OccurrenceData firstValueReference(SyntaxTree.Node subtree) {
+    for (SyntaxTree.OccurrenceData occ : subtree.occurrences) {
+      if (occ.role == 0 && valueKindFor(occ.syntaxKind) != null) return occ;
+    }
+    for (SyntaxTree.Node child : subtree.children) {
+      SyntaxTree.OccurrenceData d = firstValueReference(child);
+      if (d != null) return d;
+    }
+    return null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Returns → FLOWS
+  // ---------------------------------------------------------------------------
+
+  private void handleReturn(String file, SyntaxTree.Node node) {
+    // The returned value flows into the enclosing method's return slot.
+    List<SyntaxTree.Node> operands = nonWhitespaceChildren(node);
+    if (operands.isEmpty()) return;
+    String valueId = firstValueRuntimeId(file, operands.get(operands.size() - 1));
+    if (valueId == null) return;
+    SyntaxTree.OccurrenceData valueOcc = firstValueReference(operands.get(operands.size() - 1));
+    if (valueOcc == null) return;
+    String returnId = runtimeId(project, file, node.range, GraphModel.VALUE_KIND_RETURN);
+    Map<String, Object> props = new LinkedHashMap<>();
+    props.put("name", "return");
+    props.put("symbol", valueOcc.symbol);
+    props.put("file", file);
+    props.put("line", rangeLine(node));
+    props.put("kind", GraphModel.VALUE_KIND_RETURN);
+    props.put("access", "write");
+    writer.addNode(GraphModel.LABEL_VALUE, returnId, props);
+    String scope = innermostCond();
+    if (scope != null) {
+      writer.addEdge(GraphModel.REL_SCOPED_BY, GraphModel.LABEL_VALUE, returnId, GraphModel.LABEL_CONDITION, scope);
+    }
+    writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, valueId, GraphModel.LABEL_VALUE, returnId);
+  }
+
+  // ---------------------------------------------------------------------------
   // Call layer
   // ---------------------------------------------------------------------------
 
-  private void enterInvocation(String file, SyntaxTree.Node node) {
+  private void enterInvocation(String file, SyntaxTree.Node node, SyntaxTree.Node parent) {
     String symbol = invocationSymbol(node);
     if (symbol == null) return;
     String id = runtimeId(project, file, node.range, null);
@@ -266,7 +401,7 @@ public final class GraphExtractor {
       }
     }
 
-    // Argument values → ARG_OF.
+    // Runtime value nodes for the arguments → ARG_OF; the argument's value flows into the slot.
     List<SyntaxTree.Node> args = argumentNodes(node);
     int argIndex = 0;
     for (SyntaxTree.Node arg : args) {
@@ -284,15 +419,78 @@ public final class GraphExtractor {
       if (scope != null) {
         writer.addEdge(GraphModel.REL_SCOPED_BY, GraphModel.LABEL_VALUE, valueId, GraphModel.LABEL_CONDITION, scope);
       }
+      // The argument expression's value flows into this call slot.
+      String argSourceId = firstValueRuntimeId(file, arg);
+      if (argSourceId != null && !argSourceId.equals(valueId)) {
+        writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, argSourceId, GraphModel.LABEL_VALUE, valueId);
+      }
       argIndex++;
     }
+
+    // Call result (calledReturn) → flows into the assignment LHS when this call is the RHS.
+    String callReturnId = runtimeId(project, file, node.range, GraphModel.VALUE_KIND_CALLED_RETURN);
+    Map<String, Object> retProps = new LinkedHashMap<>();
+    retProps.put("name", shortName(symbol) + "#");
+    retProps.put("symbol", symbol);
+    retProps.put("file", file);
+    retProps.put("line", node.range == null ? 0 : node.range.startLine());
+    retProps.put("kind", GraphModel.VALUE_KIND_CALLED_RETURN);
+    writer.addNode(GraphModel.LABEL_VALUE, callReturnId, retProps);
+    if (scope != null) {
+      writer.addEdge(GraphModel.REL_SCOPED_BY, GraphModel.LABEL_VALUE, callReturnId, GraphModel.LABEL_CONDITION, scope);
+    }
+    if (parent != null && isAssignment(parent)) {
+      List<SyntaxTree.Node> operands = assignmentOperands(parent);
+      if (operands.size() >= 2) {
+        String lhsId = firstValueRuntimeId(file, operands.get(0));
+        if (lhsId != null) {
+          writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, callReturnId, GraphModel.LABEL_VALUE, lhsId);
+        }
+      }
+    }
+
+    // REF: the receiver expression's value references the call (nesting direction).
+    for (String receiverId : receiverValueIds(file, node)) {
+      writer.addEdge(GraphModel.REL_REF, GraphModel.LABEL_VALUE, receiverId, GraphModel.LABEL_CALLED_METHOD, id);
+    }
+  }
+
+  private List<String> receiverValueIds(String file, SyntaxTree.Node node) {
+    List<String> out = new ArrayList<>();
+    SyntaxTree.Node receiver = receiverSubtree(node);
+    if (receiver == null) return out;
+    collectValueIds(file, receiver, out);
+    return out;
+  }
+
+  private void collectValueIds(String file, SyntaxTree.Node subtree, List<String> out) {
+    for (SyntaxTree.OccurrenceData occ : subtree.occurrences) {
+      if (occ.role == 0 && valueKindFor(occ.syntaxKind) != null) {
+        out.add(runtimeId(project, file, occ.range, valueKindFor(occ.syntaxKind)));
+      }
+    }
+    for (SyntaxTree.Node child : subtree.children) {
+      collectValueIds(file, child, out);
+    }
+  }
+
+  /** The receiver chain child of an invocation (the object expression being called on), or null. */
+  private static SyntaxTree.Node receiverSubtree(SyntaxTree.Node node) {
+    for (SyntaxTree.Node child : node.children) {
+      if (child.kind.equals("DOT_QUALIFIED_EXPRESSION")
+          || child.kind.equals("SAFE_ACCESS_EXPRESSION")
+          || child.kind.equals("MEMBER_SELECT")) {
+        return child;
+      }
+    }
+    return null;
   }
 
   // ---------------------------------------------------------------------------
   // Conditions
   // ---------------------------------------------------------------------------
 
-  private void enterCondition(String file, SyntaxTree.Node node) {
+  private void enterCondition(String file, SyntaxTree.Node node, SyntaxTree.Node parent, int index) {
     String id = runtimeId(project, file, node.range, null);
     String kind =
         isLoopKind(node.kind) ? GraphModel.CONDITION_KIND_LOOP : GraphModel.CONDITION_KIND_IF;
@@ -302,11 +500,24 @@ public final class GraphExtractor {
     props.put("kind", kind);
     writer.addNode(GraphModel.LABEL_CONDITION, id, props);
 
-    String parent = innermostCond();
-    if (parent != null) {
-      writer.addEdge(GraphModel.REL_SUB, GraphModel.LABEL_CONDITION, parent, GraphModel.LABEL_CONDITION, id);
+    String parentCond = innermostCond();
+    if (parentCond != null) {
+      writer.addEdge(GraphModel.REL_SUB, GraphModel.LABEL_CONDITION, parentCond, GraphModel.LABEL_CONDITION, id);
     }
+    // else-if chain: Kotlin wraps the else branch in an ELSE node; javac puts it at child index >= 2.
+    boolean isElsePosition =
+        (parent != null && parent.kind.equals("ELSE"))
+            || (parent != null && isConditionKind(parent.kind) && index >= 2);
+    if (isElsePosition && parentCond != null) {
+      writer.addEdge(GraphModel.REL_ELSE, GraphModel.LABEL_CONDITION, parentCond, GraphModel.LABEL_CONDITION, id);
+    }
+
     conds.push(id);
+
+    // CONTROLS: values referenced in the condition expression guard this branch.
+    for (String valueId : conditionValueIds(file, node)) {
+      writer.addEdge(GraphModel.REL_CONTROLS, GraphModel.LABEL_VALUE, valueId, GraphModel.LABEL_CONDITION, id);
+    }
   }
 
   private String innermostCond() {
@@ -315,6 +526,35 @@ public final class GraphExtractor {
 
   private boolean isMethodRoot(String condId) {
     return !methodRootConds.isEmpty() && condId.equals(methodRootConds.peek());
+  }
+
+  private List<String> conditionValueIds(String file, SyntaxTree.Node node) {
+    SyntaxTree.Node expr = conditionExpression(node);
+    List<String> out = new ArrayList<>();
+    if (expr != null) collectValueIds(file, expr, out);
+    return out;
+  }
+
+  private static SyntaxTree.Node conditionExpression(SyntaxTree.Node node) {
+    if (node.kind.equals("IF")) {
+      for (SyntaxTree.Node child : node.children) {
+        if (!child.kind.equals("WHITE_SPACE")
+            && !child.kind.equals("THEN")
+            && !child.kind.equals("ELSE")
+            && !child.kind.equals("else")) {
+          return child;
+        }
+      }
+      return null;
+    }
+    // Loops: javac first child; Kotlin the CONDITION child.
+    for (SyntaxTree.Node child : node.children) {
+      if (child.kind.equals("CONDITION")) return child;
+    }
+    for (SyntaxTree.Node child : node.children) {
+      if (!child.kind.equals("WHITE_SPACE")) return child;
+    }
+    return null;
   }
 
   // ---------------------------------------------------------------------------
@@ -347,7 +587,8 @@ public final class GraphExtractor {
         || kind.equals("ENHANCED_FOR_LOOP")
         || kind.equals("WHILE")
         || kind.equals("FOR")
-        || kind.equals("DO_WHILE");
+        || kind.equals("DO_WHILE")
+        || kind.equals("WHEN");
   }
 
   private static boolean isLoopKind(String kind) {
@@ -366,6 +607,41 @@ public final class GraphExtractor {
         || kind.equals("CONSTRUCTOR_CALL");
   }
 
+  private static boolean isReturnKind(String kind) {
+    return kind.equals("RETURN");
+  }
+
+  private static boolean isAssignment(SyntaxTree.Node node) {
+    if (node.kind.equals("ASSIGNMENT")) return true;
+    if (node.kind.equals("BINARY_EXPRESSION")) {
+      for (SyntaxTree.Node child : node.children) {
+        if (child.kind.equals("OPERATION_REFERENCE") && isAssignOperation(child)) return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean isAssignOperation(SyntaxTree.Node opRef) {
+    for (SyntaxTree.Node child : opRef.children) {
+      switch (child.kind) {
+        case "EQ", "PLUSEQ", "MINUSEQ", "MULTEQ", "DIVEQ", "PERCEQ", "ANDEQ", "OREQ", "XOREQ",
+            "SHL", "SHR", "USHR" -> {
+          return true;
+        }
+        default -> {}
+      }
+    }
+    return false;
+  }
+
+  private static List<SyntaxTree.Node> nonWhitespaceChildren(SyntaxTree.Node node) {
+    List<SyntaxTree.Node> out = new ArrayList<>();
+    for (SyntaxTree.Node child : node.children) {
+      if (!child.kind.equals("WHITE_SPACE")) out.add(child);
+    }
+    return out;
+  }
+
   // ---------------------------------------------------------------------------
   // Occurrence helpers
   // ---------------------------------------------------------------------------
@@ -377,12 +653,7 @@ public final class GraphExtractor {
     return null;
   }
 
-  /**
-   * The structural node's own definition: the def on the node itself, or the first def among its
-   * direct children. For javac the def sits on the node; for Kotlin it sits on the name {@code
-   * IDENTIFIER} direct child. Deliberately shallow so nested members' defs are never mistaken for
-   * the node's own.
-   */
+  /** The structural node's own definition (itself or a direct child). */
   private static SyntaxTree.OccurrenceData structuralDefinition(SyntaxTree.Node node) {
     SyntaxTree.OccurrenceData own = definition(node);
     if (own != null) return own;
@@ -394,19 +665,18 @@ public final class GraphExtractor {
   }
 
   private static String invocationSymbol(SyntaxTree.Node node) {
-    SyntaxTree.OccurrenceData found = functionReference(node);
-    if (found != null) return found.symbol;
-    // Kotlin: callee reference sits on a direct child (OPERATION_REFERENCE / REFERENCE_EXPRESSION).
-    for (SyntaxTree.Node child : node.children) {
-      SyntaxTree.OccurrenceData d = functionReference(child);
-      if (d != null) return d.symbol;
-    }
-    return null;
+    return functionReferenceIn(node);
   }
 
-  private static SyntaxTree.OccurrenceData functionReference(SyntaxTree.Node node) {
+  /** First function-syntax reference in pre-order (skips value arguments). */
+  private static String functionReferenceIn(SyntaxTree.Node node) {
     for (SyntaxTree.OccurrenceData occ : node.occurrences) {
-      if (occ.role == 0 && isFunctionSyntax(occ.syntaxKind)) return occ;
+      if (occ.role == 0 && isFunctionSyntax(occ.syntaxKind)) return occ.symbol;
+    }
+    for (SyntaxTree.Node child : node.children) {
+      if (child.kind.equals("VALUE_ARGUMENT_LIST")) continue;
+      String s = functionReferenceIn(child);
+      if (s != null) return s;
     }
     return null;
   }
@@ -417,15 +687,19 @@ public final class GraphExtractor {
         || syntaxKind.equals("IdentifierFunctionDefinition");
   }
 
-  /** The argument expression nodes of an invocation. */
   private static List<SyntaxTree.Node> argumentNodes(SyntaxTree.Node node) {
     List<SyntaxTree.Node> out = new ArrayList<>();
     String calleeSymbol = invocationSymbol(node);
+    SyntaxTree.Node receiver = receiverSubtree(node);
     for (SyntaxTree.Node child : node.children) {
       if (child.kind.equals("VALUE_ARGUMENT_LIST")) {
         for (SyntaxTree.Node va : child.children) {
           if (va.kind.equals("VALUE_ARGUMENT")) out.add(va);
         }
+      } else if (child == receiver
+          || child.kind.equals("OPERATION_REFERENCE")
+          || child.kind.equals("WHITE_SPACE")) {
+        continue;
       } else if (calleeSymbol == null || !hasSymbol(child, calleeSymbol)) {
         out.add(child);
       }
@@ -440,7 +714,6 @@ public final class GraphExtractor {
     return false;
   }
 
-  /** Best-effort value symbol for an invocation argument (first reference occurrence). */
   private static String argValueSymbol(SyntaxTree.Node arg) {
     for (SyntaxTree.OccurrenceData occ : arg.occurrences) {
       if (occ.role == 0 && occ.symbol != null && !occ.symbol.isEmpty()) return occ.symbol;
@@ -456,11 +729,9 @@ public final class GraphExtractor {
   // SCIP symbol hierarchy
   // ---------------------------------------------------------------------------
 
-  /** Owner symbol (parent) of a SCIP symbol, or null when it has no parent. */
   static String ownerOf(String symbol) {
     if (symbol == null || symbol.isEmpty()) return null;
     if (symbol.endsWith(").")) {
-      // method descriptor name(disambiguator)(params). → owner is the type/term before the name
       int depth = 0;
       int open = -1;
       for (int i = symbol.length() - 2; i >= 0; i--) {
@@ -480,19 +751,16 @@ public final class GraphExtractor {
       return j < 0 ? null : symbol.substring(0, j + 1);
     }
     if (symbol.endsWith(")")) {
-      // parameter descriptor (name)
       int i = symbol.length() - 2;
       while (i >= 0 && symbol.charAt(i) != '(') i--;
       return i < 0 ? null : symbol.substring(0, i);
     }
     if (symbol.endsWith("#")) {
-      // type descriptor name#
       int i = symbol.length() - 2;
       while (i >= 0 && isNameChar(symbol.charAt(i))) i--;
       return i < 0 ? null : symbol.substring(0, i + 1);
     }
     if (symbol.endsWith(".")) {
-      // term descriptor name.
       int i = symbol.length() - 2;
       while (i >= 0 && isNameChar(symbol.charAt(i))) i--;
       return i < 0 ? null : symbol.substring(0, i + 1);
@@ -527,7 +795,10 @@ public final class GraphExtractor {
     return occ.range == null ? 0 : occ.range.startLine();
   }
 
-  /** Extracts a readable name from a SCIP symbol (fallback when no SymbolInformation). */
+  private static int rangeLine(SyntaxTree.Node node) {
+    return node.range == null ? 0 : node.range.startLine();
+  }
+
   static String shortName(String symbol) {
     if (symbol.startsWith("local ")) return symbol.substring("local ".length());
     int hash = symbol.lastIndexOf('#');
