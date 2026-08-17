@@ -1,8 +1,10 @@
 package org.scip_code.scip_java.aggregator.graph;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import org.scip_code.scip.SymbolInformation;
 import org.scip_code.scip_java.shared.ScipRange;
@@ -11,23 +13,25 @@ import org.scip_code.scip_java.shared.SyntaxTree;
 
 /**
  * Walks the merged per-file syntax trees and rewritten {@link SymbolInformation} and streams the
- * code graph into a {@link Neo4jGraphWriter}.
+ * code graph into a {@link GraphSink}.
  *
- * <p>What this first pass produces (see {@code shishanMcp/doc/GRAPH_MODEL.md}):
+ * <p>Handles both compiler front-ends:
  *
  * <ul>
- *   <li>declaration layer: {@code Class} / {@code Method} / {@code Field} nodes plus {@code Value}
- *       nodes (PARAM / LOCAL_VAR), wired with {@code DECLARES} / {@code HAS_PARAM} / {@code
- *       EXTENDS} / {@code OVERRIDES};
- *   <li>call layer: {@code CalledMethod} per invocation + {@code CALLS} to the declared method
- *       (project-defined targets only) + argument {@code Value}s with {@code ARG_OF} + {@code
- *       SCOPED_BY};
- *   <li>branch layer: {@code Condition} nodes (if/loops) wired with {@code ROOT} / {@code SUB} and
- *       {@code LEADS_TO} from the branches that reach a call.
+ *   <li>javac: definition occurrences sit on the structural node itself ({@code CLASS} / {@code
+ *       METHOD} / {@code VARIABLE});
+ *   <li>scip-kotlinc: the tree is the Kotlin PSI lighter-AST; definitions sit on the name {@code
+ *       IDENTIFIER} token under the structural node ({@code CLASS} / {@code FUN} / ...), and method
+ *       / call nodes are named {@code FUN} / {@code CALL_EXPRESSION}.
  * </ul>
  *
- * <p>Data-flow ({@code FLOWS}), {@code CONTROLS}, {@code REF} and precise else-if ({@code ELSE})
- * edges are intentionally deferred to a later pass.
+ * <p>Declaration nodes are created from definition occurrences (classified by SCIP {@code
+ * syntaxKind}); containment ({@code DECLARES} / {@code HAS_PARAM}) is derived from the SCIP symbol
+ * hierarchy in a post-pass (robust across both front-ends), while the tree provides the branch and
+ * call structure ({@code Condition} with {@code ROOT}/{@code SUB}/{@code LEADS_TO}, {@code
+ * CalledMethod} with {@code CALLS}/{@code ARG_OF}/{@code SCOPED_BY}). Data-flow ({@code FLOWS}),
+ * {@code CONTROLS}, {@code REF} and precise else-if ({@code ELSE}) edges are deferred to a later
+ * pass.
  */
 public final class GraphExtractor {
 
@@ -35,8 +39,9 @@ public final class GraphExtractor {
   private final String project;
   private final Map<String, SymbolInformation> symbols;
 
-  private final Deque<String> classFrames = new ArrayDeque<>();
-  private final Deque<String> methodFrames = new ArrayDeque<>();
+  // Post-pass bookkeeping: created declaration symbols → node label.
+  private final Map<String, String> createdSymbolLabel = new LinkedHashMap<>();
+
   private final Deque<String> methodRootConds = new ArrayDeque<>();
   private final Deque<String> conds = new ArrayDeque<>();
 
@@ -74,8 +79,32 @@ public final class GraphExtractor {
     walk(file, root);
   }
 
-  /** Emits declaration-relationship edges ({@code EXTENDS} / {@code OVERRIDES}). */
+  /**
+   * Emits the declaration-relationship edges:
+   *
+   * <ul>
+   *   <li>{@code DECLARES} / {@code HAS_PARAM} derived from the SCIP symbol hierarchy;
+   *   <li>{@code EXTENDS} / {@code OVERRIDES} from {@link SymbolInformation} relationships.
+   * </ul>
+   */
   public void emitRelationships() {
+    for (Map.Entry<String, String> entry : createdSymbolLabel.entrySet()) {
+      String symbol = entry.getKey();
+      String label = entry.getValue();
+      String owner = ownerOf(symbol);
+      if (owner == null || owner.isEmpty()) continue;
+      if (!createdSymbolLabel.containsKey(owner)) continue;
+      String ownerId = declId(project, "", owner);
+      String memberId = declId(project, "", symbol);
+      if (GraphModel.LABEL_VALUE.equals(label)) {
+        writer.addEdge(
+            GraphModel.REL_HAS_PARAM, GraphModel.LABEL_METHOD, ownerId, GraphModel.LABEL_VALUE, memberId);
+      } else {
+        writer.addEdge(
+            GraphModel.REL_DECLARES, GraphModel.LABEL_CLASS, ownerId, label, memberId);
+      }
+    }
+
     for (Map.Entry<String, SymbolInformation> entry : symbols.entrySet()) {
       String sourceSymbol = entry.getKey();
       SymbolInformation info = entry.getValue();
@@ -120,11 +149,18 @@ public final class GraphExtractor {
   }
 
   private void enter(String file, SyntaxTree.Node node) {
-    SyntaxTree.OccurrenceData def = definition(node);
-    if (def != null) {
-      enterDeclaration(file, node, def);
-      return;
+    // Method scope: a structural method node (javac METHOD / Kotlin FUN) anchors a root condition
+    // so body-level calls can be SCOPED_BY it.
+    if (isMethodKind(node.kind)) {
+      SyntaxTree.OccurrenceData def = structuralDefinition(node);
+      if (def != null) pushMethodScope(file, node, def);
     }
+
+    // Create a declaration node for every definition occurrence (MERGE dedups by id when a
+    // structural node and its name token carry the same definition).
+    SyntaxTree.OccurrenceData def = definition(node);
+    if (def != null) createDeclaration(file, node, def);
+
     if (isInvocationKind(node.kind)) {
       enterInvocation(file, node);
     }
@@ -134,94 +170,71 @@ public final class GraphExtractor {
   }
 
   private void exit(SyntaxTree.Node node) {
-    if (isTypeNode(node.kind) && !classFrames.isEmpty()) classFrames.pop();
-    if (node.kind.equals("METHOD")) {
-      if (!methodFrames.isEmpty()) methodFrames.pop();
-      if (!methodRootConds.isEmpty()) {
-        methodRootConds.pop();
-        if (!conds.isEmpty()) conds.pop(); // the method root condition
-      }
-    }
     if (isConditionKind(node.kind) && !conds.isEmpty()) conds.pop();
+    if (isMethodKind(node.kind)) {
+      if (!methodRootConds.isEmpty()) methodRootConds.pop();
+      if (!conds.isEmpty()) conds.pop(); // method root condition
+    }
   }
 
   // ---------------------------------------------------------------------------
   // Declarations
   // ---------------------------------------------------------------------------
 
-  private void enterDeclaration(
-      String file, SyntaxTree.Node node, SyntaxTree.OccurrenceData def) {
+  private void pushMethodScope(String file, SyntaxTree.Node node, SyntaxTree.OccurrenceData def) {
+    String symbol = def.symbol;
+    if (symbol.isEmpty() || ScipSymbols.isLocal(symbol)) return;
+    String id = declId(project, file, symbol);
+    String rootCond = runtimeId(project, file, def.range, "root");
+    Map<String, Object> rootProps = new LinkedHashMap<>();
+    rootProps.put("file", file);
+    rootProps.put("line", rangeLine(def));
+    rootProps.put("kind", GraphModel.CONDITION_KIND_METHOD);
+    writer.addNode(GraphModel.LABEL_CONDITION, rootCond, rootProps);
+    writer.addEdge(GraphModel.REL_ROOT, GraphModel.LABEL_METHOD, id, GraphModel.LABEL_CONDITION, rootCond);
+    methodRootConds.push(rootCond);
+    conds.push(rootCond);
+  }
+
+  private void createDeclaration(String file, SyntaxTree.Node node, SyntaxTree.OccurrenceData def) {
     String symbol = def.symbol;
     if (symbol.isEmpty()) return;
-    String id = declId(project, file, symbol);
-    SymbolInformation info = symbols.get(symbol);
     String syntaxKind = def.syntaxKind;
-    String displayName =
-        info != null && !info.getDisplayName().isEmpty()
-            ? info.getDisplayName()
-            : shortName(symbol);
-    int line = def.range == null ? 0 : def.range.startLine();
+    SymbolInformation info = symbols.get(symbol);
+    String name = displayName(info, symbol);
+    Map<String, Object> props = new LinkedHashMap<>();
+    props.put("name", name);
+    props.put("file", file);
+    props.put("line", rangeLine(def));
+    props.put("symbol", symbol);
+    if (info != null && info.hasSignatureDocumentation()) {
+      props.put("signature", info.getSignatureDocumentation().getText());
+    }
 
-    if (isTypeNode(node.kind)) {
-      Map<String, Object> props = new LinkedHashMap<>();
-      props.put("name", displayName);
-      props.put("file", file);
-      props.put("line", line);
-      props.put("symbol", symbol);
+    String label;
+    if ("IdentifierType".equals(syntaxKind)) {
       props.put("kind", typeKind(info));
-      writer.addNode(GraphModel.LABEL_CLASS, id, props);
-      if (!classFrames.isEmpty()) {
-        writer.addEdge(GraphModel.REL_DECLARES, GraphModel.LABEL_CLASS, classFrames.peek(), GraphModel.LABEL_CLASS, id);
-      }
-      classFrames.push(id);
-    } else if (node.kind.equals("METHOD")) {
-      Map<String, Object> props = new LinkedHashMap<>();
-      props.put("name", displayName);
-      props.put("file", file);
-      props.put("line", line);
-      props.put("symbol", symbol);
-      boolean isConstructor = info != null && info.getKind() == SymbolInformation.Kind.Constructor;
+      label = GraphModel.LABEL_CLASS;
+    } else if ("IdentifierFunctionDefinition".equals(syntaxKind)) {
+      boolean isConstructor =
+          info != null && info.getKind() == SymbolInformation.Kind.Constructor;
       props.put("isConstructor", isConstructor);
-      if (info != null && info.hasSignatureDocumentation()) {
-        props.put("signature", info.getSignatureDocumentation().getText());
-      }
-      writer.addNode(GraphModel.LABEL_METHOD, id, props);
-      if (!classFrames.isEmpty()) {
-        writer.addEdge(GraphModel.REL_DECLARES, GraphModel.LABEL_CLASS, classFrames.peek(), GraphModel.LABEL_METHOD, id);
-      }
-      methodFrames.push(id);
-      // Method root condition anchors SCOPED_BY for body-level runtime nodes.
-      String rootCond = runtimeId(project, file, node.range, "root");
-      Map<String, Object> rootProps = new LinkedHashMap<>();
-      rootProps.put("file", file);
-      rootProps.put("line", line);
-      rootProps.put("kind", GraphModel.CONDITION_KIND_METHOD);
-      writer.addNode(GraphModel.LABEL_CONDITION, rootCond, rootProps);
-      writer.addEdge(GraphModel.REL_ROOT, GraphModel.LABEL_METHOD, id, GraphModel.LABEL_CONDITION, rootCond);
-      methodRootConds.push(rootCond);
-      conds.push(rootCond);
-    } else if (node.kind.equals("VARIABLE")) {
-      Map<String, Object> props = new LinkedHashMap<>();
-      props.put("name", displayName);
-      props.put("file", file);
-      props.put("line", line);
-      props.put("symbol", symbol);
-      if ("IdentifierParameter".equals(syntaxKind)) {
-        props.put("kind", GraphModel.VALUE_KIND_PARAM);
-        writer.addNode(GraphModel.LABEL_VALUE, id, props);
-        if (!methodFrames.isEmpty()) {
-          writer.addEdge(GraphModel.REL_HAS_PARAM, GraphModel.LABEL_METHOD, methodFrames.peek(), GraphModel.LABEL_VALUE, id);
-        }
-      } else if ("IdentifierConstant".equals(syntaxKind)) {
-        props.put("kind", "field");
-        writer.addNode(GraphModel.LABEL_FIELD, id, props);
-        if (!classFrames.isEmpty()) {
-          writer.addEdge(GraphModel.REL_DECLARES, GraphModel.LABEL_CLASS, classFrames.peek(), GraphModel.LABEL_FIELD, id);
-        }
-      } else {
-        props.put("kind", GraphModel.VALUE_KIND_LOCAL_VAR);
-        writer.addNode(GraphModel.LABEL_VALUE, id, props);
-      }
+      label = GraphModel.LABEL_METHOD;
+    } else if ("IdentifierParameter".equals(syntaxKind)) {
+      props.put("kind", GraphModel.VALUE_KIND_PARAM);
+      label = GraphModel.LABEL_VALUE;
+    } else if ("IdentifierLocal".equals(syntaxKind)) {
+      props.put("kind", GraphModel.VALUE_KIND_LOCAL_VAR);
+      label = GraphModel.LABEL_VALUE;
+    } else {
+      // javac IdentifierConstant, Kotlin Identifier for non-local properties → field.
+      props.put("kind", "field");
+      label = GraphModel.LABEL_FIELD;
+    }
+    String id = declId(project, file, symbol);
+    writer.addNode(label, id, props);
+    if (!ScipSymbols.isLocal(symbol)) {
+      createdSymbolLabel.putIfAbsent(symbol, label);
     }
   }
 
@@ -254,9 +267,9 @@ public final class GraphExtractor {
     }
 
     // Argument values → ARG_OF.
+    List<SyntaxTree.Node> args = argumentNodes(node);
     int argIndex = 0;
-    for (SyntaxTree.Node arg : node.children) {
-      if (hasSymbol(arg, symbol)) continue; // the receiver / type select, not an argument
+    for (SyntaxTree.Node arg : args) {
       String valueSymbol = argValueSymbol(arg);
       String valueId =
           runtimeId(project, file, arg.range, argIndex + ":" + (valueSymbol != null ? valueSymbol : "arg"));
@@ -305,31 +318,57 @@ public final class GraphExtractor {
   }
 
   // ---------------------------------------------------------------------------
-  // Helpers
+  // Kind classification (javac + Kotlin PSI)
   // ---------------------------------------------------------------------------
 
-  private static boolean isTypeNode(String kind) {
+  private static boolean isTypeKind(String kind) {
     return kind.equals("CLASS")
         || kind.equals("INTERFACE")
         || kind.equals("ENUM")
         || kind.equals("RECORD")
-        || kind.equals("ANNOTATION_TYPE");
+        || kind.equals("ANNOTATION_TYPE")
+        || kind.equals("OBJECT_DECLARATION")
+        || kind.equals("OBJECT_LITERAL")
+        || kind.equals("TYPEALIAS")
+        || kind.equals("companion");
+  }
+
+  private static boolean isMethodKind(String kind) {
+    return kind.equals("METHOD")
+        || kind.equals("FUN")
+        || kind.equals("SECONDARY_CONSTRUCTOR")
+        || kind.equals("PRIMARY_CONSTRUCTOR");
   }
 
   private static boolean isConditionKind(String kind) {
     return kind.equals("IF")
         || kind.equals("WHILE_LOOP")
         || kind.equals("FOR_LOOP")
-        || kind.equals("ENHANCED_FOR_LOOP");
+        || kind.equals("ENHANCED_FOR_LOOP")
+        || kind.equals("WHILE")
+        || kind.equals("FOR")
+        || kind.equals("DO_WHILE");
   }
 
   private static boolean isLoopKind(String kind) {
-    return kind.equals("WHILE_LOOP") || kind.equals("FOR_LOOP") || kind.equals("ENHANCED_FOR_LOOP");
+    return kind.equals("WHILE_LOOP")
+        || kind.equals("FOR_LOOP")
+        || kind.equals("ENHANCED_FOR_LOOP")
+        || kind.equals("WHILE")
+        || kind.equals("FOR")
+        || kind.equals("DO_WHILE");
   }
 
   private static boolean isInvocationKind(String kind) {
-    return kind.equals("METHOD_INVOCATION") || kind.equals("NEW_CLASS");
+    return kind.equals("METHOD_INVOCATION")
+        || kind.equals("NEW_CLASS")
+        || kind.equals("CALL_EXPRESSION")
+        || kind.equals("CONSTRUCTOR_CALL");
   }
+
+  // ---------------------------------------------------------------------------
+  // Occurrence helpers
+  // ---------------------------------------------------------------------------
 
   private static SyntaxTree.OccurrenceData definition(SyntaxTree.Node node) {
     for (SyntaxTree.OccurrenceData occ : node.occurrences) {
@@ -338,14 +377,36 @@ public final class GraphExtractor {
     return null;
   }
 
-  private static String invocationSymbol(SyntaxTree.Node node) {
-    for (SyntaxTree.OccurrenceData occ : node.occurrences) {
-      if (occ.role == 0 && isFunctionSyntax(occ.syntaxKind)) return occ.symbol;
+  /**
+   * The structural node's own definition: the def on the node itself, or the first def among its
+   * direct children. For javac the def sits on the node; for Kotlin it sits on the name {@code
+   * IDENTIFIER} direct child. Deliberately shallow so nested members' defs are never mistaken for
+   * the node's own.
+   */
+  private static SyntaxTree.OccurrenceData structuralDefinition(SyntaxTree.Node node) {
+    SyntaxTree.OccurrenceData own = definition(node);
+    if (own != null) return own;
+    for (SyntaxTree.Node child : node.children) {
+      SyntaxTree.OccurrenceData d = definition(child);
+      if (d != null) return d;
     }
-    if (!node.children.isEmpty()) {
-      for (SyntaxTree.OccurrenceData occ : node.children.get(0).occurrences) {
-        if (occ.role == 0 && isFunctionSyntax(occ.syntaxKind)) return occ.symbol;
-      }
+    return null;
+  }
+
+  private static String invocationSymbol(SyntaxTree.Node node) {
+    SyntaxTree.OccurrenceData found = functionReference(node);
+    if (found != null) return found.symbol;
+    // Kotlin: callee reference sits on a direct child (OPERATION_REFERENCE / REFERENCE_EXPRESSION).
+    for (SyntaxTree.Node child : node.children) {
+      SyntaxTree.OccurrenceData d = functionReference(child);
+      if (d != null) return d.symbol;
+    }
+    return null;
+  }
+
+  private static SyntaxTree.OccurrenceData functionReference(SyntaxTree.Node node) {
+    for (SyntaxTree.OccurrenceData occ : node.occurrences) {
+      if (occ.role == 0 && isFunctionSyntax(occ.syntaxKind)) return occ;
     }
     return null;
   }
@@ -354,6 +415,22 @@ public final class GraphExtractor {
     if (syntaxKind == null) return false;
     return syntaxKind.equals("IdentifierFunction")
         || syntaxKind.equals("IdentifierFunctionDefinition");
+  }
+
+  /** The argument expression nodes of an invocation. */
+  private static List<SyntaxTree.Node> argumentNodes(SyntaxTree.Node node) {
+    List<SyntaxTree.Node> out = new ArrayList<>();
+    String calleeSymbol = invocationSymbol(node);
+    for (SyntaxTree.Node child : node.children) {
+      if (child.kind.equals("VALUE_ARGUMENT_LIST")) {
+        for (SyntaxTree.Node va : child.children) {
+          if (va.kind.equals("VALUE_ARGUMENT")) out.add(va);
+        }
+      } else if (calleeSymbol == null || !hasSymbol(child, calleeSymbol)) {
+        out.add(child);
+      }
+    }
+    return out;
   }
 
   private static boolean hasSymbol(SyntaxTree.Node node, String symbol) {
@@ -375,6 +452,67 @@ public final class GraphExtractor {
     return null;
   }
 
+  // ---------------------------------------------------------------------------
+  // SCIP symbol hierarchy
+  // ---------------------------------------------------------------------------
+
+  /** Owner symbol (parent) of a SCIP symbol, or null when it has no parent. */
+  static String ownerOf(String symbol) {
+    if (symbol == null || symbol.isEmpty()) return null;
+    if (symbol.endsWith(").")) {
+      // method descriptor name(disambiguator)(params). → owner is the type/term before the name
+      int depth = 0;
+      int open = -1;
+      for (int i = symbol.length() - 2; i >= 0; i--) {
+        char c = symbol.charAt(i);
+        if (c == ')') depth++;
+        else if (c == '(') {
+          depth--;
+          if (depth == 0) {
+            open = i;
+            break;
+          }
+        }
+      }
+      if (open < 0) return null;
+      int j = open - 1;
+      while (j >= 0 && isNameChar(symbol.charAt(j))) j--;
+      return j < 0 ? null : symbol.substring(0, j + 1);
+    }
+    if (symbol.endsWith(")")) {
+      // parameter descriptor (name)
+      int i = symbol.length() - 2;
+      while (i >= 0 && symbol.charAt(i) != '(') i--;
+      return i < 0 ? null : symbol.substring(0, i);
+    }
+    if (symbol.endsWith("#")) {
+      // type descriptor name#
+      int i = symbol.length() - 2;
+      while (i >= 0 && isNameChar(symbol.charAt(i))) i--;
+      return i < 0 ? null : symbol.substring(0, i + 1);
+    }
+    if (symbol.endsWith(".")) {
+      // term descriptor name.
+      int i = symbol.length() - 2;
+      while (i >= 0 && isNameChar(symbol.charAt(i))) i--;
+      return i < 0 ? null : symbol.substring(0, i + 1);
+    }
+    return null;
+  }
+
+  private static boolean isNameChar(char c) {
+    return Character.isLetterOrDigit(c) || c == '_' || c == '`' || c == '$' || c == '-' || c == '+';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Misc helpers
+  // ---------------------------------------------------------------------------
+
+  private static String displayName(SymbolInformation info, String symbol) {
+    if (info != null && !info.getDisplayName().isEmpty()) return info.getDisplayName();
+    return shortName(symbol);
+  }
+
   private static String typeKind(SymbolInformation info) {
     if (info == null) return "class";
     return switch (info.getKind()) {
@@ -383,6 +521,10 @@ public final class GraphExtractor {
       case TypeParameter -> "type";
       default -> "class";
     };
+  }
+
+  private static int rangeLine(SyntaxTree.OccurrenceData occ) {
+    return occ.range == null ? 0 : occ.range.startLine();
   }
 
   /** Extracts a readable name from a SCIP symbol (fallback when no SymbolInformation). */

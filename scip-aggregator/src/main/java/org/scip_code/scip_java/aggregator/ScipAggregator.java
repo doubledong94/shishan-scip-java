@@ -214,7 +214,13 @@ public class ScipAggregator {
   private void emitGraph() {
     Neo4jGraphConfig config = Neo4jGraphConfig.fromEnv();
     if (!config.enabled) return;
-    String project = options.sourceroot().getFileName().toString();
+    // Explicit project name (gateway sets SCIP_PROJECT_NAME because the working dir is a
+    // per-project copy whose basename differs from the project name); fall back to the
+    // sourceroot basename when running standalone.
+    String project = System.getenv("SCIP_PROJECT_NAME");
+    if (project == null || project.isEmpty()) {
+      project = options.sourceroot().getFileName().toString();
+    }
     if (project.isEmpty()) {
       options.reporter().error("cannot derive project name from sourceroot: " + options.sourceroot());
       return;

@@ -111,6 +111,7 @@ class GraphExtractorTest {
     MemorySink sink = new MemorySink();
     GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
     extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
 
     assertTrue(hasNode(sink, GraphModel.LABEL_CLASS, "test::pkg/A#"), "class node");
     assertTrue(
@@ -150,6 +151,64 @@ class GraphExtractorTest {
             .orElseThrow();
     assertTrue(hasEdge(sink, GraphModel.REL_SUB, mRoot, ifCond), "if is sub of m's root");
     assertTrue(hasEdge(sink, GraphModel.REL_LEADS_TO, ifCond, callId));
+  }
+
+  @Test
+  void extractsKotlinStyleTree() {
+    // Kotlin: structural nodes (CLASS/FUN) carry no occurrence; the definition sits on the name
+    // IDENTIFIER descendant. Call site is CALL_EXPRESSION; args live in VALUE_ARGUMENT_LIST.
+    SyntaxTree.Node cls = node("CLASS", 0);
+    cls.children.add(node("IDENTIFIER", 1, def("pkg/Foo#", "IdentifierType", 1)));
+    SyntaxTree.Node fun = node("FUN", 2);
+    fun.children.add(node("IDENTIFIER", 3, def("pkg/Foo#bar().", "IdentifierFunctionDefinition", 3)));
+    fun.children.add(node("IDENTIFIER", 4, def("pkg/Foo#bar().(x)", "IdentifierParameter", 4)));
+    SyntaxTree.Node ifNode = node("IF", 5);
+    SyntaxTree.Node call = node("CALL_EXPRESSION", 6);
+    call.children.add(node("OPERATION_REFERENCE", 7, ref("pkg/Foo#baz().", "IdentifierFunction", 7)));
+    SyntaxTree.Node argList = node("VALUE_ARGUMENT_LIST", 8);
+    SyntaxTree.Node valueArg = node("VALUE_ARGUMENT", 9);
+    valueArg.children.add(node("IDENTIFIER", 10, ref("local 1", "Identifier", 10)));
+    argList.children.add(valueArg);
+    call.children.add(argList);
+    ifNode.children.add(call);
+    fun.children.add(ifNode);
+    cls.children.add(fun);
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/Foo#", info(SymbolInformation.Kind.Class, "Foo"));
+    symbols.put("pkg/Foo#bar().", info(SymbolInformation.Kind.Method, "bar"));
+    symbols.put("pkg/Foo#baz().", info(SymbolInformation.Kind.Method, "baz"));
+    symbols.put("pkg/Foo#bar().(x)", info(SymbolInformation.Kind.Parameter, "x"));
+    symbols.put("local 1", info(SymbolInformation.Kind.Variable, "y"));
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "kotest", symbols);
+    extractor.extractFile("Foo.kt", cu);
+    extractor.emitRelationships();
+
+    assertTrue(hasNode(sink, GraphModel.LABEL_CLASS, "kotest::pkg/Foo#"), "kotlin class");
+    assertTrue(hasNode(sink, GraphModel.LABEL_METHOD, "kotest::pkg/Foo#bar()."), "kotlin method");
+    assertTrue(
+        hasEdge(sink, GraphModel.REL_DECLARES, "kotest::pkg/Foo#", "kotest::pkg/Foo#bar()."),
+        "kotlin class declares method");
+    assertTrue(
+        hasNode(sink, GraphModel.LABEL_VALUE, "kotest::pkg/Foo#bar().(x)"), "kotlin param");
+    assertTrue(
+        hasEdge(sink, GraphModel.REL_HAS_PARAM, "kotest::pkg/Foo#bar().", "kotest::pkg/Foo#bar().(x)"),
+        "kotlin method has param");
+
+    List<Map<String, Object>> calls = nodesOf(sink, GraphModel.LABEL_CALLED_METHOD);
+    assertEquals(1, calls.size(), "one kotlin call site");
+    String callId = (String) calls.get(0).get("_id");
+    assertTrue(hasEdge(sink, GraphModel.REL_CALLS, callId, "kotest::pkg/Foo#baz()."));
+    List<Map<String, Object>> args = nodesOf(sink, GraphModel.LABEL_VALUE);
+    boolean argLinked =
+        args.stream()
+            .filter(v -> GraphModel.VALUE_KIND_CALLED_PARAM.equals(v.get("kind")))
+            .anyMatch(v -> hasEdge(sink, GraphModel.REL_ARG_OF, (String) v.get("_id"), callId));
+    assertTrue(argLinked, "kotlin argument ARG_OF the call");
   }
 
   private static boolean hasNode(MemorySink sink, String label, String id) {
