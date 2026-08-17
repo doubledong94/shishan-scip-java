@@ -7,6 +7,7 @@ kotest = "6.2.4"
 kotlin = "2.4.10"
 kotlinx-serialization = "1.11.0"
 lombok = "1.18.46"
+neo4j-driver = "5.28.0"
 maven-plugin-annotations = "3.15.2"
 maven-plugin-api = "3.9.16"
 maven-project = "2.2.1"
@@ -38,6 +39,7 @@ lombok = { module = "org.projectlombok:lombok", version.ref = "lombok" }
 maven-plugin-annotations = { module = "org.apache.maven.plugin-tools:maven-plugin-annotations", version.ref = "maven-plugin-annotations" }
 maven-plugin-api = { module = "org.apache.maven:maven-plugin-api", version.ref = "maven-plugin-api" }
 maven-project = { module = "org.apache.maven:maven-project", version.ref = "maven-project" }
+neo4j-java-driver = { module = "org.neo4j.driver:neo4j-java-driver", version.ref = "neo4j-driver" }
 scip-java-bindings = { module = "org.scip-code:scip-java-bindings", version.ref = "scip-bindings" }
 scip-kotlin-bindings = { module = "org.scip-code:scip-kotlin-bindings", version.ref = "scip-bindings" }
 

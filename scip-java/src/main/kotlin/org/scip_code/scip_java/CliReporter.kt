@@ -15,7 +15,7 @@ class CliReporter(private val env: CliEnvironment) : ScipAggregatorReporter() {
     private val processedShards = AtomicInteger()
     private val lastReportedDecile = AtomicInteger()
 
-    fun info(message: String) {
+    override fun info(message: String) {
         env.standardOutput.println(message)
     }
 

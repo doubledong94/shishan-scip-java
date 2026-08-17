@@ -15,6 +15,8 @@ public abstract class ScipAggregatorReporter {
 
   public void warning(String message) {}
 
+  public void info(String message) {}
+
   public void startProcessing(int taskSize) {}
 
   public void processedOneItem() {}

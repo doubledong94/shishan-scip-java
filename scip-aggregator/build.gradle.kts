@@ -11,6 +11,7 @@ description = "Aggregates compiler-plugin SCIP shards into a single SCIP index"
 dependencies {
     api(libs.scip.java.bindings)
     implementation(project(":scip-shared"))
+    implementation(libs.neo4j.java.driver)
 }
 
 protobuf {

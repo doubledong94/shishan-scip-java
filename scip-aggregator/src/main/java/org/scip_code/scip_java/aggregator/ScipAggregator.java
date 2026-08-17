@@ -36,6 +36,9 @@ import org.scip_code.scip.TextEncoding;
 import org.scip_code.scip.ToolInfo;
 import org.scip_code.scip_java.shared.ScipSymbols;
 import org.scip_code.scip_java.shared.SyntaxTree;
+import org.scip_code.scip_java.aggregator.graph.GraphExtractor;
+import org.scip_code.scip_java.aggregator.graph.Neo4jGraphConfig;
+import org.scip_code.scip_java.aggregator.graph.Neo4jGraphWriter;
 
 /**
  * Aggregates per-source SCIP shards (one {@link Index} per {@code *.scip} file emitted by the
@@ -64,6 +67,8 @@ public class ScipAggregator {
   private final ScipWriter writer;
   private final ScipAggregatorOptions options;
   private final List<Struct> mergedTrees = new ArrayList<>();
+  private final Map<String, SymbolInformation> collectedSymbols = new HashMap<>();
+  private final Map<String, SyntaxTree.Node> mergedTreeNodes = new HashMap<>();
 
   public ScipAggregator(ScipWriter writer, ScipAggregatorOptions options) {
     this.writer = writer;
@@ -102,6 +107,7 @@ public class ScipAggregator {
         .forEach(shard -> processShard(shard, rewriter, inverseReferences, externalCandidates, definedSymbols));
     emitExternalSymbols(externalCandidates, definedSymbols);
     emitMergedTrees(rewriter);
+    emitGraph();
     writer.build();
     options.reporter().endProcessing();
   }
@@ -176,6 +182,7 @@ public class ScipAggregator {
         if (node == null) continue;
         SyntaxTree.Node rewritten =
             SyntaxTree.rewriteSymbols(node, symbol -> rewriter.rewrite(symbol));
+        mergedTreeNodes.put(relativePath, rewritten);
         documents.putFields(
             relativePath,
             Value.newBuilder()
@@ -197,6 +204,37 @@ public class ScipAggregator {
     String name = output.getFileName().toString();
     String treeName = name.endsWith(".scip") ? name.substring(0, name.length() - ".scip".length()) : name;
     return output.resolveSibling(treeName + ".tree");
+  }
+
+  /**
+   * Streams the code graph into Neo4j (aggregation phase). Driven entirely by the environment
+   * ({@code NEO4J_URI} / {@code NEO4J_USER} / {@code NEO4J_PASSWORD}); when not configured the
+   * aggregator just produces the SCIP index as before.
+   */
+  private void emitGraph() {
+    Neo4jGraphConfig config = Neo4jGraphConfig.fromEnv();
+    if (!config.enabled) return;
+    String project = options.sourceroot().getFileName().toString();
+    if (project.isEmpty()) {
+      options.reporter().error("cannot derive project name from sourceroot: " + options.sourceroot());
+      return;
+    }
+    try (Neo4jGraphWriter graph = new Neo4jGraphWriter(config, project)) {
+      graph.deleteProject();
+      graph.ensureSchema();
+      GraphExtractor extractor = new GraphExtractor(graph, project, collectedSymbols);
+      for (Map.Entry<String, SyntaxTree.Node> entry : mergedTreeNodes.entrySet()) {
+        extractor.extractFile(entry.getKey(), entry.getValue());
+      }
+      extractor.emitRelationships();
+      graph.flush();
+      options.reporter().info("wrote code graph to Neo4j for project " + project);
+    } catch (Exception e) {
+      options.reporter().error("Neo4j graph write failed: " + e);
+      if (e.getStackTrace().length > 0) {
+        options.reporter().error(e.getStackTrace()[0].toString());
+      }
+    }
   }
 
   private Index metadataIndex() {
@@ -227,6 +265,7 @@ public class ScipAggregator {
         options.reporter().processedOneItem();
         for (SymbolInformation info : rewritten.getSymbolsList()) {
           if (!info.getSymbol().isEmpty()) definedSymbols.add(info.getSymbol());
+          if (!info.getSymbol().isEmpty()) collectedSymbols.put(info.getSymbol(), info);
         }
       }
       for (SymbolInformation info : shardIndex.getExternalSymbolsList()) {
