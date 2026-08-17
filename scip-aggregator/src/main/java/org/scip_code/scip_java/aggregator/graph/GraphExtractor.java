@@ -63,7 +63,24 @@ public final class GraphExtractor {
   /** A data-flow scope: symbol → set of possible last-write runtime ids, plus reads with no source. */
   private static final class Scope {
     final Map<String, java.util.Set<String>> lastWrites = new java.util.HashMap<>();
-    final List<String[]> unwrittenReads = new ArrayList<>();
+    /** Runtime id → source line of the write (for loop-feedback ordering). */
+    final Map<String, Integer> writeLines = new java.util.HashMap<>();
+    /** Symbols assigned unconditionally within this scope (definite-assignment tracking). */
+    final java.util.Set<String> updated100Percent = new java.util.HashSet<>();
+    final List<UnwrittenRead> unwrittenReads = new ArrayList<>();
+    boolean hasReturn = false;
+  }
+
+  private static final class UnwrittenRead {
+    final String symbol;
+    final String id;
+    final int line;
+
+    UnwrittenRead(String symbol, String id, int line) {
+      this.symbol = symbol;
+      this.id = id;
+      this.line = line;
+    }
   }
 
   private Scope currentScope() {
@@ -211,24 +228,52 @@ public final class GraphExtractor {
   private void mergeBranchScopes(List<Scope> branches, SyntaxTree.Node node) {
     Scope parent = currentScope();
     if (parent == null) return;
+
+    // Definite assignment: when every branch unconditionally re-writes a variable (no branch
+    // returns) and the split is closed (if/else), the pre-branch last-write is dead — drop it so
+    // reads after the branch don't see it. Loops are never closed (may not execute).
+    boolean closed = node.kind.equals("IF") && branches.size() >= 2;
+    if (closed) {
+      for (String v : new ArrayList<>(parent.lastWrites.keySet())) {
+        boolean everyBranch = true;
+        for (Scope branch : branches) {
+          if (branch.hasReturn || !branch.updated100Percent.contains(v)) {
+            everyBranch = false;
+            break;
+          }
+        }
+        if (everyBranch) parent.lastWrites.remove(v);
+      }
+    }
+
+    // Union merge (return-terminated branches never reach code after the split).
     for (Scope branch : branches) {
+      if (branch.hasReturn) continue;
       for (Map.Entry<String, java.util.Set<String>> e : branch.lastWrites.entrySet()) {
         java.util.Set<String> target =
             parent.lastWrites
                 .computeIfAbsent(e.getKey(), k -> new java.util.HashSet<>());
         target.addAll(e.getValue());
         capUnionSet(target);
+        for (String id : e.getValue()) {
+          Integer line = branch.writeLines.get(id);
+          if (line != null) parent.writeLines.put(id, line);
+        }
       }
     }
-    // Loop feedback: reads with no preceding write in the loop see the loop's own writes.
+
+    // Loop feedback: reads with no preceding write in the loop see only the loop's writes that
+    // happen LATER (next-iteration flow).
     if (isLoopKind(node.kind)) {
       for (Scope branch : branches) {
-        for (String[] rw : branch.unwrittenReads) {
-          java.util.Set<String> writes = branch.lastWrites.get(rw[0]);
+        for (UnwrittenRead rw : branch.unwrittenReads) {
+          java.util.Set<String> writes = branch.lastWrites.get(rw.symbol);
           if (writes == null) continue;
           for (String w : writes) {
-            if (!w.equals(rw[1])) {
-              writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, w, GraphModel.LABEL_VALUE, rw[1]);
+            Integer wLine = branch.writeLines.get(w);
+            if (wLine == null || wLine <= rw.line) continue;
+            if (!w.equals(rw.id)) {
+              writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, w, GraphModel.LABEL_VALUE, rw.id);
             }
           }
         }
@@ -403,6 +448,8 @@ public final class GraphExtractor {
         Scope sc = currentScope();
         if (sc != null) {
           sc.lastWrites.put(occ.symbol, new java.util.HashSet<>(java.util.List.of(id)));
+          sc.writeLines.put(id, rangeLine(occ));
+          sc.updated100Percent.add(occ.symbol);
         }
       } else {
         Scope sc = currentScope();
@@ -415,7 +462,7 @@ public final class GraphExtractor {
               }
             }
           } else {
-            sc.unwrittenReads.add(new String[] {occ.symbol, id});
+            sc.unwrittenReads.add(new UnwrittenRead(occ.symbol, id, rangeLine(occ)));
           }
         }
       }
@@ -484,6 +531,9 @@ public final class GraphExtractor {
   // ---------------------------------------------------------------------------
 
   private void handleReturn(String file, SyntaxTree.Node node) {
+    // A return terminates the current branch regardless of whether it carries a value.
+    Scope cur = currentScope();
+    if (cur != null) cur.hasReturn = true;
     // The returned value flows into the enclosing method's return slot.
     List<SyntaxTree.Node> operands = nonWhitespaceChildren(node);
     if (operands.isEmpty()) return;

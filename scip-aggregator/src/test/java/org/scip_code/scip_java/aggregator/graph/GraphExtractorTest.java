@@ -399,6 +399,92 @@ class GraphExtractorTest {
     assertTrue(!bReadHasSource, "branch B f-read has no FLOWS source (no preceding write in scope)");
   }
 
+  @Test
+  void definiteAssignmentAndReturnBranch() {
+    // Build two methods in one class.
+    //   void a() { f = 0; if (c) { f = 1; } else { f = 2; } h = f; }   // definite assignment
+    //   void b() { f = 0; if (c) { f = 1; return x; } else { f = 2; } h = f; }  // return branch
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+
+    // ---- method a ----
+    SyntaxTree.Node a = node("METHOD", 2, def("pkg/A#a().", "IdentifierFunctionDefinition", 2));
+    a.children.add(assign("pkg/A#f.", 10, "pkg/A#f0.", 9));
+    SyntaxTree.Node ifA = node("IF", 11);
+    ifA.children.add(node("IDENTIFIER", 12, ref("pkg/A#c.", "IdentifierConstant", 12)));
+    SyntaxTree.Node thenA = node("BLOCK", 13);
+    thenA.children.add(assign("pkg/A#f.", 14, "pkg/A#lit1.", 13));
+    ifA.children.add(thenA);
+    SyntaxTree.Node elseA = node("BLOCK", 16);
+    elseA.children.add(assign("pkg/A#f.", 17, "pkg/A#lit2.", 16));
+    ifA.children.add(elseA);
+    a.children.add(ifA);
+    a.children.add(assign("pkg/A#h.", 19, "pkg/A#f.", 18));
+    cls.children.add(a);
+
+    // ---- method b ----
+    SyntaxTree.Node b = node("METHOD", 20, def("pkg/A#b().", "IdentifierFunctionDefinition", 20));
+    b.children.add(assign("pkg/A#f.", 22, "pkg/A#f0.", 21));
+    SyntaxTree.Node ifB = node("IF", 23);
+    ifB.children.add(node("IDENTIFIER", 24, ref("pkg/A#c.", "IdentifierConstant", 24)));
+    SyntaxTree.Node thenB = node("BLOCK", 25);
+    thenB.children.add(assign("pkg/A#f.", 26, "pkg/A#lit1.", 25));
+    SyntaxTree.Node ret = node("RETURN", 27);
+    ret.children.add(node("IDENTIFIER", 28, ref("pkg/A#x.", "IdentifierConstant", 28)));
+    thenB.children.add(ret);
+    ifB.children.add(thenB);
+    SyntaxTree.Node elseB = node("BLOCK", 29);
+    elseB.children.add(assign("pkg/A#f.", 30, "pkg/A#lit2.", 29));
+    ifB.children.add(elseB);
+    b.children.add(ifB);
+    b.children.add(assign("pkg/A#h.", 32, "pkg/A#f.", 31));
+    cls.children.add(b);
+
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#a().", info(SymbolInformation.Kind.Method, "a"));
+    symbols.put("pkg/A#b().", info(SymbolInformation.Kind.Method, "b"));
+    for (String f : new String[] {"c.", "f.", "h.", "x."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> flows = edgesOf(sink, GraphModel.REL_FLOWS);
+    java.util.function.BiPredicate<String, String> flowsTo =
+        (fromId, toId) ->
+            flows.stream()
+                .anyMatch(e -> fromId.equals(e.get("_from")) && toId.equals(e.get("_to")));
+
+    // Method a: definite assignment clears pre-branch f-write (line 10).
+    String preA = "test::Foo.java#10:0:FIELD";
+    String f1A = "test::Foo.java#14:0:FIELD";
+    String f2A = "test::Foo.java#17:0:FIELD";
+    String hA = "test::Foo.java#18:0:FIELD";
+    assertTrue(!flowsTo.test(preA, hA), "definite assignment: pre-branch write must not reach after");
+    assertTrue(flowsTo.test(f1A, hA), "branch write f=1 reaches after (union)");
+    assertTrue(flowsTo.test(f2A, hA), "branch write f=2 reaches after (union)");
+
+    // Method b: the then branch returns, so its f-write (line 26) must NOT reach after.
+    String f1B = "test::Foo.java#26:0:FIELD";
+    String f2B = "test::Foo.java#30:0:FIELD";
+    String hB = "test::Foo.java#31:0:FIELD";
+    assertTrue(!flowsTo.test(f1B, hB), "returning branch write must not reach after");
+    assertTrue(flowsTo.test(f2B, hB), "non-returning branch write reaches after");
+  }
+
+  private static SyntaxTree.Node assign(String lhsSym, int lhsLine, String rhsSym, int rhsLine) {
+    SyntaxTree.Node a = node("ASSIGNMENT", lhsLine);
+    a.children.add(node("IDENTIFIER", lhsLine, ref(lhsSym, "IdentifierConstant", lhsLine)));
+    a.children.add(node("INT_LITERAL", rhsLine, ref(rhsSym, "IdentifierConstant", rhsLine)));
+    return a;
+  }
+
   private static List<Map<String, Object>> conditionsOfKind(MemorySink sink, String kind) {
     return nodesOf(sink, GraphModel.LABEL_CONDITION).stream()
         .filter(c -> kind.equals(c.get("kind")))
