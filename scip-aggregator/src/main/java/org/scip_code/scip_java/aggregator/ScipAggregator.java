@@ -170,6 +170,7 @@ public class ScipAggregator {
     Collections.sort(trees);
 
     Struct.Builder documents = Struct.newBuilder();
+    boolean graphMode = Neo4jGraphConfig.fromEnv().enabled;
     for (Path treePath : trees) {
       try {
         com.google.protobuf.CodedInputStream input =
@@ -183,16 +184,21 @@ public class ScipAggregator {
         SyntaxTree.Node rewritten =
             SyntaxTree.rewriteSymbols(node, symbol -> rewriter.rewrite(symbol));
         mergedTreeNodes.put(relativePath, rewritten);
-        documents.putFields(
-            relativePath,
-            Value.newBuilder()
-                .setStructValue(SyntaxTree.toStruct(rewritten))
-                .build());
+        // In graph mode the merged tree is consumed by the Neo4j writer; skip materialising the
+        // .tree sidecar Struct (it would hold every tree in memory).
+        if (!graphMode) {
+          documents.putFields(
+              relativePath,
+              Value.newBuilder()
+                  .setStructValue(SyntaxTree.toStruct(rewritten))
+                  .build());
+        }
       } catch (IOException e) {
         options.reporter().error("invalid SCIP tree sidecar: " + treePath);
         options.reporter().error(e);
       }
     }
+    if (graphMode) return;
     Path treeOutput = treeOutputPath();
     byte[] bytes = documents.build().toByteArray();
     Files.createDirectories(treeOutput.getParent());
@@ -229,17 +235,20 @@ public class ScipAggregator {
       graph.deleteProject();
       graph.ensureSchema();
       GraphExtractor extractor = new GraphExtractor(graph, project, collectedSymbols);
-      for (Map.Entry<String, SyntaxTree.Node> entry : mergedTreeNodes.entrySet()) {
+      // Stream per file: extract then release the tree so we never hold all trees in memory.
+      java.util.Iterator<Map.Entry<String, SyntaxTree.Node>> it =
+          mergedTreeNodes.entrySet().iterator();
+      while (it.hasNext()) {
+        Map.Entry<String, SyntaxTree.Node> entry = it.next();
         extractor.extractFile(entry.getKey(), entry.getValue());
+        it.remove();
       }
       extractor.emitRelationships();
       graph.flush();
       options.reporter().info("wrote code graph to Neo4j for project " + project);
     } catch (Exception e) {
       options.reporter().error("Neo4j graph write failed: " + e);
-      if (e.getStackTrace().length > 0) {
-        options.reporter().error(e.getStackTrace()[0].toString());
-      }
+      e.printStackTrace();
     }
   }
 

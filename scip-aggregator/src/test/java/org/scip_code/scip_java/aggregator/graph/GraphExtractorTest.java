@@ -321,6 +321,84 @@ class GraphExtractorTest {
     assertTrue(hasEdge(sink, GraphModel.REL_ELSE, ifCond, elseIfCond), "else-if chain");
   }
 
+  @Test
+  void dataFlowRespectsBranches() {
+    // void m() { if (c) { f = 1; } else { g = f; } h = f; }
+    // Branch A writes f; branch B reads f (must NOT see A's write);
+    // the read after the if MUST see A's write (union merge).
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node method =
+        node("METHOD", 2, def("pkg/A#m().", "IdentifierFunctionDefinition", 2));
+
+    SyntaxTree.Node ifNode = node("IF", 3);
+    SyntaxTree.Node condExpr = node("IDENTIFIER", 4, ref("pkg/A#c.", "IdentifierConstant", 4));
+    ifNode.children.add(condExpr);
+
+    // then: f = 1  (branch A)
+    SyntaxTree.Node thenBlock = node("BLOCK", 5);
+    SyntaxTree.Node assignA = node("ASSIGNMENT", 6);
+    assignA.children.add(node("IDENTIFIER", 7, ref("pkg/A#f.", "IdentifierConstant", 7)));
+    assignA.children.add(node("INT_LITERAL", 6)); // literal RHS (no value reference)
+    thenBlock.children.add(assignA);
+    ifNode.children.add(thenBlock);
+
+    // else: g = f  (branch B)
+    SyntaxTree.Node elseBlock = node("BLOCK", 8);
+    SyntaxTree.Node assignB = node("ASSIGNMENT", 9);
+    assignB.children.add(node("IDENTIFIER", 10, ref("pkg/A#g.", "IdentifierConstant", 10)));
+    assignB.children.add(node("IDENTIFIER", 11, ref("pkg/A#f.", "IdentifierConstant", 11)));
+    elseBlock.children.add(assignB);
+    ifNode.children.add(elseBlock);
+    method.children.add(ifNode);
+
+    // after: h = f
+    SyntaxTree.Node assignAfter = node("ASSIGNMENT", 12);
+    assignAfter.children.add(node("IDENTIFIER", 13, ref("pkg/A#h.", "IdentifierConstant", 13)));
+    assignAfter.children.add(node("IDENTIFIER", 14, ref("pkg/A#f.", "IdentifierConstant", 14)));
+    method.children.add(assignAfter);
+
+    cls.children.add(method);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"c.", "f.", "g.", "h."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> flows = edgesOf(sink, GraphModel.REL_FLOWS);
+    // Branch A f-write id = line 7; branch B f-read id = line 11; after f-read id = line 14.
+    String aWrite = "test::Foo.java#7:0:FIELD";
+    String bRead = "test::Foo.java#11:0:FIELD";
+    String afterRead = "test::Foo.java#14:0:FIELD";
+
+    boolean crossBranch =
+        flows.stream()
+            .anyMatch(
+                e ->
+                    aWrite.equals(e.get("_from"))
+                        && bRead.equals(e.get("_to")));
+    assertTrue(!crossBranch, "branch A write must NOT flow into branch B read");
+    boolean afterSeesA =
+        flows.stream()
+            .anyMatch(
+                e ->
+                    aWrite.equals(e.get("_from"))
+                        && afterRead.equals(e.get("_to")));
+    assertTrue(afterSeesA, "read after the if sees branch A's write (union merge)");
+    // The else read is an unwritten read (no source) → no FLOWS into it.
+    boolean bReadHasSource =
+        flows.stream().anyMatch(e -> bRead.equals(e.get("_to")));
+    assertTrue(!bReadHasSource, "branch B f-read has no FLOWS source (no preceding write in scope)");
+  }
+
   private static List<Map<String, Object>> conditionsOfKind(MemorySink sink, String kind) {
     return nodesOf(sink, GraphModel.LABEL_CONDITION).stream()
         .filter(c -> kind.equals(c.get("kind")))

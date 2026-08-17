@@ -53,10 +53,22 @@ public final class GraphExtractor {
 
   private final Deque<String> methodRootConds = new ArrayDeque<>();
   private final Deque<String> conds = new ArrayDeque<>();
-  // Last-write per variable symbol, one frame per method (walk order == source order).
-  private final Deque<Map<String, String>> lastWriteFrames = new ArrayDeque<>();
+  // Last-write data-flow scopes: one frame per method / per condition branch. Branch entry copies
+  // the parent's last-write state; on condition exit the union of all branches' writes is merged
+  // back (may-analysis), mirroring the old viewer's DataFlowVisitor block scoping.
+  private final Deque<Scope> scopeStack = new ArrayDeque<>();
   // Runtime ids that are assignment targets (writes).
   private final java.util.Set<String> writeRuntimeIds = new java.util.HashSet<>();
+
+  /** A data-flow scope: symbol → set of possible last-write runtime ids, plus reads with no source. */
+  private static final class Scope {
+    final Map<String, java.util.Set<String>> lastWrites = new java.util.HashMap<>();
+    final List<String[]> unwrittenReads = new ArrayList<>();
+  }
+
+  private Scope currentScope() {
+    return scopeStack.peek();
+  }
 
   public GraphExtractor(
       GraphSink writer, String project, Map<String, SymbolInformation> symbols) {
@@ -148,17 +160,106 @@ public final class GraphExtractor {
 
   private void walk(String file, SyntaxTree.Node node, SyntaxTree.Node parent, int index) {
     enter(file, node, parent, index);
-    List<SyntaxTree.Node> children = node.children;
-    for (int i = 0; i < children.size(); i++) {
-      walk(file, children.get(i), node, i);
+    if (isConditionKind(node.kind)) {
+      walkConditionChildren(file, node);
+    } else {
+      List<SyntaxTree.Node> children = node.children;
+      for (int i = 0; i < children.size(); i++) {
+        walk(file, children.get(i), node, i);
+      }
     }
     exit(node);
   }
 
+  /**
+   * Walks a condition node's children with branch-aware data-flow scoping: the condition expression
+   * runs in the parent scope, then each branch runs in a copy of the parent's last-write state
+   * (so sibling branches never see each other's writes), and on exit the union of all branches'
+   * writes is merged back into the parent. Loop bodies additionally get feedback edges from writes
+   * to earlier unwritten reads (next-iteration flow).
+   */
+  private void walkConditionChildren(String file, SyntaxTree.Node node) {
+    List<SyntaxTree.Node> children = node.children;
+    List<SyntaxTree.Node> branches = branchChildren(node);
+
+    for (int i = 0; i < children.size(); i++) {
+      SyntaxTree.Node child = children.get(i);
+      if (branches.contains(child)) continue;
+      walk(file, child, node, i);
+    }
+
+    List<Scope> branchScopes = new ArrayList<>();
+    for (SyntaxTree.Node branch : branches) {
+      pushBranchScope();
+      walk(file, branch, node, children.indexOf(branch));
+      branchScopes.add(scopeStack.pop());
+    }
+    mergeBranchScopes(branchScopes, node);
+  }
+
+  private void pushBranchScope() {
+    Scope parent = currentScope();
+    Scope copy = new Scope();
+    if (parent != null) {
+      for (Map.Entry<String, java.util.Set<String>> e : parent.lastWrites.entrySet()) {
+        copy.lastWrites.put(e.getKey(), new java.util.HashSet<>(e.getValue()));
+      }
+    }
+    scopeStack.push(copy);
+  }
+
+  private void mergeBranchScopes(List<Scope> branches, SyntaxTree.Node node) {
+    Scope parent = currentScope();
+    if (parent == null) return;
+    for (Scope branch : branches) {
+      for (Map.Entry<String, java.util.Set<String>> e : branch.lastWrites.entrySet()) {
+        java.util.Set<String> target =
+            parent.lastWrites
+                .computeIfAbsent(e.getKey(), k -> new java.util.HashSet<>());
+        target.addAll(e.getValue());
+        capUnionSet(target);
+      }
+    }
+    // Loop feedback: reads with no preceding write in the loop see the loop's own writes.
+    if (isLoopKind(node.kind)) {
+      for (Scope branch : branches) {
+        for (String[] rw : branch.unwrittenReads) {
+          java.util.Set<String> writes = branch.lastWrites.get(rw[0]);
+          if (writes == null) continue;
+          for (String w : writes) {
+            if (!w.equals(rw[1])) {
+              writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, w, GraphModel.LABEL_VALUE, rw[1]);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Bounds the size of a may-analysis last-write set. Without a cap, deeply nested branches make
+   * the union grow without bound and blow up both the fork's memory and the Neo4j edge count.
+   */
+  private static void capUnionSet(java.util.Set<String> set) {
+    if (set.size() <= MAX_UNION_WRITES) return;
+    java.util.Set<String> capped = new java.util.LinkedHashSet<>();
+    int skip = set.size() - MAX_UNION_WRITES;
+    for (String id : set) {
+      if (skip-- > 0) continue;
+      capped.add(id);
+    }
+    set.clear();
+    set.addAll(capped);
+  }
+
+  private static final int MAX_UNION_WRITES = 64;
+
   private void enter(String file, SyntaxTree.Node node, SyntaxTree.Node parent, int index) {
+    // Method scope: a structural method node (javac METHOD / Kotlin FUN) anchors a root condition
+    // so body-level calls can be SCOPED_BY it. Always pushed (even without a resolvable symbol) so
+    // exit() is symmetric.
     if (isMethodKind(node.kind)) {
-      SyntaxTree.OccurrenceData def = structuralDefinition(node);
-      if (def != null) pushMethodScope(file, node, def);
+      pushMethodScope(file, node, structuralDefinition(node));
     }
 
     SyntaxTree.OccurrenceData def = definition(node);
@@ -185,7 +286,7 @@ public final class GraphExtractor {
     if (isMethodKind(node.kind)) {
       if (!methodRootConds.isEmpty()) methodRootConds.pop();
       if (!conds.isEmpty()) conds.pop(); // method root condition
-      if (!lastWriteFrames.isEmpty()) lastWriteFrames.pop();
+      if (!scopeStack.isEmpty()) scopeStack.pop();
     }
   }
 
@@ -194,19 +295,41 @@ public final class GraphExtractor {
   // ---------------------------------------------------------------------------
 
   private void pushMethodScope(String file, SyntaxTree.Node node, SyntaxTree.OccurrenceData def) {
-    String symbol = def.symbol;
-    if (symbol.isEmpty() || ScipSymbols.isLocal(symbol)) return;
-    String id = declId(project, file, symbol);
-    String rootCond = runtimeId(project, file, def.range, "root");
+    scopeStack.push(new Scope());
+    String symbol = def != null ? def.symbol : "";
+    boolean hasSymbol = def != null && !symbol.isEmpty() && !ScipSymbols.isLocal(symbol);
+    if (hasSymbol) {
+      String id = declId(project, file, symbol);
+      SymbolInformation info = symbols.get(symbol);
+      Map<String, Object> props = new LinkedHashMap<>();
+      props.put("name", displayName(info, symbol));
+      props.put("file", file);
+      props.put("line", rangeLine(def));
+      props.put("symbol", symbol);
+      boolean isConstructor = info != null && info.getKind() == SymbolInformation.Kind.Constructor;
+      props.put("isConstructor", isConstructor);
+      if (info != null && info.hasSignatureDocumentation()) {
+        props.put("signature", info.getSignatureDocumentation().getText());
+      }
+      writer.addNode(GraphModel.LABEL_METHOD, id, props);
+    }
+    // The root condition anchors SCOPED_BY for body-level runtime nodes; created in all cases so
+    // the enter/exit stacks stay symmetric.
+    ScipRange range = def != null && def.range != null ? def.range : node.range;
+    String rootCond = runtimeId(project, file, range, "root");
     Map<String, Object> rootProps = new LinkedHashMap<>();
     rootProps.put("file", file);
-    rootProps.put("line", rangeLine(def));
+    rootProps.put("line", range == null ? 0 : range.startLine());
     rootProps.put("kind", GraphModel.CONDITION_KIND_METHOD);
     writer.addNode(GraphModel.LABEL_CONDITION, rootCond, rootProps);
-    writer.addEdge(GraphModel.REL_ROOT, GraphModel.LABEL_METHOD, id, GraphModel.LABEL_CONDITION, rootCond);
+    if (hasSymbol) {
+      writer.addEdge(
+          GraphModel.REL_ROOT,
+          GraphModel.LABEL_METHOD, declId(project, file, symbol),
+          GraphModel.LABEL_CONDITION, rootCond);
+    }
     methodRootConds.push(rootCond);
     conds.push(rootCond);
-    lastWriteFrames.push(new LinkedHashMap<>());
   }
 
   private void createDeclaration(String file, SyntaxTree.Node node, SyntaxTree.OccurrenceData def) {
@@ -277,12 +400,23 @@ public final class GraphExtractor {
       }
 
       if (isWrite) {
-        if (!lastWriteFrames.isEmpty()) lastWriteFrames.peek().put(occ.symbol, id);
+        Scope sc = currentScope();
+        if (sc != null) {
+          sc.lastWrites.put(occ.symbol, new java.util.HashSet<>(java.util.List.of(id)));
+        }
       } else {
-        String lastWrite =
-            lastWriteFrames.isEmpty() ? null : lastWriteFrames.peek().get(occ.symbol);
-        if (lastWrite != null && !lastWrite.equals(id)) {
-          writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, lastWrite, GraphModel.LABEL_VALUE, id);
+        Scope sc = currentScope();
+        if (sc != null) {
+          java.util.Set<String> sources = sc.lastWrites.get(occ.symbol);
+          if (sources != null && !sources.isEmpty()) {
+            for (String src : sources) {
+              if (!src.equals(id)) {
+                writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, src, GraphModel.LABEL_VALUE, id);
+              }
+            }
+          } else {
+            sc.unwrittenReads.add(new String[] {occ.symbol, id});
+          }
         }
       }
     }
@@ -638,6 +772,25 @@ public final class GraphExtractor {
     List<SyntaxTree.Node> out = new ArrayList<>();
     for (SyntaxTree.Node child : node.children) {
       if (!child.kind.equals("WHITE_SPACE")) out.add(child);
+    }
+    return out;
+  }
+
+  /**
+   * The branch subtrees of a condition node: javac IF → then/else statements; Kotlin IF → THEN and
+   * ELSE children; Kotlin WHEN → WHEN_ENTRY children; loops → the body (last child).
+   */
+  private static List<SyntaxTree.Node> branchChildren(SyntaxTree.Node node) {
+    List<SyntaxTree.Node> out = new ArrayList<>();
+    List<SyntaxTree.Node> kids = nonWhitespaceChildren(node);
+    if (node.kind.equals("IF")) {
+      for (int i = 1; i < kids.size(); i++) out.add(kids.get(i));
+    } else if (node.kind.equals("WHEN")) {
+      for (SyntaxTree.Node k : kids) {
+        if (k.kind.equals("WHEN_ENTRY")) out.add(k);
+      }
+    } else {
+      if (!kids.isEmpty()) out.add(kids.get(kids.size() - 1));
     }
     return out;
   }

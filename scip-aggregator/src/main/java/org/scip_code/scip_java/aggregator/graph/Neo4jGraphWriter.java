@@ -72,9 +72,12 @@ public final class Neo4jGraphWriter implements GraphSink {
 
   private final List<NodeRow> pendingNodes = new ArrayList<>();
   private final List<EdgeRow> pendingEdges = new ArrayList<>();
+  // De-duplicate edges client-side so the server can use cheap CREATE (deleteProject runs first,
+  // so no pre-existing edges exist to MERGE against).
+  private final java.util.Set<String> seenEdges = new java.util.HashSet<>();
 
   public Neo4jGraphWriter(Neo4jGraphConfig config, String project) {
-    this(config, project, 5000);
+    this(config, project, 250);
   }
 
   public Neo4jGraphWriter(Neo4jGraphConfig config, String project, int batchSize) {
@@ -95,10 +98,22 @@ public final class Neo4jGraphWriter implements GraphSink {
   // Public API
   // ---------------------------------------------------------------------------
 
-  /** Deletes every node belonging to {@code project} (and its relationships). */
+  /** Deletes every node belonging to {@code project} (and its relationships), in chunks so a
+   * single transaction never exceeds Neo4j's memory limits on large graphs. */
   @Override
   public void deleteProject() {
-    run("MATCH (n {" + PROP_PROJECT + ": $project}) DETACH DELETE n", Map.of("project", project));
+    long chunk = 20_000;
+    long deleted;
+    do {
+      var result =
+          runReturn(
+              "MATCH (n {" + PROP_PROJECT + ": $project}) "
+                  + "WITH n LIMIT $chunk "
+                  + "DETACH DELETE n "
+                  + "RETURN count(*) AS c",
+              Map.of("project", project, "chunk", chunk));
+      deleted = result > 0 ? result : 0;
+    } while (deleted >= chunk);
   }
 
   /** Creates idempotent unique indexes for the node ids of every label. */
@@ -127,6 +142,7 @@ public final class Neo4jGraphWriter implements GraphSink {
   @Override
   public void addEdge(
       String type, String fromLabel, String fromId, String toLabel, String toId) {
+    if (!seenEdges.add(type + "|" + fromId + "|" + toId)) return;
     pendingEdges.add(new EdgeRow(type, fromLabel, fromId, toLabel, toId));
     if (pendingEdges.size() >= batchSize) flushEdges();
   }
@@ -158,13 +174,16 @@ public final class Neo4jGraphWriter implements GraphSink {
     for (Map.Entry<String, List<NodeRow>> entry : byLabel.entrySet()) {
       String label = entry.getKey();
       List<NodeRow> rows = entry.getValue();
-      List<Map<String, Object>> data = new ArrayList<>(rows.size());
-      for (NodeRow row : rows) {
-        data.add(row.props);
+      // Chunk within a label group so one transaction never exceeds Neo4j's memory limits.
+      for (int from = 0; from < rows.size(); from += batchSize) {
+        List<Map<String, Object>> data = new ArrayList<>(batchSize);
+        for (int i = from; i < Math.min(from + batchSize, rows.size()); i++) {
+          data.add(rows.get(i).props);
+        }
+        run(
+            "UNWIND $rows AS r MERGE (n:" + label + " {" + PROP_ID + ": r.id}) SET n += r",
+            Map.of("rows", data));
       }
-      run(
-          "UNWIND $rows AS r MERGE (n:" + label + " {" + PROP_ID + ": r.id}) SET n += r",
-          Map.of("rows", data));
     }
     pendingNodes.clear();
   }
@@ -180,13 +199,6 @@ public final class Neo4jGraphWriter implements GraphSink {
     }
     for (Map.Entry<String, List<EdgeRow>> entry : byType.entrySet()) {
       List<EdgeRow> rows = entry.getValue();
-      List<Map<String, Object>> data = new ArrayList<>(rows.size());
-      for (EdgeRow row : rows) {
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("from", row.fromId);
-        m.put("to", row.toId);
-        data.add(m);
-      }
       EdgeRow first = rows.get(0);
       String query =
           "UNWIND $rows AS r "
@@ -200,10 +212,19 @@ public final class Neo4jGraphWriter implements GraphSink {
               + " {"
               + PROP_ID
               + ": r.to}) "
-              + "MERGE (a)-[:"
+              + "CREATE (a)-[:"
               + first.type
               + "]->(b)";
-      run(query, Map.of("rows", data));
+      for (int from = 0; from < rows.size(); from += batchSize) {
+        List<Map<String, Object>> data = new ArrayList<>(batchSize);
+        for (int i = from; i < Math.min(from + batchSize, rows.size()); i++) {
+          Map<String, Object> m = new LinkedHashMap<>();
+          m.put("from", rows.get(i).fromId);
+          m.put("to", rows.get(i).toId);
+          data.add(m);
+        }
+        run(query, Map.of("rows", data));
+      }
     }
     pendingEdges.clear();
   }
@@ -215,6 +236,18 @@ public final class Neo4jGraphWriter implements GraphSink {
   private void run(String query, Map<String, Object> params) {
     try (var session = driver.session(sessionConfig)) {
       session.executeWrite(tx -> tx.run(query, params).consume());
+    }
+  }
+
+  private long runReturn(String query, Map<String, Object> params) {
+    try (var session = driver.session(sessionConfig)) {
+      return session.executeWrite(
+          tx -> {
+            var r = tx.run(query, params);
+            long c = 0;
+            if (r.hasNext()) c = r.next().get("c").asLong();
+            return c;
+          });
     }
   }
 }

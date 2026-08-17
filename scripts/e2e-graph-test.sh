@@ -79,6 +79,8 @@ docker run -d --name "$NEO4J_NAME" \
   -p "$NEO4J_PORT:7687" \
   -e NEO4J_AUTH="neo4j/$NEO4J_PASS" \
   -e NEO4J_server_memory_heap_max__size=512M \
+  -e NEO4J_dbms_memory_transaction_total_max=1G \
+  -e NEO4J_db_memory_transaction_max=512M \
   "$NEO4J_IMAGE" >/dev/null
 echo -n "   等待 Neo4j 就绪"
 for i in $(seq 1 60); do
