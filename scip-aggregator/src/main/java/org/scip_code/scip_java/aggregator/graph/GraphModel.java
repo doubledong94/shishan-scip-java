@@ -42,6 +42,7 @@ public final class GraphModel {
   public static final String REL_CONTROLS = "CONTROLS";
   public static final String REL_REF = "REF";
   public static final String REL_INDEX = "INDEX";
+  public static final String REL_NEXT = "NEXT";
 
   // Value kinds (mirror the old viewer's KEY_TYPE_* concepts, subset relevant to the indexer).
   public static final String VALUE_KIND_PARAM = "PARAM";

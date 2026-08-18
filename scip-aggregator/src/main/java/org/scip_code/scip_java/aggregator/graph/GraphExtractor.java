@@ -192,7 +192,7 @@ public final class GraphExtractor {
         walk(file, children.get(i), node, i);
       }
     }
-    exit(node);
+    exit(file, node);
   }
 
   /**
@@ -341,7 +341,7 @@ public final class GraphExtractor {
     emitReferenceValues(file, node);
   }
 
-  private void exit(SyntaxTree.Node node) {
+  private void exit(String file, SyntaxTree.Node node) {
     if (isConditionKind(node.kind) && !conds.isEmpty()) conds.pop();
     if (isMethodKind(node.kind)) {
       if (!methodRootConds.isEmpty()) methodRootConds.pop();
@@ -349,6 +349,72 @@ public final class GraphExtractor {
       if (!scopeStack.isEmpty()) scopeStack.pop();
       if (!methodSymbols.isEmpty()) methodSymbols.pop();
     }
+    if (node.kind.equals("BLOCK")) {
+      emitNextChain(file, node);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Execution order (the old viewer's CodeOrderVisitor, 5th direction)
+  // ---------------------------------------------------------------------------
+
+  private static final class Anchor {
+    final String id;
+    final String label;
+
+    Anchor(String id, String label) {
+      this.id = id;
+      this.label = label;
+    }
+  }
+
+  /**
+   * NEXT chain within a block: connect consecutive statement anchors in source order
+   * ({@code stmt1 → stmt2 → …}), mirroring the old viewer's {@code codeOrder(mk, prev, next)}.
+   */
+  private void emitNextChain(String file, SyntaxTree.Node block) {
+    List<Anchor> anchors = new ArrayList<>();
+    for (SyntaxTree.Node child : nonWhitespaceChildren(block)) {
+      Anchor a = firstRuntimeAnchor(file, child);
+      if (a != null) anchors.add(a);
+    }
+    for (int i = 0; i + 1 < anchors.size(); i++) {
+      Anchor a = anchors.get(i);
+      Anchor b = anchors.get(i + 1);
+      if (!a.id.equals(b.id)) {
+        writer.addEdge(GraphModel.REL_NEXT, a.label, a.id, b.label, b.id);
+      }
+    }
+  }
+
+  /** The first runtime anchor inside a statement subtree (value ref, then call, then condition). */
+  private Anchor firstRuntimeAnchor(String file, SyntaxTree.Node subtree) {
+    SyntaxTree.OccurrenceData v = firstValueReference(subtree);
+    if (v != null) {
+      String kind = valueKindFor(v.syntaxKind);
+      if (kind != null) {
+        return new Anchor(runtimeId(project, file, v.range, kind), GraphModel.LABEL_VALUE);
+      }
+    }
+    SyntaxTree.Node inv = firstNodeOfKind(subtree, GraphExtractor::isInvocationKind);
+    if (inv != null) {
+      return new Anchor(runtimeId(project, file, inv.range, null), GraphModel.LABEL_CALLED_METHOD);
+    }
+    SyntaxTree.Node cond = firstNodeOfKind(subtree, GraphExtractor::isConditionKind);
+    if (cond != null) {
+      return new Anchor(runtimeId(project, file, cond.range, null), GraphModel.LABEL_CONDITION);
+    }
+    return null;
+  }
+
+  private static SyntaxTree.Node firstNodeOfKind(
+      SyntaxTree.Node node, java.util.function.Predicate<String> kindTest) {
+    if (kindTest.test(node.kind)) return node;
+    for (SyntaxTree.Node child : node.children) {
+      SyntaxTree.Node r = firstNodeOfKind(child, kindTest);
+      if (r != null) return r;
+    }
+    return null;
   }
 
   // ---------------------------------------------------------------------------
