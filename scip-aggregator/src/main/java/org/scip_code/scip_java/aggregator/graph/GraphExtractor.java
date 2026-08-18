@@ -58,6 +58,8 @@ public final class GraphExtractor {
   private final Map<String, java.util.List<String>> paramsByMethod = new java.util.HashMap<>();
   // Cross-method binding: callee method symbol → its return-slot runtime ids.
   private final Map<String, java.util.List<String>> returnsByMethod = new java.util.HashMap<>();
+  // Local variables get per-file SCIP symbols ("local N"); map (file, localSymbol) → source name.
+  private final Map<String, Map<String, String>> localNamesByFile = new java.util.HashMap<>();
   // Last-write data-flow scopes: one frame per method / per condition branch. Branch entry copies
   // the parent's last-write state; on condition exit the union of all branches' writes is merged
   // back (may-analysis), mirroring the old viewer's DataFlowVisitor block scoping.
@@ -431,6 +433,12 @@ public final class GraphExtractor {
     } else if ("IdentifierLocal".equals(syntaxKind)) {
       props.put("kind", GraphModel.VALUE_KIND_LOCAL_VAR);
       label = GraphModel.LABEL_VALUE;
+      if (ScipSymbols.isLocal(symbol)) {
+        // Locals use per-file "local N" symbols; remember the real source name for naming reads.
+        localNamesByFile
+            .computeIfAbsent(file, k -> new java.util.HashMap<>())
+            .put(symbol, name);
+      }
     } else {
       // javac IdentifierConstant, Kotlin Identifier for non-local properties → field.
       props.put("kind", "field");
@@ -455,7 +463,7 @@ public final class GraphExtractor {
       String id = runtimeId(project, file, occ.range, kind);
       boolean isWrite = writeRuntimeIds.contains(id);
       Map<String, Object> props = new LinkedHashMap<>();
-      props.put("name", shortName(occ.symbol));
+      props.put("name", valueName(file, occ.symbol));
       props.put("symbol", occ.symbol);
       props.put("file", file);
       props.put("line", rangeLine(occ));
@@ -732,7 +740,7 @@ public final class GraphExtractor {
       String valueId =
           runtimeId(project, file, arg.range, argIndex + ":" + (valueSymbol != null ? valueSymbol : "arg"));
       Map<String, Object> argProps = new LinkedHashMap<>();
-      argProps.put("name", valueSymbol != null ? shortName(valueSymbol) : "arg");
+      argProps.put("name", valueSymbol != null && !valueSymbol.isEmpty() ? valueName(file, valueSymbol) : "arg");
       argProps.put("symbol", valueSymbol != null ? valueSymbol : "");
       argProps.put("file", file);
       argProps.put("line", arg.range == null ? 0 : arg.range.startLine());
@@ -1184,6 +1192,24 @@ public final class GraphExtractor {
   // ---------------------------------------------------------------------------
 
   private static String displayName(SymbolInformation info, String symbol) {
+    if (info != null && !info.getDisplayName().isEmpty()) return info.getDisplayName();
+    return shortName(symbol);
+  }
+
+  /**
+   * Display name of a runtime value reference: locals use the per-file source name (old viewer's
+   * variableKey), globals (params/fields) the {@link SymbolInformation} display name. Falls back to
+   * {@link #shortName} when the symbol carries no name information.
+   */
+  private String valueName(String file, String symbol) {
+    if (symbol == null || symbol.isEmpty()) return symbol;
+    if (ScipSymbols.isLocal(symbol)) {
+      Map<String, String> fileNames = localNamesByFile.get(file);
+      String n = fileNames == null ? null : fileNames.get(symbol);
+      if (n != null && !n.isEmpty()) return n;
+      return shortName(symbol);
+    }
+    SymbolInformation info = symbols.get(symbol);
     if (info != null && !info.getDisplayName().isEmpty()) return info.getDisplayName();
     return shortName(symbol);
   }
