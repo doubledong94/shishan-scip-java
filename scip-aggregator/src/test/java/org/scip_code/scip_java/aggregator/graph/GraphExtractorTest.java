@@ -478,6 +478,52 @@ class GraphExtractorTest {
     assertTrue(flowsTo.test(f2B, hB), "non-returning branch write reaches after");
   }
 
+  @Test
+  void loopCarriedDependencyFeedback() {
+    // void m() { x = 0; while (x < 10) { use(x); x = x + 1; } }
+    // The read of x at the loop top sees the outer write (first iteration) AND the loop's own
+    // write that happens later (next iterations) via loop feedback.
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node method =
+        node("METHOD", 2, def("pkg/A#m().", "IdentifierFunctionDefinition", 2));
+
+    method.children.add(assign("pkg/A#x.", 10, "pkg/A#zero.", 9));
+
+    SyntaxTree.Node loop = node("WHILE_LOOP", 11);
+    loop.children.add(node("IDENTIFIER", 12, ref("pkg/A#x.", "IdentifierConstant", 12)));
+    SyntaxTree.Node body = node("BLOCK", 13);
+    body.children.add(node("IDENTIFIER", 14, ref("pkg/A#x.", "IdentifierConstant", 14)));
+    body.children.add(assign("pkg/A#x.", 15, "pkg/A#one.", 14));
+    loop.children.add(body);
+    method.children.add(loop);
+
+    cls.children.add(method);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    symbols.put("pkg/A#x.", info(SymbolInformation.Kind.Field, "x"));
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> flows = edgesOf(sink, GraphModel.REL_FLOWS);
+    java.util.function.BiPredicate<String, String> flowsTo =
+        (fromId, toId) ->
+            flows.stream()
+                .anyMatch(e -> fromId.equals(e.get("_from")) && toId.equals(e.get("_to")));
+
+    String outerWrite = "test::Foo.java#10:0:FIELD";
+    String loopWrite = "test::Foo.java#15:0:FIELD";
+    String loopRead = "test::Foo.java#14:0:FIELD";
+    assertTrue(flowsTo.test(outerWrite, loopRead), "outer write reaches first-iteration read");
+    assertTrue(flowsTo.test(loopWrite, loopRead), "loop-carried dependency: loop write feeds back to read");
+  }
+
   private static SyntaxTree.Node assign(String lhsSym, int lhsLine, String rhsSym, int rhsLine) {
     SyntaxTree.Node a = node("ASSIGNMENT", lhsLine);
     a.children.add(node("IDENTIFIER", lhsLine, ref(lhsSym, "IdentifierConstant", lhsLine)));

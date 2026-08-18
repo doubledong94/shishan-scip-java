@@ -260,6 +260,8 @@ public final class GraphExtractor {
           if (line != null) parent.writeLines.put(id, line);
         }
       }
+      // Unwritten reads propagate up so a loop's feedback can reach reads nested in branches.
+      parent.unwrittenReads.addAll(branch.unwrittenReads);
     }
 
     // Loop feedback: reads with no preceding write in the loop see only the loop's writes that
@@ -456,10 +458,19 @@ public final class GraphExtractor {
         if (sc != null) {
           java.util.Set<String> sources = sc.lastWrites.get(occ.symbol);
           if (sources != null && !sources.isEmpty()) {
+            boolean anyLocal = false;
             for (String src : sources) {
+              // A write is "local" to this scope subtree if it was written here (direct or via a
+              // nested merge); writes copied from an outer scope on branch entry are not.
+              if (sc.writeLines.containsKey(src)) anyLocal = true;
               if (!src.equals(id)) {
                 writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, src, GraphModel.LABEL_VALUE, id);
               }
+            }
+            if (!anyLocal) {
+              // Only outer-scope sources: still a loop-feedback candidate (loop-carried
+              // dependency), mirroring the old viewer's writtenAllFromOuterScope.
+              sc.unwrittenReads.add(new UnwrittenRead(occ.symbol, id, rangeLine(occ)));
             }
           } else {
             sc.unwrittenReads.add(new UnwrittenRead(occ.symbol, id, rangeLine(occ)));
