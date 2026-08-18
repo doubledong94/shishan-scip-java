@@ -41,6 +41,7 @@ public final class GraphModel {
   public static final String REL_FLOWS = "FLOWS";
   public static final String REL_CONTROLS = "CONTROLS";
   public static final String REL_REF = "REF";
+  public static final String REL_INDEX = "INDEX";
 
   // Value kinds (mirror the old viewer's KEY_TYPE_* concepts, subset relevant to the indexer).
   public static final String VALUE_KIND_PARAM = "PARAM";
@@ -49,6 +50,7 @@ public final class GraphModel {
   public static final String VALUE_KIND_LOCAL_VAR = "LOCAL_VAR";
   public static final String VALUE_KIND_CALLED_PARAM = "CALLED_PARAM";
   public static final String VALUE_KIND_CALLED_RETURN = "CALLED_RETURN";
+  public static final String VALUE_KIND_INDEX = "INDEX";
   public static final String VALUE_KIND_DEFAULT_VALUE = "DEFAULT_VALUE";
   public static final String VALUE_KIND_KEY_WORD_VALUE = "KEY_WORD_VALUE";
 

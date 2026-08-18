@@ -564,12 +564,12 @@ class GraphExtractorTest {
                 .anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
     assertTrue(flowsTo.test(xId, fWriteId), "x flows into the field write (not the base)");
 
-    // REF: base obj -> field write (nesting direction).
+    // REF: the member WRITE is reversed (member -> base) per reversedRef/markUnreadReturn.
     String objId = "test::Foo.java#5:0:LOCAL_VAR";
     boolean ref =
         edgesOf(sink, GraphModel.REL_REF).stream()
-            .anyMatch(e -> objId.equals(e.get("_from")) && fWriteId.equals(e.get("_to")));
-    assertTrue(ref, "base obj REF the field write");
+            .anyMatch(e -> fWriteId.equals(e.get("_from")) && objId.equals(e.get("_to")));
+    assertTrue(ref, "member write REF back to the base obj (reversedRef)");
 
     // The base obj is recorded as written (reversedRef): a later read of obj sees this access.
     List<Map<String, Object>> objValues =
@@ -578,6 +578,85 @@ class GraphExtractorTest {
             .filter(v -> "obj".equals(v.get("name")))
             .toList();
     assertTrue(!objValues.isEmpty(), "base obj runtime value exists");
+  }
+
+  @Test
+  void crossMethodParamAndReturnBinding() {
+    // int add(int a, int b) { return a; }  void m() { s = add(x, y); }
+    // Param slots of the call bind to the callee's params; the callee's return flows into calledReturn.
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+
+    SyntaxTree.Node add = node("METHOD", 2, def("pkg/A#add().", "IdentifierFunctionDefinition", 2));
+    add.children.add(node("VARIABLE", 3, def("pkg/A#add().(a)", "IdentifierParameter", 3)));
+    add.children.add(node("VARIABLE", 4, def("pkg/A#add().(b)", "IdentifierParameter", 4)));
+    SyntaxTree.Node ret = node("RETURN", 5);
+    ret.children.add(node("IDENTIFIER", 6, ref("pkg/A#add().(a)", "IdentifierParameter", 6)));
+    add.children.add(ret);
+    cls.children.add(add);
+
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node call = node("CALL_EXPRESSION", 11);
+    call.children.add(node("OPERATION_REFERENCE", 12, ref("pkg/A#add().", "IdentifierFunction", 12)));
+    SyntaxTree.Node argList = node("VALUE_ARGUMENT_LIST", 13);
+    SyntaxTree.Node va1 = node("VALUE_ARGUMENT", 14);
+    va1.children.add(node("REFERENCE_EXPRESSION", 15, ref("pkg/A#x.", "IdentifierConstant", 15)));
+    argList.children.add(va1);
+    SyntaxTree.Node va2 = node("VALUE_ARGUMENT", 16);
+    va2.children.add(node("REFERENCE_EXPRESSION", 17, ref("pkg/A#y.", "IdentifierConstant", 17)));
+    argList.children.add(va2);
+    call.children.add(argList);
+    m.children.add(call);
+    cls.children.add(m);
+
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#add().", info(SymbolInformation.Kind.Method, "add"));
+    symbols.put("pkg/A#add().(a)", info(SymbolInformation.Kind.Parameter, "a"));
+    symbols.put("pkg/A#add().(b)", info(SymbolInformation.Kind.Parameter, "b"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    symbols.put("pkg/A#x.", info(SymbolInformation.Kind.Field, "x"));
+    symbols.put("pkg/A#y.", info(SymbolInformation.Kind.Field, "y"));
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> flows = edgesOf(sink, GraphModel.REL_FLOWS);
+    java.util.function.BiPredicate<String, String> flowsTo =
+        (from, to) ->
+            flows.stream()
+                .anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+
+    // Param binding: the two calledParam slots flow into the callee's parameter declarations.
+    String paramA = "test::pkg/A#add().(a)";
+    String paramB = "test::pkg/A#add().(b)";
+    boolean paramAHasSource =
+        flows.stream().anyMatch(e -> paramA.equals(e.get("_to")));
+    boolean paramBHasSource =
+        flows.stream().anyMatch(e -> paramB.equals(e.get("_to")));
+    assertTrue(paramAHasSource, "calledParam slot 0 binds to callee param a");
+    assertTrue(paramBHasSource, "calledParam slot 1 binds to callee param b");
+
+    // Return binding: the callee's return slot flows into the caller's calledReturn.
+    List<Map<String, Object>> calledReturns =
+        nodesOf(sink, GraphModel.LABEL_VALUE).stream()
+            .filter(v -> GraphModel.VALUE_KIND_CALLED_RETURN.equals(v.get("kind")))
+            .toList();
+    assertEquals(1, calledReturns.size(), "one calledReturn for the call");
+    String callReturnId = (String) calledReturns.get(0).get("_id");
+    List<Map<String, Object>> returnSlots =
+        nodesOf(sink, GraphModel.LABEL_VALUE).stream()
+            .filter(v -> GraphModel.VALUE_KIND_RETURN.equals(v.get("kind")))
+            .toList();
+    assertEquals(1, returnSlots.size(), "one return slot in the callee");
+    String returnSlotId = (String) returnSlots.get(0).get("_id");
+    assertTrue(
+        flowsTo.test(returnSlotId, callReturnId),
+        "callee return slot flows into the caller's calledReturn");
   }
 
   private static SyntaxTree.Node assign(String lhsSym, int lhsLine, String rhsSym, int rhsLine) {

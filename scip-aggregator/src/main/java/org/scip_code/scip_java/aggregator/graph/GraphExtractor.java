@@ -53,6 +53,11 @@ public final class GraphExtractor {
 
   private final Deque<String> methodRootConds = new ArrayDeque<>();
   private final Deque<String> conds = new ArrayDeque<>();
+  private final Deque<String> methodSymbols = new ArrayDeque<>();
+  // Cross-method binding: callee method symbol → its params in declaration order.
+  private final Map<String, java.util.List<String>> paramsByMethod = new java.util.HashMap<>();
+  // Cross-method binding: callee method symbol → its return-slot runtime ids.
+  private final Map<String, java.util.List<String>> returnsByMethod = new java.util.HashMap<>();
   // Last-write data-flow scopes: one frame per method / per condition branch. Branch entry copies
   // the parent's last-write state; on condition exit the union of all branches' writes is merged
   // back (may-analysis), mirroring the old viewer's DataFlowVisitor block scoping.
@@ -318,6 +323,9 @@ public final class GraphExtractor {
     if (isMemberSelectKind(node.kind)) {
       handleMemberSelect(file, node);
     }
+    if (isIndexAccessKind(node.kind)) {
+      handleIndexAccess(file, node);
+    }
     if (isInvocationKind(node.kind)) {
       enterInvocation(file, node, parent);
     }
@@ -337,6 +345,7 @@ public final class GraphExtractor {
       if (!methodRootConds.isEmpty()) methodRootConds.pop();
       if (!conds.isEmpty()) conds.pop(); // method root condition
       if (!scopeStack.isEmpty()) scopeStack.pop();
+      if (!methodSymbols.isEmpty()) methodSymbols.pop();
     }
   }
 
@@ -362,6 +371,9 @@ public final class GraphExtractor {
         props.put("signature", info.getSignatureDocumentation().getText());
       }
       writer.addNode(GraphModel.LABEL_METHOD, id, props);
+      methodSymbols.push(symbol);
+    } else {
+      methodSymbols.push("");
     }
     // The root condition anchors SCOPED_BY for body-level runtime nodes; created in all cases so
     // the enter/exit stacks stay symmetric.
@@ -409,6 +421,13 @@ public final class GraphExtractor {
     } else if ("IdentifierParameter".equals(syntaxKind)) {
       props.put("kind", GraphModel.VALUE_KIND_PARAM);
       label = GraphModel.LABEL_VALUE;
+      if (!ScipSymbols.isLocal(symbol)) {
+        // Record the param against its method (declaration walk order == param order).
+        String owner = ownerOf(symbol);
+        if (owner != null && !owner.isEmpty()) {
+          paramsByMethod.computeIfAbsent(owner, k -> new ArrayList<>()).add(symbol);
+        }
+      }
     } else if ("IdentifierLocal".equals(syntaxKind)) {
       props.put("kind", GraphModel.VALUE_KIND_LOCAL_VAR);
       label = GraphModel.LABEL_VALUE;
@@ -558,8 +577,14 @@ public final class GraphExtractor {
     String memberId = runtimeId(project, file, member.range, kind);
     List<String> baseIds = new ArrayList<>();
     collectValueIds(file, base, baseIds);
+    // reversedRef: a member WRITE (assignment target) flows member → base instead of base → member,
+    // mirroring the old viewer's markUnreadReturn / setReversedRefRecur.
+    boolean memberIsWrite = writeRuntimeIds.contains(memberId);
     for (String b : baseIds) {
-      if (!b.equals(memberId)) {
+      if (b.equals(memberId)) continue;
+      if (memberIsWrite) {
+        writer.addEdge(GraphModel.REL_REF, GraphModel.LABEL_VALUE, memberId, GraphModel.LABEL_VALUE, b);
+      } else {
         writer.addEdge(GraphModel.REL_REF, GraphModel.LABEL_VALUE, b, GraphModel.LABEL_VALUE, memberId);
       }
     }
@@ -663,6 +688,11 @@ public final class GraphExtractor {
       writer.addEdge(GraphModel.REL_SCOPED_BY, GraphModel.LABEL_VALUE, returnId, GraphModel.LABEL_CONDITION, scope);
     }
     writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, valueId, GraphModel.LABEL_VALUE, returnId);
+    // Record this return slot against the enclosing method for cross-method return binding.
+    String methodSymbol = methodSymbols.isEmpty() ? null : methodSymbols.peek();
+    if (methodSymbol != null && !methodSymbol.isEmpty()) {
+      returnsByMethod.computeIfAbsent(methodSymbol, k -> new ArrayList<>()).add(returnId);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -695,6 +725,7 @@ public final class GraphExtractor {
 
     // Runtime value nodes for the arguments → ARG_OF; the argument's value flows into the slot.
     List<SyntaxTree.Node> args = argumentNodes(node);
+    java.util.List<String> calledParamIds = new ArrayList<>();
     int argIndex = 0;
     for (SyntaxTree.Node arg : args) {
       String valueSymbol = argValueSymbol(arg);
@@ -716,7 +747,21 @@ public final class GraphExtractor {
       if (argSourceId != null && !argSourceId.equals(valueId)) {
         writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, argSourceId, GraphModel.LABEL_VALUE, valueId);
       }
+      calledParamIds.add(valueId);
       argIndex++;
+    }
+
+    // Cross-method param binding: arg slot i → callee's i-th parameter declaration.
+    if (symbols.containsKey(symbol)) {
+      java.util.List<String> params = paramsByMethod.get(symbol);
+      if (params != null) {
+        int n = Math.min(calledParamIds.size(), params.size());
+        for (int i = 0; i < n; i++) {
+          String paramId = declId(project, "", params.get(i));
+          writer.addEdge(
+              GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, calledParamIds.get(i), GraphModel.LABEL_VALUE, paramId);
+        }
+      }
     }
 
     // Call result (calledReturn) → flows into the assignment LHS when this call is the RHS.
@@ -730,6 +775,17 @@ public final class GraphExtractor {
     writer.addNode(GraphModel.LABEL_VALUE, callReturnId, retProps);
     if (scope != null) {
       writer.addEdge(GraphModel.REL_SCOPED_BY, GraphModel.LABEL_VALUE, callReturnId, GraphModel.LABEL_CONDITION, scope);
+    }
+    // Cross-method return binding: the callee's return slots flow into this call's result.
+    if (symbols.containsKey(symbol)) {
+      java.util.List<String> returns = returnsByMethod.get(symbol);
+      if (returns != null) {
+        for (String r : returns) {
+          if (!r.equals(callReturnId)) {
+            writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, r, GraphModel.LABEL_VALUE, callReturnId);
+          }
+        }
+      }
     }
     if (parent != null && isAssignment(parent)) {
       List<SyntaxTree.Node> operands = assignmentOperands(parent);
@@ -903,6 +959,40 @@ public final class GraphExtractor {
     return kind.equals("DOT_QUALIFIED_EXPRESSION")
         || kind.equals("SAFE_ACCESS_EXPRESSION")
         || kind.equals("MEMBER_SELECT");
+  }
+
+  private static boolean isIndexAccessKind(String kind) {
+    return kind.equals("ARRAY_ACCESS_EXPRESSION") || kind.equals("ARRAY_ACCESS");
+  }
+
+  /**
+   * Array access {@code arr[i]} (the old viewer's Index relation): the array value references the
+   * indexed element access, mirroring {@code addIndexProlog} ({@code array → index → element}).
+   */
+  private void handleIndexAccess(String file, SyntaxTree.Node node) {
+    SyntaxTree.Node array = firstOperand(node);
+    if (array == null) return;
+    SyntaxTree.OccurrenceData base = firstValueReference(array);
+    if (base == null) return;
+    String kind = valueKindFor(base.syntaxKind);
+    if (kind == null) return;
+    String baseId = runtimeId(project, file, base.range, kind);
+
+    String elementId = runtimeId(project, file, node.range, GraphModel.VALUE_KIND_INDEX);
+    Map<String, Object> props = new LinkedHashMap<>();
+    props.put("name", "[]");
+    props.put("symbol", base.symbol);
+    props.put("file", file);
+    props.put("line", rangeLine(node));
+    props.put("kind", GraphModel.VALUE_KIND_INDEX);
+    writer.addNode(GraphModel.LABEL_VALUE, elementId, props);
+    String scope = innermostCond();
+    if (scope != null) {
+      writer.addEdge(GraphModel.REL_SCOPED_BY, GraphModel.LABEL_VALUE, elementId, GraphModel.LABEL_CONDITION, scope);
+    }
+    if (!baseId.equals(elementId)) {
+      writer.addEdge(GraphModel.REL_INDEX, GraphModel.LABEL_VALUE, baseId, GraphModel.LABEL_VALUE, elementId);
+    }
   }
 
   private static boolean isReturnKind(String kind) {
