@@ -414,6 +414,7 @@ public final class GraphExtractor {
     String label;
     if ("IdentifierType".equals(syntaxKind)) {
       props.put("kind", typeKind(info));
+      props.put("package", packageOf(symbol));
       label = GraphModel.LABEL_CLASS;
     } else if ("IdentifierFunctionDefinition".equals(syntaxKind)) {
       boolean isConstructor =
@@ -1243,5 +1244,23 @@ public final class GraphExtractor {
     int paren = tail.indexOf('(');
     if (paren > 0) return tail.substring(0, paren);
     return tail;
+  }
+
+  /**
+   * The dot-separated package of a class from its SCIP symbol, e.g.
+   * {@code "…okhttp3/internal/connection/RealCall#"} → {@code "okhttp3.internal.connection"}.
+   * Empty string for the default package.
+   */
+  static String packageOf(String symbol) {
+    if (symbol == null) return "";
+    int hash = symbol.lastIndexOf('#');
+    if (hash < 0) return "";
+    int i = hash - 1;
+    while (i >= 0 && isNameChar(symbol.charAt(i))) i--;
+    if (i < 0) return "";
+    String before = symbol.substring(0, i + 1);
+    int sp = before.lastIndexOf(' ');
+    String pkg = sp >= 0 ? before.substring(sp + 1) : before;
+    return pkg.replace('/', '.');
   }
 }
