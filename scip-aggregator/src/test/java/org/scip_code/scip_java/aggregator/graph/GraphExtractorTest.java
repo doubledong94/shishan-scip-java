@@ -524,6 +524,62 @@ class GraphExtractorTest {
     assertTrue(flowsTo.test(loopWrite, loopRead), "loop-carried dependency: loop write feeds back to read");
   }
 
+  @Test
+  void fieldWriteThroughReference() {
+    // void m(A obj, int x) { obj.f = x; }
+    // The write target is the FIELD (through obj); FLOWS x -> field-write; REF obj -> field-write;
+    // the base obj is recorded as written.
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node method =
+        node("METHOD", 2, def("pkg/A#m().", "IdentifierFunctionDefinition", 2));
+
+    SyntaxTree.Node assign = node("ASSIGNMENT", 3);
+    SyntaxTree.Node lhs = node("DOT_QUALIFIED_EXPRESSION", 4);
+    lhs.children.add(node("REFERENCE_EXPRESSION", 5, ref("pkg/A#obj.", "IdentifierLocal", 5)));
+    lhs.children.add(node("IDENTIFIER", 6, ref("pkg/A#f.", "IdentifierConstant", 6)));
+    assign.children.add(lhs);
+    assign.children.add(node("REFERENCE_EXPRESSION", 7, ref("pkg/A#x.", "IdentifierLocal", 7)));
+    method.children.add(assign);
+
+    cls.children.add(method);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    symbols.put("pkg/A#f.", info(SymbolInformation.Kind.Field, "f"));
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> flows = edgesOf(sink, GraphModel.REL_FLOWS);
+    String xId = "test::Foo.java#7:0:LOCAL_VAR";
+    String fWriteId = "test::Foo.java#6:0:FIELD";
+    java.util.function.BiPredicate<String, String> flowsTo =
+        (from, to) ->
+            flows.stream()
+                .anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+    assertTrue(flowsTo.test(xId, fWriteId), "x flows into the field write (not the base)");
+
+    // REF: base obj -> field write (nesting direction).
+    String objId = "test::Foo.java#5:0:LOCAL_VAR";
+    boolean ref =
+        edgesOf(sink, GraphModel.REL_REF).stream()
+            .anyMatch(e -> objId.equals(e.get("_from")) && fWriteId.equals(e.get("_to")));
+    assertTrue(ref, "base obj REF the field write");
+
+    // The base obj is recorded as written (reversedRef): a later read of obj sees this access.
+    List<Map<String, Object>> objValues =
+        nodesOf(sink, GraphModel.LABEL_VALUE).stream()
+            .filter(v -> GraphModel.VALUE_KIND_LOCAL_VAR.equals(v.get("kind")))
+            .filter(v -> "obj".equals(v.get("name")))
+            .toList();
+    assertTrue(!objValues.isEmpty(), "base obj runtime value exists");
+  }
+
   private static SyntaxTree.Node assign(String lhsSym, int lhsLine, String rhsSym, int rhsLine) {
     SyntaxTree.Node a = node("ASSIGNMENT", lhsLine);
     a.children.add(node("IDENTIFIER", lhsLine, ref(lhsSym, "IdentifierConstant", lhsLine)));

@@ -315,6 +315,9 @@ public final class GraphExtractor {
     if (isAssignment(node)) {
       handleAssignment(file, node);
     }
+    if (isMemberSelectKind(node.kind)) {
+      handleMemberSelect(file, node);
+    }
     if (isInvocationKind(node.kind)) {
       enterInvocation(file, node, parent);
     }
@@ -501,12 +504,106 @@ public final class GraphExtractor {
     if (operands.size() < 2) return;
     SyntaxTree.Node lhs = operands.get(0);
     SyntaxTree.Node rhs = operands.get(operands.size() - 1);
-    String lhsId = firstValueRuntimeId(file, lhs);
-    String rhsId = firstValueRuntimeId(file, rhs);
-    if (lhsId != null) writeRuntimeIds.add(lhsId);
-    if (lhsId != null && rhsId != null) {
-      writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, rhsId, GraphModel.LABEL_VALUE, lhsId);
+
+    String writeId;
+    if (isMemberSelectKind(lhs.kind)) {
+      // `obj.field = x`: the write target is the MEMBER field (not the base object). The base is
+      // recorded as written too (reversedRef: the object is mutated), mirroring the old viewer's
+      // visitSentence handling.
+      SyntaxTree.OccurrenceData memberOcc = memberValueReference(lhs);
+      if (memberOcc == null) return;
+      String kind = valueKindFor(memberOcc.syntaxKind);
+      if (kind == null) return;
+      writeId = runtimeId(project, file, memberOcc.range, kind);
+      markBaseWritten(file, lhs);
+    } else {
+      String id = firstValueRuntimeId(file, lhs);
+      if (id == null) return;
+      writeId = id;
     }
+
+    writeRuntimeIds.add(writeId);
+    String rhsId = firstValueRuntimeId(file, rhs);
+    if (rhsId != null && !rhsId.equals(writeId)) {
+      writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, rhsId, GraphModel.LABEL_VALUE, writeId);
+    }
+  }
+
+  /**
+   * reversedRef: writing {@code obj.field} mutates {@code obj}, so the base's variable is recorded
+   * as written — subsequent reads of {@code obj} (or its other fields) see this access as their
+   * last write.
+   */
+  private void markBaseWritten(String file, SyntaxTree.Node memberSelect) {
+    SyntaxTree.Node base = rootBase(memberSelect);
+    if (base == null) return;
+    SyntaxTree.OccurrenceData occ = firstValueReference(base);
+    if (occ == null) return;
+    String kind = valueKindFor(occ.syntaxKind);
+    if (kind == null) return;
+    Scope sc = currentScope();
+    if (sc == null) return;
+    String id = runtimeId(project, file, occ.range, kind);
+    sc.lastWrites.put(occ.symbol, new java.util.HashSet<>(java.util.List.of(id)));
+    sc.writeLines.put(id, rangeLine(occ));
+  }
+
+  /** Nesting direction: the base object REF the field/member value it accesses. */
+  private void handleMemberSelect(String file, SyntaxTree.Node node) {
+    SyntaxTree.Node base = rootBase(node);
+    SyntaxTree.OccurrenceData member = memberValueReference(node);
+    if (base == null || member == null) return;
+    String kind = valueKindFor(member.syntaxKind);
+    if (kind == null) return;
+    String memberId = runtimeId(project, file, member.range, kind);
+    List<String> baseIds = new ArrayList<>();
+    collectValueIds(file, base, baseIds);
+    for (String b : baseIds) {
+      if (!b.equals(memberId)) {
+        writer.addEdge(GraphModel.REL_REF, GraphModel.LABEL_VALUE, b, GraphModel.LABEL_VALUE, memberId);
+      }
+    }
+  }
+
+  /** The root object of a member-access chain ({@code a.b.c} → {@code a}). */
+  private static SyntaxTree.Node rootBase(SyntaxTree.Node memberSelect) {
+    SyntaxTree.Node cur = memberSelect;
+    while (isMemberSelectKind(cur.kind)) {
+      SyntaxTree.Node base = firstOperand(cur);
+      if (base == null) return null;
+      if (!isMemberSelectKind(base.kind)) return base;
+      cur = base;
+    }
+    return cur;
+  }
+
+  /** The member (field/method name) operand of a member access — its last non-separator child. */
+  private static SyntaxTree.Node memberOperand(SyntaxTree.Node memberSelect) {
+    List<SyntaxTree.Node> kids = nonWhitespaceChildren(memberSelect);
+    for (int i = kids.size() - 1; i >= 0; i--) {
+      SyntaxTree.Node k = kids.get(i);
+      if (!k.kind.equals("DOT") && !k.kind.equals("SAFE_ACCESS")) return k;
+    }
+    return null;
+  }
+
+  private static SyntaxTree.OccurrenceData memberValueReference(SyntaxTree.Node memberSelect) {
+    SyntaxTree.Node member = memberOperand(memberSelect);
+    if (member == null) return null;
+    return firstValueReference(member);
+  }
+
+  /** First non-whitespace, non-separator child (the receiver operand of a member access). */
+  private static SyntaxTree.Node firstOperand(SyntaxTree.Node node) {
+    for (SyntaxTree.Node child : node.children) {
+      if (child.kind.equals("WHITE_SPACE")
+          || child.kind.equals("DOT")
+          || child.kind.equals("SAFE_ACCESS")) {
+        continue;
+      }
+      return child;
+    }
+    return null;
   }
 
   private static List<SyntaxTree.Node> assignmentOperands(SyntaxTree.Node node) {
@@ -800,6 +897,12 @@ public final class GraphExtractor {
         || kind.equals("NEW_CLASS")
         || kind.equals("CALL_EXPRESSION")
         || kind.equals("CONSTRUCTOR_CALL");
+  }
+
+  private static boolean isMemberSelectKind(String kind) {
+    return kind.equals("DOT_QUALIFIED_EXPRESSION")
+        || kind.equals("SAFE_ACCESS_EXPRESSION")
+        || kind.equals("MEMBER_SELECT");
   }
 
   private static boolean isReturnKind(String kind) {
