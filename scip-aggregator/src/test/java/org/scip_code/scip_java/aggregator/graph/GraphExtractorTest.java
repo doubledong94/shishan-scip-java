@@ -35,10 +35,17 @@ class GraphExtractorTest {
 
     @Override
     public void addEdge(String type, String fromLabel, String fromId, String toLabel, String toId) {
+      addEdge(type, fromLabel, fromId, toLabel, toId, null);
+    }
+
+    @Override
+    public void addEdge(
+        String type, String fromLabel, String fromId, String toLabel, String toId, Map<String, Object> props) {
       Map<String, Object> row = new LinkedHashMap<>();
       row.put("_type", type);
       row.put("_from", fromId);
       row.put("_to", toId);
+      if (props != null) row.put("_props", props);
       edges.add(row);
     }
 
@@ -657,6 +664,133 @@ class GraphExtractorTest {
     assertTrue(
         flowsTo.test(returnSlotId, callReturnId),
         "callee return slot flows into the caller's calledReturn");
+  }
+
+  @Test
+  void orderChainContinuesAcrossBlocksAndFunctions() {
+    // void m() { e0; if (flag) { a; } else { b; } c; foo(x); y; }
+    // void foo(int p) { q; }   -- void method, fall-through exit
+    // Order chain: e0→flagCond→{a|b}→c→CalledMethod(foo)→q→calledReturn→y
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+
+    SyntaxTree.Node foo = node("METHOD", 2, def("pkg/A#foo().", "IdentifierFunctionDefinition", 2));
+    foo.children.add(node("VARIABLE", 3, def("pkg/A#foo().(p)", "IdentifierParameter", 3)));
+    SyntaxTree.Node fooBody = node("BLOCK", 4);
+    fooBody.children.add(node("IDENTIFIER", 5, ref("pkg/A#q.", "IdentifierConstant", 5)));
+    foo.children.add(fooBody);
+    cls.children.add(foo);
+
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+    mBody.children.add(node("IDENTIFIER", 12, ref("pkg/A#e0.", "IdentifierConstant", 12)));
+
+    SyntaxTree.Node ifNode = node("IF", 13);
+    ifNode.children.add(node("IDENTIFIER", 14, ref("pkg/A#flag.", "IdentifierConstant", 14)));
+    SyntaxTree.Node thenB = node("BLOCK", 15);
+    thenB.children.add(node("IDENTIFIER", 16, ref("pkg/A#a.", "IdentifierConstant", 16)));
+    ifNode.children.add(thenB);
+    SyntaxTree.Node elseB = node("BLOCK", 17);
+    elseB.children.add(node("IDENTIFIER", 18, ref("pkg/A#b.", "IdentifierConstant", 18)));
+    ifNode.children.add(elseB);
+    mBody.children.add(ifNode);
+
+    mBody.children.add(node("IDENTIFIER", 19, ref("pkg/A#c.", "IdentifierConstant", 19)));
+
+    SyntaxTree.Node call = node("CALL_EXPRESSION", 20);
+    call.children.add(node("OPERATION_REFERENCE", 21, ref("pkg/A#foo().", "IdentifierFunction", 21)));
+    SyntaxTree.Node argList = node("VALUE_ARGUMENT_LIST", 22);
+    SyntaxTree.Node va = node("VALUE_ARGUMENT", 23);
+    va.children.add(node("REFERENCE_EXPRESSION", 24, ref("pkg/A#x.", "IdentifierConstant", 24)));
+    argList.children.add(va);
+    call.children.add(argList);
+    mBody.children.add(call);
+
+    mBody.children.add(node("IDENTIFIER", 25, ref("pkg/A#y.", "IdentifierConstant", 25)));
+
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#foo().", info(SymbolInformation.Kind.Method, "foo"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"q.", "e0.", "flag.", "a.", "b.", "c.", "x.", "y."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    List<Map<String, Object>> elseEdges = edgesOf(sink, GraphModel.REL_ELSE);
+    java.util.function.BiPredicate<String, String> next = (from, to) ->
+        nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+
+    String e0 = "test::Foo.java#12:0:FIELD";
+    String flagCond = "test::Foo.java#13:0";
+    String a = "test::Foo.java#16:0:FIELD";
+    String b = "test::Foo.java#18:0:FIELD";
+    String c = "test::Foo.java#19:0:FIELD";
+    String x = "test::Foo.java#24:0:FIELD";
+
+    // Cross-block: the condition is the fork — then branch via NEXT, else branch via ELSE; both
+    // branch ends link to the continuation, never skipping via the condition.
+    assertTrue(next.test(e0, flagCond), "e0 before condition");
+    boolean thenNEXT =
+        nexts.stream().anyMatch(e -> flagCond.equals(e.get("_from")) && a.equals(e.get("_to")));
+    boolean elseELSE =
+        elseEdges.stream().anyMatch(e -> flagCond.equals(e.get("_from")) && b.equals(e.get("_to")));
+    assertTrue(thenNEXT, "then branch entered via NEXT from the condition");
+    assertTrue(elseELSE, "else branch entered via ELSE from the condition");
+    assertTrue(next.test(a, c), "then branch end continues after the if");
+    assertTrue(next.test(b, c), "else branch end continues after the if");
+    assertTrue(!next.test(flagCond, c), "condition must not skip straight to continuation");
+
+    // Branch entry structure: then via NEXT (condition true), else via ELSE (condition false).
+    assertTrue(thenNEXT, "then edge entered via NEXT (condition true)");
+    assertTrue(elseELSE, "else edge entered via ELSE (condition false)");
+
+    // Cross-function: call enters callee's first event; void method's exit flows to calledReturn.
+    String calledMethod = "test::Foo.java#20:0";
+    String q = "test::Foo.java#5:0:FIELD";
+    String calledReturn = "test::Foo.java#20:0:CALLED_RETURN";
+    String y = "test::Foo.java#25:0:FIELD";
+    assertTrue(next.test(calledMethod, q), "call enters callee first event");
+    assertTrue(next.test(q, calledReturn), "callee fall-through exit flows to calledReturn");
+    assertTrue(next.test(calledReturn, y), "caller continues after the call");
+  }
+
+  @Test
+  void voidReturnCreatesReturnSlot() {
+    // void m() { return; }  → a RETURN slot node exists (order chain has an explicit exit event)
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 2, def("pkg/A#m().", "IdentifierFunctionDefinition", 2));
+    SyntaxTree.Node body = node("BLOCK", 3);
+    SyntaxTree.Node ret = node("RETURN", 4);
+    body.children.add(ret);
+    m.children.add(body);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    boolean slot =
+        nodesOf(sink, GraphModel.LABEL_VALUE).stream()
+            .anyMatch(v -> GraphModel.VALUE_KIND_RETURN.equals(v.get("kind"))
+                && "test::Foo.java#4:0:RETURN".equals(v.get("_id")));
+    assertTrue(slot, "void return creates a RETURN slot node");
   }
 
   private static SyntaxTree.Node assign(String lhsSym, int lhsLine, String rhsSym, int rhsLine) {

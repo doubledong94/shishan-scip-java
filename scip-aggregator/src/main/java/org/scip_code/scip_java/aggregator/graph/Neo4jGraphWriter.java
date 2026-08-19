@@ -60,13 +60,15 @@ public final class Neo4jGraphWriter implements GraphSink {
     final String fromId;
     final String toLabel;
     final String toId;
+    final Map<String, Object> props;
 
-    EdgeRow(String type, String fromLabel, String fromId, String toLabel, String toId) {
+    EdgeRow(String type, String fromLabel, String fromId, String toLabel, String toId, Map<String, Object> props) {
       this.type = type;
       this.fromLabel = fromLabel;
       this.fromId = fromId;
       this.toLabel = toLabel;
       this.toId = toId;
+      this.props = props;
     }
   }
 
@@ -142,8 +144,19 @@ public final class Neo4jGraphWriter implements GraphSink {
   @Override
   public void addEdge(
       String type, String fromLabel, String fromId, String toLabel, String toId) {
-    if (!seenEdges.add(type + "|" + fromId + "|" + toId)) return;
-    pendingEdges.add(new EdgeRow(type, fromLabel, fromId, toLabel, toId));
+    addEdge(type, fromLabel, fromId, toLabel, toId, null);
+  }
+
+  @Override
+  public void addEdge(
+      String type,
+      String fromLabel,
+      String fromId,
+      String toLabel,
+      String toId,
+      Map<String, Object> props) {
+    if (!seenEdges.add(type + "|" + fromId + "|" + toId + "|" + props)) return;
+    pendingEdges.add(new EdgeRow(type, fromLabel, fromId, toLabel, toId, props));
     if (pendingEdges.size() >= batchSize) flushEdges();
   }
 
@@ -212,15 +225,17 @@ public final class Neo4jGraphWriter implements GraphSink {
               + " {"
               + PROP_ID
               + ": r.to}) "
-              + "CREATE (a)-[:"
+              + "CREATE (a)-[e:"
               + first.type
-              + "]->(b)";
+              + "]->(b) SET e += r.p";
       for (int from = 0; from < rows.size(); from += batchSize) {
         List<Map<String, Object>> data = new ArrayList<>(batchSize);
         for (int i = from; i < Math.min(from + batchSize, rows.size()); i++) {
+          EdgeRow row = rows.get(i);
           Map<String, Object> m = new LinkedHashMap<>();
-          m.put("from", rows.get(i).fromId);
-          m.put("to", rows.get(i).toId);
+          m.put("from", row.fromId);
+          m.put("to", row.toId);
+          m.put("p", row.props == null ? Map.of() : row.props);
           data.add(m);
         }
         run(query, Map.of("rows", data));

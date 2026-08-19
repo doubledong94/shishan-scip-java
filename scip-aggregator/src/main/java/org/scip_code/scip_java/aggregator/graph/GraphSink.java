@@ -17,6 +17,16 @@ public interface GraphSink extends AutoCloseable {
   void addEdge(
       String type, String fromLabel, String fromId, String toLabel, String toId);
 
+  default void addEdge(
+      String type,
+      String fromLabel,
+      String fromId,
+      String toLabel,
+      String toId,
+      Map<String, Object> props) {
+    addEdge(type, fromLabel, fromId, toLabel, toId);
+  }
+
   void flush();
 
   @Override

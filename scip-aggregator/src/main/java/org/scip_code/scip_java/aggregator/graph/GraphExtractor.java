@@ -94,6 +94,120 @@ public final class GraphExtractor {
     return scopeStack.peek();
   }
 
+  // ---------------------------------------------------------------------------
+  // Execution-order chain state (event-level NEXT, cross-block/cross-function)
+  // ---------------------------------------------------------------------------
+
+  /** A chain end waiting to link to the next event in an enclosing block. */
+  private static final class Join {
+    final String id;
+    final String label;
+
+    Join(String id, String label) {
+      this.id = id;
+      this.label = label;
+    }
+  }
+
+  /** A runtime event in an order chain, with its node label. */
+  private static final class EventRef {
+    final String id;
+    final String label;
+
+    EventRef(String id, String label) {
+      this.id = id;
+      this.label = label;
+    }
+  }
+
+  /** Builds one block's event-level order chain. */
+  private static final class BlockBuilder {
+    final List<EventRef> events = new ArrayList<>();
+    final List<Join> pendingJoins = new ArrayList<>();
+    EventRef startFrom = null; // event this block continues from (enclosing chain's last event)
+
+    EventRef lastEvent() {
+      return events.isEmpty() ? null : events.get(events.size() - 1);
+    }
+
+    List<Join> finish() {
+      List<Join> ends = new ArrayList<>(pendingJoins);
+      EventRef last = lastEvent();
+      if (last != null) {
+        ends.add(new Join(last.id, last.label));
+      }
+      pendingJoins.clear();
+      return ends;
+    }
+  }
+
+  private final Deque<BlockBuilder> blockStack = new ArrayDeque<>();
+  // Branch kind of the block being walked: "then" (entered via NEXT) or "else" (entered via ELSE).
+  private final Deque<String> branchKinds = new ArrayDeque<>();
+  // Argument-expression nesting depth: value reads inside a call's arguments are not order-chain
+  // events (the call event encompasses them), keeping arg-before-call ordering implicit.
+  private int insideArgList = 0;
+  // Value reads inside a condition expression are not order-chain events — the condition node is
+  // the fork, so the guard expression's evaluation is part of the condition itself.
+  private int insideConditionExpr = 0;
+  // The most recent Condition event; branch blocks link their first event from it (NEXT=then /
+  // ELSE=else).
+  private EventRef lastConditionEvent = null;
+  private EventRef pendingBranchStartFrom = null;
+  // Cross-function order: callee symbol → its body's first / exit events.
+  private final Map<String, java.util.List<EventRef>> methodFirstEvents = new java.util.HashMap<>();
+  private final Map<String, java.util.List<EventRef>> methodExitEvents = new java.util.HashMap<>();
+  // Call sites collected for the cross-function order post-pass.
+  private static final class CallSite {
+    final String calleeSymbol;
+    final String calledMethodId;
+    final String calledReturnId;
+
+    CallSite(String calleeSymbol, String calledMethodId, String calledReturnId) {
+      this.calleeSymbol = calleeSymbol;
+      this.calledMethodId = calledMethodId;
+      this.calledReturnId = calledReturnId;
+    }
+  }
+
+  private final List<CallSite> callSites = new ArrayList<>();
+
+  /**
+   * Append a runtime event to the current block's order chain, linking it from the previous event
+   * and resolving any pending branch joins. {@code label} is the event node's label.
+   */
+  private void appendChainEvent(String file, String id, String label) {
+    if (insideArgList > 0 || insideConditionExpr > 0) return;
+    BlockBuilder b = blockStack.peek();
+    if (b == null) return;
+    boolean hasJoins = !b.pendingJoins.isEmpty();
+    for (Join j : b.pendingJoins) {
+      writer.addEdge(GraphModel.REL_NEXT, j.label, j.id, label, id);
+    }
+    b.pendingJoins.clear();
+    EventRef prev = b.lastEvent();
+    if (prev != null) {
+      if (!hasJoins && !prev.id.equals(id)) {
+        writer.addEdge(GraphModel.REL_NEXT, prev.label, prev.id, label, id);
+      }
+    } else if (b.startFrom != null) {
+      // Branch entry: a branch block's first event links from the condition — NEXT for the
+      // then branch, ELSE for the else branch.
+      String kind = branchKinds.isEmpty() ? null : branchKinds.peek();
+      String rel = "else".equals(kind) ? GraphModel.REL_ELSE : GraphModel.REL_NEXT;
+      writer.addEdge(rel, b.startFrom.label, b.startFrom.id, label, id);
+      b.startFrom = null;
+    }
+    b.events.add(new EventRef(id, label));
+    // First event of the outermost (method body) block → cross-function entry.
+    if (blockStack.size() == 1 && b.events.size() == 1) {
+      String m = methodSymbols.isEmpty() ? null : methodSymbols.peek();
+      if (m != null && !m.isEmpty()) {
+        methodFirstEvents.computeIfAbsent(m, k -> new ArrayList<>()).add(new EventRef(id, label));
+      }
+    }
+  }
+
   public GraphExtractor(
       GraphSink writer, String project, Map<String, SymbolInformation> symbols) {
     this.writer = writer;
@@ -170,12 +284,43 @@ public final class GraphExtractor {
         }
       }
     }
+    emitOrderRelationships();
   }
 
   private static boolean isTypeSymbol(SymbolInformation.Kind kind) {
     return kind == SymbolInformation.Kind.Class
         || kind == SymbolInformation.Kind.Interface
         || kind == SymbolInformation.Kind.Enum;
+  }
+
+  /**
+   * Cross-function order (called at the end of {@link #emitRelationships()}): a call site enters
+   * the callee's first event, and the callee's exit events flow back into the caller's
+   * calledReturn — so order paths continue across function boundaries without dangling.
+   */
+  private void emitOrderRelationships() {
+    for (CallSite cs : callSites) {
+      if (!symbols.containsKey(cs.calleeSymbol)) continue;
+      java.util.List<EventRef> firsts = methodFirstEvents.get(cs.calleeSymbol);
+      if (firsts != null && !firsts.isEmpty()) {
+        EventRef f = firsts.get(0);
+        writer.addEdge(
+            GraphModel.REL_NEXT,
+            GraphModel.LABEL_CALLED_METHOD, cs.calledMethodId,
+            f.label, f.id);
+      }
+      java.util.List<EventRef> exits = methodExitEvents.get(cs.calleeSymbol);
+      if (exits != null) {
+        for (EventRef ex : exits) {
+          if (!ex.id.equals(cs.calledReturnId)) {
+            writer.addEdge(
+                GraphModel.REL_NEXT,
+                ex.label, ex.id,
+                GraphModel.LABEL_VALUE, cs.calledReturnId);
+          }
+        }
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -206,17 +351,27 @@ public final class GraphExtractor {
     List<SyntaxTree.Node> children = node.children;
     List<SyntaxTree.Node> branches = branchChildren(node);
 
+    // The condition expression evaluates as part of the condition node; its value reads are not
+    // separate order-chain events (the condition is the fork).
+    insideConditionExpr++;
     for (int i = 0; i < children.size(); i++) {
       SyntaxTree.Node child = children.get(i);
       if (branches.contains(child)) continue;
       walk(file, child, node, i);
     }
+    insideConditionExpr--;
 
     List<Scope> branchScopes = new ArrayList<>();
-    for (SyntaxTree.Node branch : branches) {
+    for (int i = 0; i < branches.size(); i++) {
+      // Then branch is entered via NEXT from the condition; else branches via ELSE.
+      String kind = isLoopKind(node.kind) ? "then" : (i == 0 ? "then" : "else");
+      branchKinds.push(kind);
+      pendingBranchStartFrom = lastConditionEvent;
       pushBranchScope();
-      walk(file, branch, node, children.indexOf(branch));
+      walk(file, branches.get(i), node, children.indexOf(branches.get(i)));
       branchScopes.add(scopeStack.pop());
+      pendingBranchStartFrom = null;
+      branchKinds.pop();
     }
     mergeBranchScopes(branchScopes, node);
   }
@@ -315,6 +470,12 @@ public final class GraphExtractor {
     if (isMethodKind(node.kind)) {
       pushMethodScope(file, node, structuralDefinition(node));
     }
+    if (node.kind.equals("BLOCK")) {
+      enterBlock(node);
+    }
+    if (node.kind.equals("VALUE_ARGUMENT_LIST") || node.kind.equals("VALUE_ARGUMENT")) {
+      insideArgList++;
+    }
 
     SyntaxTree.OccurrenceData def = definition(node);
     if (def != null) createDeclaration(file, node, def);
@@ -341,6 +502,18 @@ public final class GraphExtractor {
     emitReferenceValues(file, node);
   }
 
+  private void enterBlock(SyntaxTree.Node node) {
+    BlockBuilder b = new BlockBuilder();
+    if (pendingBranchStartFrom != null) {
+      b.startFrom = pendingBranchStartFrom;
+      pendingBranchStartFrom = null;
+    } else if (!blockStack.isEmpty()) {
+      EventRef prev = blockStack.peek().lastEvent();
+      if (prev != null) b.startFrom = prev;
+    }
+    blockStack.push(b);
+  }
+
   private void exit(String file, SyntaxTree.Node node) {
     if (isConditionKind(node.kind) && !conds.isEmpty()) conds.pop();
     if (isMethodKind(node.kind)) {
@@ -350,71 +523,31 @@ public final class GraphExtractor {
       if (!methodSymbols.isEmpty()) methodSymbols.pop();
     }
     if (node.kind.equals("BLOCK")) {
-      emitNextChain(file, node);
+      exitBlock();
     }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Execution order (the old viewer's CodeOrderVisitor, 5th direction)
-  // ---------------------------------------------------------------------------
-
-  private static final class Anchor {
-    final String id;
-    final String label;
-
-    Anchor(String id, String label) {
-      this.id = id;
-      this.label = label;
+    if (node.kind.equals("VALUE_ARGUMENT_LIST") || node.kind.equals("VALUE_ARGUMENT")) {
+      insideArgList--;
     }
   }
 
   /**
-   * NEXT chain within a block: connect consecutive statement anchors in source order
-   * ({@code stmt1 → stmt2 → …}), mirroring the old viewer's {@code codeOrder(mk, prev, next)}.
+   * On block exit, its chain ends (last event + unresolved branch joins) continue into the
+   * enclosing block's next event (via pendingJoin) — or, for the method body, become the method's
+   * cross-function exit events.
    */
-  private void emitNextChain(String file, SyntaxTree.Node block) {
-    List<Anchor> anchors = new ArrayList<>();
-    for (SyntaxTree.Node child : nonWhitespaceChildren(block)) {
-      Anchor a = firstRuntimeAnchor(file, child);
-      if (a != null) anchors.add(a);
-    }
-    for (int i = 0; i + 1 < anchors.size(); i++) {
-      Anchor a = anchors.get(i);
-      Anchor b = anchors.get(i + 1);
-      if (!a.id.equals(b.id)) {
-        writer.addEdge(GraphModel.REL_NEXT, a.label, a.id, b.label, b.id);
+  private void exitBlock() {
+    BlockBuilder b = blockStack.pop();
+    List<Join> ends = b.finish();
+    if (blockStack.isEmpty()) {
+      String m = methodSymbols.isEmpty() ? null : methodSymbols.peek();
+      if (m != null && !m.isEmpty()) {
+        for (Join j : ends) {
+          methodExitEvents.computeIfAbsent(m, k -> new ArrayList<>()).add(new EventRef(j.id, j.label));
+        }
       }
+    } else {
+      blockStack.peek().pendingJoins.addAll(ends);
     }
-  }
-
-  /** The first runtime anchor inside a statement subtree (value ref, then call, then condition). */
-  private Anchor firstRuntimeAnchor(String file, SyntaxTree.Node subtree) {
-    SyntaxTree.OccurrenceData v = firstValueReference(subtree);
-    if (v != null) {
-      String kind = valueKindFor(v.syntaxKind);
-      if (kind != null) {
-        return new Anchor(runtimeId(project, file, v.range, kind), GraphModel.LABEL_VALUE);
-      }
-    }
-    SyntaxTree.Node inv = firstNodeOfKind(subtree, GraphExtractor::isInvocationKind);
-    if (inv != null) {
-      return new Anchor(runtimeId(project, file, inv.range, null), GraphModel.LABEL_CALLED_METHOD);
-    }
-    SyntaxTree.Node cond = firstNodeOfKind(subtree, GraphExtractor::isConditionKind);
-    if (cond != null) {
-      return new Anchor(runtimeId(project, file, cond.range, null), GraphModel.LABEL_CONDITION);
-    }
-    return null;
-  }
-
-  private static SyntaxTree.Node firstNodeOfKind(
-      SyntaxTree.Node node, java.util.function.Predicate<String> kindTest) {
-    if (kindTest.test(node.kind)) return node;
-    for (SyntaxTree.Node child : node.children) {
-      SyntaxTree.Node r = firstNodeOfKind(child, kindTest);
-      if (r != null) return r;
-    }
-    return null;
   }
 
   // ---------------------------------------------------------------------------
@@ -537,6 +670,7 @@ public final class GraphExtractor {
       props.put("kind", kind);
       props.put("access", isWrite ? "write" : "read");
       writer.addNode(GraphModel.LABEL_VALUE, id, props);
+      appendChainEvent(file, id, GraphModel.LABEL_VALUE);
 
       String scope = innermostCond();
       if (scope != null) {
@@ -742,17 +876,17 @@ public final class GraphExtractor {
     // A return terminates the current branch regardless of whether it carries a value.
     Scope cur = currentScope();
     if (cur != null) cur.hasReturn = true;
-    // The returned value flows into the enclosing method's return slot.
-    List<SyntaxTree.Node> operands = nonWhitespaceChildren(node);
-    if (operands.isEmpty()) return;
-    String valueId = firstValueRuntimeId(file, operands.get(operands.size() - 1));
-    if (valueId == null) return;
-    SyntaxTree.OccurrenceData valueOcc = firstValueReference(operands.get(operands.size() - 1));
-    if (valueOcc == null) return;
+    // Always create a return slot (even for `return;`), so the order chain has an explicit exit
+    // event and the cross-function exit is precise.
     String returnId = runtimeId(project, file, node.range, GraphModel.VALUE_KIND_RETURN);
+    SyntaxTree.OccurrenceData valueOcc = null;
+    List<SyntaxTree.Node> operands = nonWhitespaceChildren(node);
+    if (!operands.isEmpty()) {
+      valueOcc = firstValueReference(operands.get(operands.size() - 1));
+    }
     Map<String, Object> props = new LinkedHashMap<>();
     props.put("name", "return");
-    props.put("symbol", valueOcc.symbol);
+    props.put("symbol", valueOcc != null ? valueOcc.symbol : "");
     props.put("file", file);
     props.put("line", rangeLine(node));
     props.put("kind", GraphModel.VALUE_KIND_RETURN);
@@ -762,7 +896,13 @@ public final class GraphExtractor {
     if (scope != null) {
       writer.addEdge(GraphModel.REL_SCOPED_BY, GraphModel.LABEL_VALUE, returnId, GraphModel.LABEL_CONDITION, scope);
     }
-    writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, valueId, GraphModel.LABEL_VALUE, returnId);
+    if (valueOcc != null) {
+      String valueId = firstValueRuntimeId(file, operands.get(operands.size() - 1));
+      if (valueId != null && !valueId.equals(returnId)) {
+        writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, valueId, GraphModel.LABEL_VALUE, returnId);
+      }
+    }
+    appendChainEvent(file, returnId, GraphModel.LABEL_VALUE);
     // Record this return slot against the enclosing method for cross-method return binding.
     String methodSymbol = methodSymbols.isEmpty() ? null : methodSymbols.peek();
     if (methodSymbol != null && !methodSymbol.isEmpty()) {
@@ -784,6 +924,7 @@ public final class GraphExtractor {
     props.put("file", file);
     props.put("line", node.range == null ? 0 : node.range.startLine());
     writer.addNode(GraphModel.LABEL_CALLED_METHOD, id, props);
+    appendChainEvent(file, id, GraphModel.LABEL_CALLED_METHOD);
 
     if (symbols.containsKey(symbol)) {
       String target = declId(project, file, symbol);
@@ -848,8 +989,13 @@ public final class GraphExtractor {
     retProps.put("line", node.range == null ? 0 : node.range.startLine());
     retProps.put("kind", GraphModel.VALUE_KIND_CALLED_RETURN);
     writer.addNode(GraphModel.LABEL_VALUE, callReturnId, retProps);
+    appendChainEvent(file, callReturnId, GraphModel.LABEL_VALUE);
     if (scope != null) {
       writer.addEdge(GraphModel.REL_SCOPED_BY, GraphModel.LABEL_VALUE, callReturnId, GraphModel.LABEL_CONDITION, scope);
+    }
+    // Cross-function order: the callee's exit events flow into this call's result.
+    if (symbols.containsKey(symbol)) {
+      callSites.add(new CallSite(symbol, id, callReturnId));
     }
     // Cross-method return binding: the callee's return slots flow into this call's result.
     if (symbols.containsKey(symbol)) {
@@ -922,6 +1068,8 @@ public final class GraphExtractor {
     props.put("line", node.range == null ? 0 : node.range.startLine());
     props.put("kind", kind);
     writer.addNode(GraphModel.LABEL_CONDITION, id, props);
+    appendChainEvent(file, id, GraphModel.LABEL_CONDITION);
+    lastConditionEvent = new EventRef(id, GraphModel.LABEL_CONDITION);
 
     String parentCond = innermostCond();
     if (parentCond != null) {
@@ -1113,7 +1261,14 @@ public final class GraphExtractor {
     List<SyntaxTree.Node> out = new ArrayList<>();
     List<SyntaxTree.Node> kids = nonWhitespaceChildren(node);
     if (node.kind.equals("IF")) {
-      for (int i = 1; i < kids.size(); i++) out.add(kids.get(i));
+      // javac: [condition, then, else?]; Kotlin: ['if', condition, THEN, ELSE?]. The condition
+      // expression is NOT a branch; Kotlin wraps the branches in THEN/ELSE nodes.
+      for (SyntaxTree.Node k : kids) {
+        if (k.kind.equals("THEN") || k.kind.equals("ELSE")) out.add(k);
+      }
+      if (out.isEmpty()) {
+        for (int i = 1; i < kids.size(); i++) out.add(kids.get(i));
+      }
     } else if (node.kind.equals("WHEN")) {
       for (SyntaxTree.Node k : kids) {
         if (k.kind.equals("WHEN_ENTRY")) out.add(k);
