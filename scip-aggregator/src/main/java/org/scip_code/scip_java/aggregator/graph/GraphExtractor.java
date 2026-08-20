@@ -565,6 +565,8 @@ public final class GraphExtractor {
       props.put("name", displayName(info, symbol));
       props.put("file", file);
       props.put("line", rangeLine(def));
+      props.put("col", rangeCol(def));
+      props.put("colEnd", rangeColEnd(def));
       props.put("symbol", symbol);
       boolean isConstructor = info != null && info.getKind() == SymbolInformation.Kind.Constructor;
       props.put("isConstructor", isConstructor);
@@ -583,6 +585,8 @@ public final class GraphExtractor {
     Map<String, Object> rootProps = new LinkedHashMap<>();
     rootProps.put("file", file);
     rootProps.put("line", range == null ? 0 : range.startLine());
+    rootProps.put("col", range == null ? 0 : range.startCharacter());
+    rootProps.put("colEnd", range == null ? 0 : range.endCharacter());
     rootProps.put("kind", GraphModel.CONDITION_KIND_METHOD);
     writer.addNode(GraphModel.LABEL_CONDITION, rootCond, rootProps);
     if (hasSymbol) {
@@ -605,6 +609,8 @@ public final class GraphExtractor {
     props.put("name", name);
     props.put("file", file);
     props.put("line", rangeLine(def));
+    props.put("col", rangeCol(def));
+    props.put("colEnd", rangeColEnd(def));
     props.put("symbol", symbol);
     if (info != null && info.hasSignatureDocumentation()) {
       props.put("signature", info.getSignatureDocumentation().getText());
@@ -667,6 +673,8 @@ public final class GraphExtractor {
       props.put("symbol", occ.symbol);
       props.put("file", file);
       props.put("line", rangeLine(occ));
+      props.put("col", rangeCol(occ));
+      props.put("colEnd", rangeColEnd(occ));
       props.put("kind", kind);
       props.put("access", isWrite ? "write" : "read");
       writer.addNode(GraphModel.LABEL_VALUE, id, props);
@@ -889,6 +897,8 @@ public final class GraphExtractor {
     props.put("symbol", valueOcc != null ? valueOcc.symbol : "");
     props.put("file", file);
     props.put("line", rangeLine(node));
+    props.put("col", rangeCol(node));
+    props.put("colEnd", rangeColEnd(node));
     props.put("kind", GraphModel.VALUE_KIND_RETURN);
     props.put("access", "write");
     writer.addNode(GraphModel.LABEL_VALUE, returnId, props);
@@ -923,6 +933,8 @@ public final class GraphExtractor {
     props.put("symbol", symbol);
     props.put("file", file);
     props.put("line", node.range == null ? 0 : node.range.startLine());
+    props.put("col", rangeCol(node));
+    props.put("colEnd", rangeColEnd(node));
     writer.addNode(GraphModel.LABEL_CALLED_METHOD, id, props);
     appendChainEvent(file, id, GraphModel.LABEL_CALLED_METHOD);
 
@@ -952,6 +964,8 @@ public final class GraphExtractor {
       argProps.put("symbol", valueSymbol != null ? valueSymbol : "");
       argProps.put("file", file);
       argProps.put("line", arg.range == null ? 0 : arg.range.startLine());
+      argProps.put("col", rangeCol(arg));
+      argProps.put("colEnd", rangeColEnd(arg));
       argProps.put("kind", GraphModel.VALUE_KIND_CALLED_PARAM);
       writer.addNode(GraphModel.LABEL_VALUE, valueId, argProps);
       writer.addEdge(GraphModel.REL_ARG_OF, GraphModel.LABEL_VALUE, valueId, GraphModel.LABEL_CALLED_METHOD, id);
@@ -987,6 +1001,8 @@ public final class GraphExtractor {
     retProps.put("symbol", symbol);
     retProps.put("file", file);
     retProps.put("line", node.range == null ? 0 : node.range.startLine());
+    retProps.put("col", rangeCol(node));
+    retProps.put("colEnd", rangeColEnd(node));
     retProps.put("kind", GraphModel.VALUE_KIND_CALLED_RETURN);
     writer.addNode(GraphModel.LABEL_VALUE, callReturnId, retProps);
     appendChainEvent(file, callReturnId, GraphModel.LABEL_VALUE);
@@ -1066,6 +1082,8 @@ public final class GraphExtractor {
     Map<String, Object> props = new LinkedHashMap<>();
     props.put("file", file);
     props.put("line", node.range == null ? 0 : node.range.startLine());
+    props.put("col", rangeCol(node));
+    props.put("colEnd", rangeColEnd(node));
     props.put("kind", kind);
     writer.addNode(GraphModel.LABEL_CONDITION, id, props);
     appendChainEvent(file, id, GraphModel.LABEL_CONDITION);
@@ -1207,6 +1225,8 @@ public final class GraphExtractor {
     props.put("symbol", base.symbol);
     props.put("file", file);
     props.put("line", rangeLine(node));
+    props.put("col", rangeCol(node));
+    props.put("colEnd", rangeColEnd(node));
     props.put("kind", GraphModel.VALUE_KIND_INDEX);
     writer.addNode(GraphModel.LABEL_VALUE, elementId, props);
     String scope = innermostCond();
@@ -1452,6 +1472,22 @@ public final class GraphExtractor {
 
   private static int rangeLine(SyntaxTree.Node node) {
     return node.range == null ? 0 : node.range.startLine();
+  }
+
+  private static int rangeCol(SyntaxTree.OccurrenceData occ) {
+    return occ.range == null ? 0 : occ.range.startCharacter();
+  }
+
+  private static int rangeCol(SyntaxTree.Node node) {
+    return node.range == null ? 0 : node.range.startCharacter();
+  }
+
+  private static int rangeColEnd(SyntaxTree.OccurrenceData occ) {
+    return occ.range == null ? 0 : occ.range.endCharacter();
+  }
+
+  private static int rangeColEnd(SyntaxTree.Node node) {
+    return node.range == null ? 0 : node.range.endCharacter();
   }
 
   static String shortName(String symbol) {
