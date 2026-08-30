@@ -1029,17 +1029,31 @@ public final class GraphExtractor {
     // （exit 顺序在实参子表达式读取之后），保证执行序 ...→实参求值→实参槽→调用→返回→...。
     java.util.List<EventRef> callChain = new ArrayList<>();
     List<SyntaxTree.Node> args = argumentNodes(node);
+    // 被调函数按序的形参符号（用于让实参槽 symbol 与被调函数的形参一致，从 symbol 即知"哪个函数的哪个参数"）
+    java.util.List<String> calleeParams = paramsByMethod.get(symbol);
     java.util.List<String> calledParamIds = new ArrayList<>();
     int argIndex = 0;
     for (SyntaxTree.Node arg : args) {
-      String valueSymbol = argValueSymbol(arg);
+      // 实参的取值符号（仅作兜底/伪实参判断）：实参里第一个"非 local"的真实符号。
+      String argSym = argLabel(file, arg)[1];
       // 无参/零参调用：AST 可能把"被调函数引用"本身当子节点，误成一个"实参"（其 symbol 恰为 callee），
       // 会给无参函数造出假的 CALLED_PARAM 槽。跳过实参==被调函数自身的项，只在确有其实参时建槽。
-      if (valueSymbol != null && valueSymbol.equals(symbol)) continue;
-      String valueId =
-          runtimeId(project, file, arg.range, argIndex + ":" + (valueSymbol != null ? valueSymbol : "arg"));
+      if (argSym != null && argSym.equals(symbol)) continue;
+      // 实参槽的 symbol/名字：优先=被调函数的第 argIndex 个形参符号（与 PARAM 节点同源、观感一致）；
+      // 形参解析不到（外部/顺序对不上）时回退到实参的取值符号（字段等）。
+      String slotSym = null, slotName = null;
+      if (calleeParams != null && argIndex < calleeParams.size()) {
+        String pSym = calleeParams.get(argIndex);
+        SymbolInformation pi = symbols.get(pSym);
+        String pName = pi != null && !pi.getDisplayName().isEmpty() ? pi.getDisplayName() : shortName(pSym);
+        slotSym = pSym; slotName = pName;
+      }
+      String valueSymbol = slotSym != null ? slotSym : (argSym != null ? argSym : null);
+      String safeSym = valueSymbol == null || valueSymbol.isEmpty() ? ("#" + argIndex) : valueSymbol;
+      String valueId = runtimeId(project, file, arg.range, argIndex + ":" + safeSym);
       Map<String, Object> argProps = new LinkedHashMap<>();
-      argProps.put("name", valueSymbol != null && !valueSymbol.isEmpty() ? valueName(file, valueSymbol) : "arg");
+      String name = slotName != null ? slotName : (argSym != null && !argSym.isEmpty() ? valueName(file, argSym) : ("#" + argIndex));
+      argProps.put("name", name);
       argProps.put("symbol", valueSymbol != null ? valueSymbol : "");
       argProps.put("file", file);
       argProps.put("line", arg.range == null ? 0 : arg.range.startLine());
@@ -1450,6 +1464,41 @@ public final class GraphExtractor {
       if (symbol.equals(occ.symbol)) return true;
     }
     return false;
+  }
+
+  /**
+   * 实参槽的 {名字, 符号}，遍历语法树（不依赖源码文本）：
+   *  名字 = 实参里第一个引用（左起）的真实名：局部变量解析回源码名（如 request），字段/方法取显示名；
+   *  符号 = 实参子树里第一个"非 local"的真实符号（字段/参数/方法）——局部变量一律不暴露成
+   *         opaque 的 "local N"，全是局部则留空。既修 symbol=local，也避免 label 退回 "arg"。
+   */
+  private String[] argLabel(String file, SyntaxTree.Node arg) {
+    String firstName = null;
+    String best = null;
+    java.util.ArrayDeque<SyntaxTree.Node> stack = new java.util.ArrayDeque<>();
+    stack.push(arg);
+    while (!stack.isEmpty()) {
+      SyntaxTree.Node n = stack.pop();
+      for (SyntaxTree.OccurrenceData occ : n.occurrences) {
+        String sym = occ.symbol;
+        if (sym == null || sym.isEmpty()) continue;
+        if (ScipSymbols.isLocal(sym)) {
+          if (firstName == null) {
+            Map<String, String> m = localNamesByFile.get(file);
+            String rn = m == null ? null : m.get(sym);
+            firstName = (rn != null && !rn.isEmpty()) ? rn : shortName(sym);
+          }
+        } else {
+          if (best == null) best = sym;
+          if (firstName == null) {
+            SymbolInformation info = symbols.get(sym);
+            firstName = info != null && !info.getDisplayName().isEmpty() ? info.getDisplayName() : shortName(sym);
+          }
+        }
+      }
+      for (SyntaxTree.Node c : n.children) stack.push(c);
+    }
+    return new String[] {firstName != null ? firstName : "", best != null ? best : ""};
   }
 
   private static String argValueSymbol(SyntaxTree.Node arg) {
