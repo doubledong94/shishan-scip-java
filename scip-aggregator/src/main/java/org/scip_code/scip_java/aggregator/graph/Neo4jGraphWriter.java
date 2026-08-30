@@ -203,6 +203,10 @@ public final class Neo4jGraphWriter implements GraphSink {
 
   private void flushEdges() {
     if (pendingEdges.isEmpty()) return;
+    // 关键：边用 MATCH(a{id})/MATCH(b{id}) 建，若端点还留在 pendingNodes 未入库，该边会被静默丢弃
+    // （正是方法有节点、却没 Method-[:ROOT]->根条件/LEADS_TO 边的原因）。写边前先刷光全部待写节点，
+    // 保证任意边的两端在写库时都已存在。
+    flushNodes();
     // Group by (type, fromLabel, toLabel).
     Map<String, List<EdgeRow>> byType = new LinkedHashMap<>();
     for (EdgeRow row : pendingEdges) {
