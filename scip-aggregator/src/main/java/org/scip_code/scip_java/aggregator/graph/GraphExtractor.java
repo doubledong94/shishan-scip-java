@@ -39,8 +39,9 @@ import org.scip_code.scip_java.shared.SyntaxTree;
  * <p>Edges: declarations wired by {@code DECLARES}/{@code HAS_PARAM} (SCIP symbol hierarchy) and
  * {@code EXTENDS}/{@code OVERRIDES}; runtime layer wired by {@code FLOWS} (assignment, last-write,
  * argument passing, return), {@code CONTROLS} (value guards a branch), {@code REF} (receiver
- * reaches a call), {@code ROOT}/{@code SUB}/{@code ELSE}/{@code LEADS_TO} (branches) and {@code
- * CALLS}/{@code ARG_OF}/{@code SCOPED_BY} (calls).
+ * reaches a call), {@code ROOT}/{@code SUB}/{@code ELSE}/{@code LEADS_TO} (branches; {@code
+ * LEADS_TO} also anchors each runtime node — call site or Value — to its enclosing condition /
+ * method root, all in the unified Condition->node direction), {@code CALLS}/{@code ARG_OF} (calls).
  */
 public final class GraphExtractor {
 
@@ -50,6 +51,14 @@ public final class GraphExtractor {
 
   // Post-pass bookkeeping: created declaration symbols → node label.
   private final Map<String, String> createdSymbolLabel = new LinkedHashMap<>();
+  // In-project Method node ids actually created (from method definitions). A CALLS target NOT in
+  // this set is a dependency / unknown symbol → a placeholder Method node is materialised for it in
+  // emitRelationships(), so every call site still expands to at least one searchable node.
+  private final java.util.Set<String> inProjectMethodIds = new java.util.HashSet<>();
+  private final java.util.Map<String, String> callTargetSymbols = new java.util.HashMap<>();
+  // Collect CALLS (callId, targetId) and emit them at the end (emitExternalMethodTargets), AFTER
+  // any placeholder Method targets are queued, so batch flushes never write an edge to a missing node.
+  private final java.util.List<java.util.List<String>> deferredCalls = new java.util.ArrayList<>();
 
   private final Deque<String> methodRootConds = new ArrayDeque<>();
   private final Deque<String> conds = new ArrayDeque<>();
@@ -285,6 +294,34 @@ public final class GraphExtractor {
       }
     }
     emitOrderRelationships();
+    emitExternalMethodTargets();
+  }
+
+  /**
+   * 后置补全：所有 CALLS 目标里，凡不是项目内已建的 Method 节点（依赖/未建定义的），为其补一个
+   * external 占位 Method 节点。这样每个调用点至少能展开到一个可搜索的节点（即使被调在依赖包里），
+   * 不再让 CALLS 指向不存在的节点而被丢弃。出现在 emitRelationships 末尾，此时项目内定义全已建好，
+   * 也避免了"调用先于定义"导致的误判。
+   */
+  private void emitExternalMethodTargets() {
+    // 1) 先把项目内定义之外的所有 CALLS 目标补成 external 占位 Method 节点（入队待 flush）。
+    for (Map.Entry<String, String> en : callTargetSymbols.entrySet()) {
+      String target = en.getKey();
+      if (inProjectMethodIds.contains(target)) continue;
+      String esym = en.getValue();
+      if (ScipSymbols.isLocal(esym)) continue;
+      Map<String, Object> ep = new LinkedHashMap<>();
+      ep.put("name", shortName(esym));
+      ep.put("symbol", esym);
+      ep.put("external", true);
+      writer.addNode(GraphModel.LABEL_METHOD, target, ep);
+    }
+    // 2) 再统一补发所有 CALLS 边。flush() 会先在 pendingNodes 里写占位/项目内 Method 节点、
+    //    后写这些边，故 MATCH 目标必然存在。
+    for (java.util.List<String> c : deferredCalls) {
+      writer.addEdge(
+          GraphModel.REL_CALLS, GraphModel.LABEL_CALLED_METHOD, c.get(0), GraphModel.LABEL_METHOD, c.get(1));
+    }
   }
 
   private static boolean isTypeSymbol(SymbolInformation.Kind kind) {
@@ -464,9 +501,9 @@ public final class GraphExtractor {
   private static final int MAX_UNION_WRITES = 64;
 
   private void enter(String file, SyntaxTree.Node node, SyntaxTree.Node parent, int index) {
-    // Method scope: a structural method node (javac METHOD / Kotlin FUN) anchors a root condition
-    // so body-level calls can be SCOPED_BY it. Always pushed (even without a resolvable symbol) so
-    // exit() is symmetric.
+    // Method scope: a structural method node (javac METHOD / Kotlin FUN) anchors a root condition;
+    // both body-level calls and runtime Value nodes are anchored to it via LEADS_TO. Always pushed
+    // (even without a resolvable symbol) so exit() is symmetric.
     if (isMethodKind(node.kind)) {
       pushMethodScope(file, node, structuralDefinition(node));
     }
@@ -574,11 +611,12 @@ public final class GraphExtractor {
         props.put("signature", info.getSignatureDocumentation().getText());
       }
       writer.addNode(GraphModel.LABEL_METHOD, id, props);
+      inProjectMethodIds.add(id);
       methodSymbols.push(symbol);
     } else {
       methodSymbols.push("");
     }
-    // The root condition anchors SCOPED_BY for body-level runtime nodes; created in all cases so
+    // The root condition anchors LEADS_TO for body-level runtime nodes; created in all cases so
     // the enter/exit stacks stay symmetric.
     ScipRange range = def != null && def.range != null ? def.range : node.range;
     String rootCond = runtimeId(project, file, range, "root");
@@ -682,7 +720,7 @@ public final class GraphExtractor {
 
       String scope = innermostCond();
       if (scope != null) {
-        writer.addEdge(GraphModel.REL_SCOPED_BY, GraphModel.LABEL_VALUE, id, GraphModel.LABEL_CONDITION, scope);
+        writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_VALUE, id);
       }
 
       if (isWrite) {
@@ -904,7 +942,7 @@ public final class GraphExtractor {
     writer.addNode(GraphModel.LABEL_VALUE, returnId, props);
     String scope = innermostCond();
     if (scope != null) {
-      writer.addEdge(GraphModel.REL_SCOPED_BY, GraphModel.LABEL_VALUE, returnId, GraphModel.LABEL_CONDITION, scope);
+      writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_VALUE, returnId);
     }
     if (valueOcc != null) {
       String valueId = firstValueRuntimeId(file, operands.get(operands.size() - 1));
@@ -938,17 +976,20 @@ public final class GraphExtractor {
     writer.addNode(GraphModel.LABEL_CALLED_METHOD, id, props);
     appendChainEvent(file, id, GraphModel.LABEL_CALLED_METHOD);
 
-    if (symbols.containsKey(symbol)) {
-      String target = declId(project, file, symbol);
-      writer.addEdge(GraphModel.REL_CALLS, GraphModel.LABEL_CALLED_METHOD, id, GraphModel.LABEL_METHOD, target);
+    String target = declId(project, file, symbol);
+    // CALLS 边后置到 emitRelationships() 再发（先把项目内/占位目标节点都入队，flush 先写节点后写
+    // 边，边决不指向空节点）。本地符号不跨文件，跳过。
+    if (!ScipSymbols.isLocal(symbol)) {
+      deferredCalls.add(java.util.List.of(id, target));
+      callTargetSymbols.put(target, symbol);
     }
 
     String scope = innermostCond();
     if (scope != null) {
-      writer.addEdge(GraphModel.REL_SCOPED_BY, GraphModel.LABEL_CALLED_METHOD, id, GraphModel.LABEL_CONDITION, scope);
-      if (!isMethodRoot(scope)) {
-        writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_CALLED_METHOD, id);
-      }
+      // 统一锚定边 LEADS_TO（Condition->运行时节点，恒发含方法根）：调用点（CalledMethod）与
+      // Value 数据作用域都走这条边的同一方向。分支/方法归属用 Condition 节点 +
+      // kind(METHOD/IF/LOOP/ELSE) 区分即可。
+      writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_CALLED_METHOD, id);
     }
 
     // Runtime value nodes for the arguments → ARG_OF; the argument's value flows into the slot.
@@ -970,7 +1011,7 @@ public final class GraphExtractor {
       writer.addNode(GraphModel.LABEL_VALUE, valueId, argProps);
       writer.addEdge(GraphModel.REL_ARG_OF, GraphModel.LABEL_VALUE, valueId, GraphModel.LABEL_CALLED_METHOD, id);
       if (scope != null) {
-        writer.addEdge(GraphModel.REL_SCOPED_BY, GraphModel.LABEL_VALUE, valueId, GraphModel.LABEL_CONDITION, scope);
+        writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_VALUE, valueId);
       }
       // The argument expression's value flows into this call slot.
       String argSourceId = firstValueRuntimeId(file, arg);
@@ -1007,7 +1048,7 @@ public final class GraphExtractor {
     writer.addNode(GraphModel.LABEL_VALUE, callReturnId, retProps);
     appendChainEvent(file, callReturnId, GraphModel.LABEL_VALUE);
     if (scope != null) {
-      writer.addEdge(GraphModel.REL_SCOPED_BY, GraphModel.LABEL_VALUE, callReturnId, GraphModel.LABEL_CONDITION, scope);
+      writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_VALUE, callReturnId);
     }
     // Cross-function order: the callee's exit events flow into this call's result.
     if (symbols.containsKey(symbol)) {
@@ -1111,10 +1152,6 @@ public final class GraphExtractor {
 
   private String innermostCond() {
     return conds.isEmpty() ? null : conds.peek();
-  }
-
-  private boolean isMethodRoot(String condId) {
-    return !methodRootConds.isEmpty() && condId.equals(methodRootConds.peek());
   }
 
   private List<String> conditionValueIds(String file, SyntaxTree.Node node) {
@@ -1231,7 +1268,7 @@ public final class GraphExtractor {
     writer.addNode(GraphModel.LABEL_VALUE, elementId, props);
     String scope = innermostCond();
     if (scope != null) {
-      writer.addEdge(GraphModel.REL_SCOPED_BY, GraphModel.LABEL_VALUE, elementId, GraphModel.LABEL_CONDITION, scope);
+      writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_VALUE, elementId);
     }
     if (!baseId.equals(elementId)) {
       writer.addEdge(GraphModel.REL_INDEX, GraphModel.LABEL_VALUE, baseId, GraphModel.LABEL_VALUE, elementId);

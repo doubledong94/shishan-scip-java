@@ -35,7 +35,6 @@ public final class GraphModel {
   public static final String REL_ELSE = "ELSE";
   public static final String REL_LEADS_TO = "LEADS_TO";
   public static final String REL_CALLS = "CALLS";
-  public static final String REL_SCOPED_BY = "SCOPED_BY";
   public static final String REL_ARG_OF = "ARG_OF";
   public static final String REL_RET_OF = "RET_OF";
   public static final String REL_FLOWS = "FLOWS";
