@@ -675,11 +675,19 @@ public final class GraphExtractor {
     } else if ("IdentifierLocal".equals(syntaxKind)) {
       props.put("kind", GraphModel.VALUE_KIND_LOCAL_VAR);
       label = GraphModel.LABEL_VALUE;
+      props.put("access", "write"); // 声明 = 一次对该局部变量的写
       if (ScipSymbols.isLocal(symbol)) {
         // Locals use per-file "local N" symbols; remember the real source name for naming reads.
         localNamesByFile
             .computeIfAbsent(file, k -> new java.util.HashMap<>())
             .put(symbol, name);
+        // 声明式赋值（val/var x = …）的 LHS 是 definition occurrence，不走 emitReferenceValues，
+        // 于是这个"写"节点从未进入 NEXT 执行链、孤立。把它作为一次运行时写事件入链，
+        // 与普通 `x = y` 的写节点行为一致，保证每个语句节点都有顺序关系。
+        String localId = declId(project, file, symbol);
+        writer.addNode(label, localId, props);
+        appendChainEvent(file, localId, GraphModel.LABEL_VALUE);
+        return;
       }
     } else {
       // javac IdentifierConstant, Kotlin Identifier for non-local properties → field.
