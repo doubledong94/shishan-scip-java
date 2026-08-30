@@ -495,7 +495,26 @@ public final class GraphExtractor {
       // Then branch is entered via NEXT from the condition; else branches via ELSE.
       String kind = isLoopKind(node.kind) ? "then" : (i == 0 ? "then" : "else");
       branchKinds.push(kind);
-      pendingBranchStartFrom = lastConditionEvent;
+      if ("else".equals(kind)) {
+        // else 分支也物化成一个 kind=ELSE 的 Condition 节点：IF --ELSE--> ELSE(node)，
+        // 并把 else 块首节点的起点锚到该 ELSE 节点（else 不是边，是 Condition 的一种）。
+        SyntaxTree.Node br = branches.get(i);
+        String elseId = runtimeId(project, file, br.range, "ELSE");
+        Map<String, Object> ep = new LinkedHashMap<>();
+        ep.put("file", file);
+        ep.put("line", rangeLine(br));
+        ep.put("col", rangeCol(br));
+        ep.put("colEnd", rangeColEnd(br));
+        ep.put("kind", GraphModel.CONDITION_KIND_ELSE);
+        writer.addNode(GraphModel.LABEL_CONDITION, elseId, ep);
+        if (lastConditionEvent != null) {
+          writer.addEdge(GraphModel.REL_ELSE, lastConditionEvent.label, lastConditionEvent.id,
+              GraphModel.LABEL_CONDITION, elseId);
+        }
+        pendingBranchStartFrom = new EventRef(elseId, GraphModel.LABEL_CONDITION);
+      } else {
+        pendingBranchStartFrom = lastConditionEvent;
+      }
       pushBranchScope();
       walk(file, branches.get(i), node, children.indexOf(branches.get(i)));
       branchScopes.add(scopeStack.pop());

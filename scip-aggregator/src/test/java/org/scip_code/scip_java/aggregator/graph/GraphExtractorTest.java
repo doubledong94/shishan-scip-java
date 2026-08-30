@@ -745,17 +745,23 @@ class GraphExtractorTest {
     assertTrue(next.test(flag, flagCond), "guard read before condition");
     boolean thenNEXT =
         nexts.stream().anyMatch(e -> flagCond.equals(e.get("_from")) && a.equals(e.get("_to")));
-    boolean elseELSE =
-        elseEdges.stream().anyMatch(e -> flagCond.equals(e.get("_from")) && b.equals(e.get("_to")));
+    // else 分支首节点 b 的前置是一个 kind=ELSE 的 Condition 节点(elseB@17)，其从 flagCond 经 ELSE 进入。
+    String elseCond = "test::Foo.java#17:0:ELSE";
+    boolean elseChain =
+        elseEdges.stream().anyMatch(e -> flagCond.equals(e.get("_from")) && elseCond.equals(e.get("_to")));
+    boolean elseEntry =
+        elseEdges.stream().anyMatch(e -> elseCond.equals(e.get("_from")) && b.equals(e.get("_to")));
     assertTrue(thenNEXT, "then branch entered via NEXT from the condition");
-    assertTrue(elseELSE, "else branch entered via ELSE from the condition");
+    assertTrue(elseChain, "condition -> else node via ELSE");
+    assertTrue(elseEntry, "else node -> else branch first via ELSE");
     assertTrue(next.test(a, c), "then branch end continues after the if");
     assertTrue(next.test(b, c), "else branch end continues after the if");
     assertTrue(!next.test(flagCond, c), "condition must not skip straight to continuation");
 
-    // Branch entry structure: then via NEXT (condition true), else via ELSE (condition false).
+    // Branch entry structure: then via NEXT (condition true), else 经 ELSE 进入 kind=ELSE 的条件节点。
     assertTrue(thenNEXT, "then edge entered via NEXT (condition true)");
-    assertTrue(elseELSE, "else edge entered via ELSE (condition false)");
+    assertTrue(elseChain, "else entered via ELSE from condition");
+    assertTrue(elseEntry, "else branch first node's predecessor is the ELSE node");
 
     // Cross-function: call enters callee's first event; void method's exit flows to calledReturn.
     String calledMethod = "test::Foo.java#20:0";
