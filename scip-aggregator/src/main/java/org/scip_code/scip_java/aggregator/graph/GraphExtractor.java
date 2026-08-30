@@ -65,6 +65,15 @@ public final class GraphExtractor {
   private final Deque<String> methodSymbols = new ArrayDeque<>();
   // Cross-method binding: callee method symbol → its params in declaration order.
   private final Map<String, java.util.List<String>> paramsByMethod = new java.util.HashMap<>();
+  // CALLED_PARAM 槽的形参后置补正：paramsByMethod 在处理到被调文件时才填充，调用点可能在它
+  // 之前被处理，故先记录，待全部文件提取完、paramsByMethod 完整后再统一把槽名/符号改成对应形参。
+  private static final class ArgSlotFixup {
+    final String id; final String file; final String calleeSymbol; final int argIndex;
+    ArgSlotFixup(String id, String file, String calleeSymbol, int argIndex) {
+      this.id = id; this.file = file; this.calleeSymbol = calleeSymbol; this.argIndex = argIndex;
+    }
+  }
+  private final java.util.List<ArgSlotFixup> pendingArgFixups = new java.util.ArrayList<>();
   // Cross-method binding: callee method symbol → its return-slot runtime ids.
   private final Map<String, java.util.List<String>> returnsByMethod = new java.util.HashMap<>();
   // Local variables get per-file SCIP symbols ("local N"); map (file, localSymbol) → source name.
@@ -276,7 +285,24 @@ public final class GraphExtractor {
   }
 
   /** Emits declaration-relationship edges ({@code DECLARES}/{@code HAS_PARAM}/{@code EXTENDS}/{@code OVERRIDES}). */
+    /** 全部文件提取完后，把 CALLED_PARAM 槽的符号/名字后置补正为被调函数对应形参（paramsByMethod 此时已完整）。 */
+  private void fixupArgSlots() {
+    for (ArgSlotFixup f : pendingArgFixups) {
+      java.util.List<String> ps = paramsByMethod.get(f.calleeSymbol);
+      if (ps == null || f.argIndex >= ps.size()) continue;
+      String pSym = ps.get(f.argIndex);
+      SymbolInformation pi = symbols.get(pSym);
+      String pName = pi != null && !pi.getDisplayName().isEmpty() ? pi.getDisplayName() : shortName(pSym);
+      Map<String, Object> m = new LinkedHashMap<>();
+      m.put("name", pName);
+      m.put("symbol", pSym);
+      writer.addNode(GraphModel.LABEL_VALUE, f.id, m); // MERGE by id → 更新该槽的 name/symbol
+    }
+    pendingArgFixups.clear();
+  }
+
   public void emitRelationships() {
+    fixupArgSlots();
     for (Map.Entry<String, String> entry : createdSymbolLabel.entrySet()) {
       String symbol = entry.getKey();
       String label = entry.getValue();
@@ -1072,6 +1098,7 @@ public final class GraphExtractor {
         writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, argSourceId, GraphModel.LABEL_VALUE, valueId);
       }
       calledParamIds.add(valueId);
+      pendingArgFixups.add(new ArgSlotFixup(valueId, file, symbol, argIndex));
       argIndex++;
     }
     // 实参槽之后入链调用本身。
