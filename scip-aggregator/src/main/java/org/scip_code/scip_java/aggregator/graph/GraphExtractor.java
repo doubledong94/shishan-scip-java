@@ -178,12 +178,36 @@ public final class GraphExtractor {
   // invocation node's exit so arg-internal reads (chained during child traversal) precede the call
   // in execution order — matching eval-order: ... → argExpr reads → args → call → return → ...
   private final Deque<java.util.List<EventRef>> pendingCallChains = new ArrayDeque<>();
+  // 赋值/声明的"写"延迟到 RHS 读之后再入链：`x = rhs` / `val x = rhs` 执行顺序是"先求值 RHS（读），
+  // 再写 LHS"。Write 在遍历 LHS（或声明）时最先遇到，若立刻入链会把写排到 RHS 读之前。
+  // 用"行"作语句边界：同一行内的写先挂着，待链推进到下一行（该语句的 RHS 读及之后的语句）再统一入链。
+  private static final class LocalWrite {
+    final int line; final String id; final String label;
+    LocalWrite(int line, String id, String label) { this.line = line; this.id = id; this.label = label; }
+  }
+  private final java.util.List<LocalWrite> pendingLocalWrites = new java.util.ArrayList<>();
+
+  /** 在并入一个位于 {@code line} 的新事件前，先把行号更小的延迟"写"入链（同语句更后的读不受影响）。 */
+  private void flushLocalWrites(String file, int line) {
+    for (int i = 0; i < pendingLocalWrites.size(); ) {
+      LocalWrite w = pendingLocalWrites.get(i);
+      if (w.line < line) { pendingLocalWrites.remove(i); appendChainEvent(file, w.id, w.label, w.line); }
+      else i++;
+    }
+  }
+  private void flushAllLocalWrites(String file) { flushLocalWrites(file, Integer.MAX_VALUE); }
+
+  /** 入链一个运行时事件（带源行，供按行冲排延迟写）。 */
+  private void appendChainEvent(String file, String id, String label, int line) {
+    flushLocalWrites(file, line);
+    doAppendChainEvent(file, id, label);
+  }
 
   /**
    * Append a runtime event to the current block's order chain, linking it from the previous event
    * and resolving any pending branch joins. {@code label} is the event node's label.
    */
-  private void appendChainEvent(String file, String id, String label) {
+  private void doAppendChainEvent(String file, String id, String label) {
     // 所有运行时事件（方法调用、value 读取/写入、实参槽、条件、返回值、索引元素）都进执行链，
     // 保证 method↔value、value↔value 连续、节点不孤立。实参槽在调用前入链，实参子表达式的读取
     // 在遍历到子节点时补链，整体连通。
@@ -553,13 +577,13 @@ public final class GraphExtractor {
       if (!methodSymbols.isEmpty()) methodSymbols.pop();
     }
     if (node.kind.equals("BLOCK")) {
-      exitBlock();
+      exitBlock(file);
     }
     // Invocation exit: commit this call's deferred chain events (args → calledMethod → calledReturn)
     // into the enclosing block, after the arg-internal reads that were chained during child walk.
     if (isInvocationKind(node.kind) && !pendingCallChains.isEmpty()) {
       for (EventRef e : pendingCallChains.pop()) {
-        appendChainEvent(file, e.id, e.label);
+        appendChainEvent(file, e.id, e.label, rangeLine(node));
       }
     }
   }
@@ -569,7 +593,8 @@ public final class GraphExtractor {
    * enclosing block's next event (via pendingJoin) — or, for the method body, become the method's
    * cross-function exit events.
    */
-  private void exitBlock() {
+  private void exitBlock(String file) {
+    flushAllLocalWrites(file); // 方法体/块结束前冲掉末尾遗留的延迟写
     BlockBuilder b = blockStack.pop();
     List<Join> ends = b.finish();
     if (blockStack.isEmpty()) {
@@ -686,7 +711,8 @@ public final class GraphExtractor {
         // 与普通 `x = y` 的写节点行为一致，保证每个语句节点都有顺序关系。
         String localId = declId(project, file, symbol);
         writer.addNode(label, localId, props);
-        appendChainEvent(file, localId, GraphModel.LABEL_VALUE);
+        // 写节点延迟（按行）到 RHS 读之后再入链，保证 `val x = rhs` 先读后写。
+        pendingLocalWrites.add(new LocalWrite(rangeLine(node), localId, GraphModel.LABEL_VALUE));
         return;
       }
     } else {
@@ -722,7 +748,8 @@ public final class GraphExtractor {
       props.put("kind", kind);
       props.put("access", isWrite ? "write" : "read");
       writer.addNode(GraphModel.LABEL_VALUE, id, props);
-      appendChainEvent(file, id, GraphModel.LABEL_VALUE);
+      if (isWrite) pendingLocalWrites.add(new LocalWrite(rangeLine(occ), id, GraphModel.LABEL_VALUE));
+      else appendChainEvent(file, id, GraphModel.LABEL_VALUE, rangeLine(occ));
 
       String scope = innermostCond();
       if (scope != null) {
@@ -956,7 +983,7 @@ public final class GraphExtractor {
         writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, valueId, GraphModel.LABEL_VALUE, returnId);
       }
     }
-    appendChainEvent(file, returnId, GraphModel.LABEL_VALUE);
+    appendChainEvent(file, returnId, GraphModel.LABEL_VALUE, rangeLine(node));
     // Record this return slot against the enclosing method for cross-method return binding.
     String methodSymbol = methodSymbols.isEmpty() ? null : methodSymbols.peek();
     if (methodSymbol != null && !methodSymbol.isEmpty()) {
@@ -1140,7 +1167,7 @@ public final class GraphExtractor {
     props.put("colEnd", rangeColEnd(node));
     props.put("kind", kind);
     writer.addNode(GraphModel.LABEL_CONDITION, id, props);
-    appendChainEvent(file, id, GraphModel.LABEL_CONDITION);
+    appendChainEvent(file, id, GraphModel.LABEL_CONDITION, rangeLine(node));
     lastConditionEvent = new EventRef(id, GraphModel.LABEL_CONDITION);
 
     String parentCond = innermostCond();
@@ -1279,7 +1306,7 @@ public final class GraphExtractor {
     props.put("colEnd", rangeColEnd(node));
     props.put("kind", GraphModel.VALUE_KIND_INDEX);
     writer.addNode(GraphModel.LABEL_VALUE, elementId, props);
-    appendChainEvent(file, elementId, GraphModel.LABEL_VALUE);
+    appendChainEvent(file, elementId, GraphModel.LABEL_VALUE, rangeLine(node));
     String scope = innermostCond();
     if (scope != null) {
       writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_VALUE, elementId);
