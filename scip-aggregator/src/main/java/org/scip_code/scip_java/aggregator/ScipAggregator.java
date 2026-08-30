@@ -279,8 +279,19 @@ public class ScipAggregator {
         writer.emitTyped(Index.newBuilder().addDocuments(rewritten).build());
         options.reporter().processedOneItem();
         for (SymbolInformation info : rewritten.getSymbolsList()) {
-          if (!info.getSymbol().isEmpty()) definedSymbols.add(info.getSymbol());
-          if (!info.getSymbol().isEmpty()) collectedSymbols.put(info.getSymbol(), info);
+          String symbol = info.getSymbol();
+          if (!symbol.isEmpty()) {
+            definedSymbols.add(symbol);
+            // SCIP 局部符号 "local N" 是每个文件各自编号、跨文件会重号。若全局按 symbol 字符串
+            // 收集，不同文件里"同号不同变量"的 SymbolInformation 会被 map 折叠成最后一个，其
+            // displayName 会污染所有文件里该号的节点（本该是 request 却标成 address）。
+            // 局部符号改用 (文件相对路径, 符号) 复合键，extractor 侧按 file 区分查找。
+            if (ScipSymbols.isLocal(symbol)) {
+              collectedSymbols.put(rewritten.getRelativePath() + " " + symbol, info);
+            } else {
+              collectedSymbols.put(symbol, info);
+            }
+          }
         }
       }
       for (SymbolInformation info : shardIndex.getExternalSymbolsList()) {

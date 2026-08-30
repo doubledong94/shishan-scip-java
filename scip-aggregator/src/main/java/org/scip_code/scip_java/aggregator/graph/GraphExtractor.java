@@ -638,7 +638,8 @@ public final class GraphExtractor {
     String symbol = def.symbol;
     if (symbol.isEmpty()) return;
     String syntaxKind = def.syntaxKind;
-    SymbolInformation info = symbols.get(symbol);
+    // 局部符号（"local N"）按文件区分查找，避免跨文件同号折叠成错误的 displayName。
+    SymbolInformation info = infoOf(file, symbol);
     String name = displayName(info, symbol);
     Map<String, Object> props = new LinkedHashMap<>();
     props.put("name", name);
@@ -1478,6 +1479,13 @@ public final class GraphExtractor {
   private static String displayName(SymbolInformation info, String symbol) {
     if (info != null && !info.getDisplayName().isEmpty()) return info.getDisplayName();
     return shortName(symbol);
+  }
+
+  /** Look up a symbol's {@link SymbolInformation}. 局部符号（"local N"）每文件各自编号、跨文件
+   *  会重号，须按 (文件相对路径, 符号) 区分；非局部符号全局唯一，直接按符号查。 */
+  private SymbolInformation infoOf(String file, String symbol) {
+    if (ScipSymbols.isLocal(symbol)) return symbols.get(file + " " + symbol);
+    return symbols.get(symbol);
   }
 
   /**
