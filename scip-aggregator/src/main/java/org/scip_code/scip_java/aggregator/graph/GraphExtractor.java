@@ -1033,6 +1033,9 @@ public final class GraphExtractor {
     int argIndex = 0;
     for (SyntaxTree.Node arg : args) {
       String valueSymbol = argValueSymbol(arg);
+      // 无参/零参调用：AST 可能把"被调函数引用"本身当子节点，误成一个"实参"（其 symbol 恰为 callee），
+      // 会给无参函数造出假的 CALLED_PARAM 槽。跳过实参==被调函数自身的项，只在确有其实参时建槽。
+      if (valueSymbol != null && valueSymbol.equals(symbol)) continue;
       String valueId =
           runtimeId(project, file, arg.range, argIndex + ":" + (valueSymbol != null ? valueSymbol : "arg"));
       Map<String, Object> argProps = new LinkedHashMap<>();
