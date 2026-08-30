@@ -593,6 +593,9 @@ public final class GraphExtractor {
       pushMethodScope(file, node, structuralDefinition(node));
     }
     if (node.kind.equals("BLOCK")) {
+      // 进入块(如 try/嵌套块)前先冲掉更早行的延迟写(如 val x = … 的写)，否则该块的起点/续接
+      // 会锚到"写之前"的最后链事件(如 equals()#)，导致后续分支分叉/续接定位到错误节点。
+      flushLocalWrites(file, rangeLine(node));
       enterBlock(node);
     }
 
