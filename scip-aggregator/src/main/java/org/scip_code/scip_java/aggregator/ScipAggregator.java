@@ -297,7 +297,11 @@ public class ScipAggregator {
       for (SymbolInformation info : shardIndex.getExternalSymbolsList()) {
         String rewritten = rewriter.rewrite(info.getSymbol());
         if (rewritten.isEmpty()) continue;
-        externalCandidates.putIfAbsent(rewritten, rebuildExternal(rewritten, info));
+        SymbolInformation external = rebuildExternal(rewritten, info);
+        // 外部符号也并入 collectedSymbols（带签名文档），供 GraphExtractor 对被调外部方法按
+        // 签名解析形参名（编译期本就知道外部形参，不应退化成 "#N"）。
+        collectedSymbols.putIfAbsent(rewritten, external);
+        externalCandidates.putIfAbsent(rewritten, external);
       }
     }
   }

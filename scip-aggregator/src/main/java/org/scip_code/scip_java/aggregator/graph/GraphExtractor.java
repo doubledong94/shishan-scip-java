@@ -285,17 +285,56 @@ public final class GraphExtractor {
   }
 
   /** Emits declaration-relationship edges ({@code DECLARES}/{@code HAS_PARAM}/{@code EXTENDS}/{@code OVERRIDES}). */
-    /** 全部文件提取完后，把 CALLED_PARAM 槽的符号/名字后置补正为被调函数对应形参（paramsByMethod 此时已完整）。 */
+    /**
+   * 被调函数的按序形参名。优先项目内记录（paramsByMethod，成员本身是形参符号）；外部方法在
+   * collectedSymbols 里有签名文档（编译期已知），解析签名 `(a: T, b: U)` 取形参名，不退回 "#N"。
+   */
+  private java.util.List<String> paramNamesOf(String calleeSymbol) {
+    java.util.List<String> syms = paramsByMethod.get(calleeSymbol);
+    if (syms != null && !syms.isEmpty()) {
+      // paramsByMethod 存的是形参符号，转成显示名（如 "request"）。
+      java.util.List<String> names = new ArrayList<>();
+      for (String s : syms) {
+        SymbolInformation pi = symbols.get(s);
+        names.add(pi != null && !pi.getDisplayName().isEmpty() ? pi.getDisplayName() : shortName(s));
+      }
+      return names;
+    }
+    SymbolInformation info = symbols.get(calleeSymbol);
+    if (info != null && info.hasSignatureDocumentation()) {
+      String sig = info.getSignatureDocumentation().getText();
+      int open = sig.indexOf('('), close = sig.lastIndexOf(')');
+      if (open >= 0 && close > open) {
+        java.util.List<String> out = new ArrayList<>();
+        for (String seg : sig.substring(open + 1, close).split(",", -1)) {
+          String t = seg.trim();
+          if (t.isEmpty()) continue;
+          int ci = t.indexOf(':');
+          String n = (ci > 0 ? t.substring(0, ci) : t).trim();
+          if (!n.isEmpty()) out.add(n);
+        }
+        if (!out.isEmpty()) return out;
+      }
+    }
+    return null;
+  }
+
+  /** 由形参名合成 SCIP 形参符号：`方法().(参数名)`（外部方法无独立形参 SymbolInformation 时用）。 */
+  private static String paramSymbolFor(String calleeSymbol, String paramName) {
+    if (calleeSymbol == null || paramName == null || paramName.isEmpty()) return null;
+    return calleeSymbol.endsWith("().") ? calleeSymbol + "(" + paramName + ")" : null;
+  }
+
+  /** 全部文件提取完后，把 CALLED_PARAM 槽的符号/名字后置补正为被调函数对应形参（paramsByMethod 此时已完整）。 */
   private void fixupArgSlots() {
     for (ArgSlotFixup f : pendingArgFixups) {
-      java.util.List<String> ps = paramsByMethod.get(f.calleeSymbol);
+      java.util.List<String> ps = paramNamesOf(f.calleeSymbol);
       if (ps == null || f.argIndex >= ps.size()) continue;
-      String pSym = ps.get(f.argIndex);
-      SymbolInformation pi = symbols.get(pSym);
-      String pName = pi != null && !pi.getDisplayName().isEmpty() ? pi.getDisplayName() : shortName(pSym);
+      String pName = ps.get(f.argIndex);
+      String pSym = paramSymbolFor(f.calleeSymbol, pName);
       Map<String, Object> m = new LinkedHashMap<>();
       m.put("name", pName);
-      m.put("symbol", pSym);
+      if (pSym != null) m.put("symbol", pSym);
       writer.addNode(GraphModel.LABEL_VALUE, f.id, m); // MERGE by id → 更新该槽的 name/symbol
     }
     pendingArgFixups.clear();
@@ -1056,7 +1095,8 @@ public final class GraphExtractor {
     java.util.List<EventRef> callChain = new ArrayList<>();
     List<SyntaxTree.Node> args = argumentNodes(node);
     // 被调函数按序的形参符号（用于让实参槽 symbol 与被调函数的形参一致，从 symbol 即知"哪个函数的哪个参数"）
-    java.util.List<String> calleeParams = paramsByMethod.get(symbol);
+    java.util.List<String> calleeParamSyms = paramsByMethod.get(symbol); // 项目内真实形参符号
+    java.util.List<String> calleeParamNames = paramNamesOf(symbol);       // 形参名（项目内或外部签名解析）
     java.util.List<String> calledParamIds = new ArrayList<>();
     int argIndex = 0;
     for (SyntaxTree.Node arg : args) {
@@ -1068,11 +1108,10 @@ public final class GraphExtractor {
       // 实参槽的 symbol/名字：优先=被调函数的第 argIndex 个形参符号（与 PARAM 节点同源、观感一致）；
       // 形参解析不到（外部/顺序对不上）时回退到实参的取值符号（字段等）。
       String slotSym = null, slotName = null;
-      if (calleeParams != null && argIndex < calleeParams.size()) {
-        String pSym = calleeParams.get(argIndex);
-        SymbolInformation pi = symbols.get(pSym);
-        String pName = pi != null && !pi.getDisplayName().isEmpty() ? pi.getDisplayName() : shortName(pSym);
-        slotSym = pSym; slotName = pName;
+      if (calleeParamNames != null && argIndex < calleeParamNames.size()) {
+        slotName = calleeParamNames.get(argIndex);
+        if (calleeParamSyms != null && argIndex < calleeParamSyms.size()) slotSym = calleeParamSyms.get(argIndex);
+        else slotSym = paramSymbolFor(symbol, slotName); // 外部方法：按签名合成 方法().(形参)
       }
       String valueSymbol = slotSym != null ? slotSym : (argSym != null ? argSym : null);
       String safeSym = valueSymbol == null || valueSymbol.isEmpty() ? ("#" + argIndex) : valueSymbol;
