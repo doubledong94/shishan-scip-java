@@ -763,12 +763,14 @@ class GraphExtractorTest {
     assertTrue(elseChain, "else entered via ELSE from condition");
     assertTrue(elseEntry, "else branch first node's predecessor is the ELSE node");
 
-    // Cross-function: call enters callee's first event; void method's exit flows to calledReturn.
+    // Cross-function: call enters callee's first event（现为 METHOD 根条件=方法入口）；void 方法退出流入 calledReturn。
     String calledMethod = "test::Foo.java#20:0";
+    String fooRoot = "test::Foo.java#2:0:root"; // callee foo 的 METHOD 根条件（顺序链首事件）
     String q = "test::Foo.java#5:0:FIELD";
     String calledReturn = "test::Foo.java#20:0:CALLED_RETURN";
     String y = "test::Foo.java#25:0:FIELD";
-    assertTrue(next.test(calledMethod, q), "call enters callee first event");
+    assertTrue(next.test(calledMethod, fooRoot), "call enters callee METHOD-root first event");
+    assertTrue(next.test(fooRoot, q), "callee body starts after METHOD root");
     assertTrue(next.test(q, calledReturn), "callee fall-through exit flows to calledReturn");
     assertTrue(next.test(calledReturn, y), "caller continues after the call");
   }

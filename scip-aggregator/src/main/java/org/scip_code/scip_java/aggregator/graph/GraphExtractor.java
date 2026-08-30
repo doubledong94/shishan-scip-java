@@ -622,7 +622,7 @@ public final class GraphExtractor {
       // 进入块(如 try/嵌套块)前先冲掉更早行的延迟写(如 val x = … 的写)，否则该块的起点/续接
       // 会锚到"写之前"的最后链事件(如 equals()#)，导致后续分支分叉/续接定位到错误节点。
       flushLocalWrites(file, rangeLine(node));
-      enterBlock(node);
+      enterBlock(node, file);
     }
 
     SyntaxTree.OccurrenceData def = definition(node);
@@ -650,7 +650,7 @@ public final class GraphExtractor {
     emitReferenceValues(file, node);
   }
 
-  private void enterBlock(SyntaxTree.Node node) {
+  private void enterBlock(SyntaxTree.Node node, String file) {
     BlockBuilder b = new BlockBuilder();
     if (pendingBranchStartFrom != null) {
       b.startFrom = pendingBranchStartFrom;
@@ -660,6 +660,11 @@ public final class GraphExtractor {
       if (prev != null) b.startFrom = prev;
     }
     blockStack.push(b);
+    // 方法体主块（blockStack 深度 1）：把 METHOD 根条件作为该函数顺序链的首事件（方法入口），
+    // 使函数体第一个运行时事件的前置 = METHOD 条件。
+    if (blockStack.size() == 1 && !methodRootConds.isEmpty()) {
+      appendChainEvent(file, methodRootConds.peek(), GraphModel.LABEL_CONDITION, rangeLine(node));
+    }
   }
 
   private void exit(String file, SyntaxTree.Node node) {
