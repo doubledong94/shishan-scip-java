@@ -1443,8 +1443,13 @@ public final class GraphExtractor {
     List<SyntaxTree.Node> out = new ArrayList<>();
     String calleeSymbol = invocationSymbol(node);
     SyntaxTree.Node receiver = receiverSubtree(node);
+    boolean hasArgList = false;
+    for (SyntaxTree.Node child : node.children) {
+      if (child.kind.equals("VALUE_ARGUMENT_LIST")) { hasArgList = true; break; }
+    }
     for (SyntaxTree.Node child : node.children) {
       if (child.kind.equals("VALUE_ARGUMENT_LIST")) {
+        // 有显式实参表：只取其 VALUE_ARGUMENT，不把 receiver/嵌套子表达式误当实参
         for (SyntaxTree.Node va : child.children) {
           if (va.kind.equals("VALUE_ARGUMENT")) out.add(va);
         }
@@ -1452,7 +1457,8 @@ public final class GraphExtractor {
           || child.kind.equals("OPERATION_REFERENCE")
           || child.kind.equals("WHITE_SPACE")) {
         continue;
-      } else if (calleeSymbol == null || !hasSymbol(child, calleeSymbol)) {
+      } else if (!hasArgList && (calleeSymbol == null || !hasSymbol(child, calleeSymbol))) {
+        // 树形没有 VALUE_ARGUMENT_LIST（裸参数调用）时才用兜底收集裸参。
         out.add(child);
       }
     }
