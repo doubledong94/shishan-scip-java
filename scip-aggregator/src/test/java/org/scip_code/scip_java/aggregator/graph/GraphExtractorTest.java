@@ -733,6 +733,7 @@ class GraphExtractorTest {
 
     String e0 = "test::Foo.java#12:0:FIELD";
     String flagCond = "test::Foo.java#13:0";
+    String flag = "test::Foo.java#14:0:FIELD"; // 守卫表达式对 flag 的读取
     String a = "test::Foo.java#16:0:FIELD";
     String b = "test::Foo.java#18:0:FIELD";
     String c = "test::Foo.java#19:0:FIELD";
@@ -740,7 +741,8 @@ class GraphExtractorTest {
 
     // Cross-block: the condition is the fork — then branch via NEXT, else branch via ELSE; both
     // branch ends link to the continuation, never skipping via the condition.
-    assertTrue(next.test(e0, flagCond), "e0 before condition");
+    assertTrue(next.test(e0, flag), "e0 before guard read");
+    assertTrue(next.test(flag, flagCond), "guard read before condition");
     boolean thenNEXT =
         nexts.stream().anyMatch(e -> flagCond.equals(e.get("_from")) && a.equals(e.get("_to")));
     boolean elseELSE =

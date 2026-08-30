@@ -183,6 +183,8 @@ public final class GraphExtractor {
   }
 
   private final List<CallSite> callSites = new ArrayList<>();
+  // 条件节点的线性入链延迟到子节点(守卫表达式读取)走完后，保证 守卫读 → IF → 分支 的顺序。
+  private final Deque<EventRef> pendingConditionChains = new ArrayDeque<>();
   // Deferred per-invocation chain events (arg slots → calledMethod → calledReturn), chained at the
   // invocation node's exit so arg-internal reads (chained during child traversal) precede the call
   // in execution order — matching eval-order: ... → argExpr reads → args → call → return → ...
@@ -481,6 +483,11 @@ public final class GraphExtractor {
       SyntaxTree.Node child = children.get(i);
       if (branches.contains(child)) continue;
       walk(file, child, node, i);
+    }
+    // 守卫表达式读取已入链：现在把 IF 条件节点线性入链（守卫读 → IF），再走分支（分支从 IF 锚定）。
+    if (!pendingConditionChains.isEmpty()) {
+      EventRef e = pendingConditionChains.pop();
+      appendChainEvent(file, e.id, e.label, rangeLine(node));
     }
 
     List<Scope> branchScopes = new ArrayList<>();
@@ -1253,7 +1260,8 @@ public final class GraphExtractor {
     props.put("colEnd", rangeColEnd(node));
     props.put("kind", kind);
     writer.addNode(GraphModel.LABEL_CONDITION, id, props);
-    appendChainEvent(file, id, GraphModel.LABEL_CONDITION, rangeLine(node));
+    // 条件节点暂不入链：把它的线性入链延迟到 exit（守卫表达式读取走完后），保证 守卫读 → IF → 分支。
+    pendingConditionChains.push(new EventRef(id, GraphModel.LABEL_CONDITION));
     lastConditionEvent = new EventRef(id, GraphModel.LABEL_CONDITION);
 
     String parentCond = innermostCond();
