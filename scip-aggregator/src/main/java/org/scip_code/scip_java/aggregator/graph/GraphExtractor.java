@@ -153,12 +153,6 @@ public final class GraphExtractor {
   private final Deque<BlockBuilder> blockStack = new ArrayDeque<>();
   // Branch kind of the block being walked: "then" (entered via NEXT) or "else" (entered via ELSE).
   private final Deque<String> branchKinds = new ArrayDeque<>();
-  // Argument-expression nesting depth: value reads inside a call's arguments are not order-chain
-  // events (the call event encompasses them), keeping arg-before-call ordering implicit.
-  private int insideArgList = 0;
-  // Value reads inside a condition expression are not order-chain events — the condition node is
-  // the fork, so the guard expression's evaluation is part of the condition itself.
-  private int insideConditionExpr = 0;
   // The most recent Condition event; branch blocks link their first event from it (NEXT=then /
   // ELSE=else).
   private EventRef lastConditionEvent = null;
@@ -180,13 +174,19 @@ public final class GraphExtractor {
   }
 
   private final List<CallSite> callSites = new ArrayList<>();
+  // Deferred per-invocation chain events (arg slots → calledMethod → calledReturn), chained at the
+  // invocation node's exit so arg-internal reads (chained during child traversal) precede the call
+  // in execution order — matching eval-order: ... → argExpr reads → args → call → return → ...
+  private final Deque<java.util.List<EventRef>> pendingCallChains = new ArrayDeque<>();
 
   /**
    * Append a runtime event to the current block's order chain, linking it from the previous event
    * and resolving any pending branch joins. {@code label} is the event node's label.
    */
   private void appendChainEvent(String file, String id, String label) {
-    if (insideArgList > 0 || insideConditionExpr > 0) return;
+    // 所有运行时事件（方法调用、value 读取/写入、实参槽、条件、返回值、索引元素）都进执行链，
+    // 保证 method↔value、value↔value 连续、节点不孤立。实参槽在调用前入链，实参子表达式的读取
+    // 在遍历到子节点时补链，整体连通。
     BlockBuilder b = blockStack.peek();
     if (b == null) return;
     boolean hasJoins = !b.pendingJoins.isEmpty();
@@ -388,15 +388,11 @@ public final class GraphExtractor {
     List<SyntaxTree.Node> children = node.children;
     List<SyntaxTree.Node> branches = branchChildren(node);
 
-    // The condition expression evaluates as part of the condition node; its value reads are not
-    // separate order-chain events (the condition is the fork).
-    insideConditionExpr++;
     for (int i = 0; i < children.size(); i++) {
       SyntaxTree.Node child = children.get(i);
       if (branches.contains(child)) continue;
       walk(file, child, node, i);
     }
-    insideConditionExpr--;
 
     List<Scope> branchScopes = new ArrayList<>();
     for (int i = 0; i < branches.size(); i++) {
@@ -510,9 +506,6 @@ public final class GraphExtractor {
     if (node.kind.equals("BLOCK")) {
       enterBlock(node);
     }
-    if (node.kind.equals("VALUE_ARGUMENT_LIST") || node.kind.equals("VALUE_ARGUMENT")) {
-      insideArgList++;
-    }
 
     SyntaxTree.OccurrenceData def = definition(node);
     if (def != null) createDeclaration(file, node, def);
@@ -562,8 +555,12 @@ public final class GraphExtractor {
     if (node.kind.equals("BLOCK")) {
       exitBlock();
     }
-    if (node.kind.equals("VALUE_ARGUMENT_LIST") || node.kind.equals("VALUE_ARGUMENT")) {
-      insideArgList--;
+    // Invocation exit: commit this call's deferred chain events (args → calledMethod → calledReturn)
+    // into the enclosing block, after the arg-internal reads that were chained during child walk.
+    if (isInvocationKind(node.kind) && !pendingCallChains.isEmpty()) {
+      for (EventRef e : pendingCallChains.pop()) {
+        appendChainEvent(file, e.id, e.label);
+      }
     }
   }
 
@@ -974,7 +971,6 @@ public final class GraphExtractor {
     props.put("col", rangeCol(node));
     props.put("colEnd", rangeColEnd(node));
     writer.addNode(GraphModel.LABEL_CALLED_METHOD, id, props);
-    appendChainEvent(file, id, GraphModel.LABEL_CALLED_METHOD);
 
     String target = declId(project, file, symbol);
     // CALLS 边后置到 emitRelationships() 再发（先把项目内/占位目标节点都入队，flush 先写节点后写
@@ -993,6 +989,9 @@ public final class GraphExtractor {
     }
 
     // Runtime value nodes for the arguments → ARG_OF; the argument's value flows into the slot.
+    // 实参槽/调用/返回不在 enter 时入链，而是压进 pendingCallChains，在调用节点 exit 时才统一入链
+    // （exit 顺序在实参子表达式读取之后），保证执行序 ...→实参求值→实参槽→调用→返回→...。
+    java.util.List<EventRef> callChain = new ArrayList<>();
     List<SyntaxTree.Node> args = argumentNodes(node);
     java.util.List<String> calledParamIds = new ArrayList<>();
     int argIndex = 0;
@@ -1009,6 +1008,7 @@ public final class GraphExtractor {
       argProps.put("colEnd", rangeColEnd(arg));
       argProps.put("kind", GraphModel.VALUE_KIND_CALLED_PARAM);
       writer.addNode(GraphModel.LABEL_VALUE, valueId, argProps);
+      callChain.add(new EventRef(valueId, GraphModel.LABEL_VALUE));
       writer.addEdge(GraphModel.REL_ARG_OF, GraphModel.LABEL_VALUE, valueId, GraphModel.LABEL_CALLED_METHOD, id);
       if (scope != null) {
         writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_VALUE, valueId);
@@ -1021,6 +1021,9 @@ public final class GraphExtractor {
       calledParamIds.add(valueId);
       argIndex++;
     }
+    // 实参槽之后入链调用本身。
+    callChain.add(new EventRef(id, GraphModel.LABEL_CALLED_METHOD));
+    pendingCallChains.push(callChain);
 
     // Cross-method param binding: arg slot i → callee's i-th parameter declaration.
     if (symbols.containsKey(symbol)) {
@@ -1046,7 +1049,8 @@ public final class GraphExtractor {
     retProps.put("colEnd", rangeColEnd(node));
     retProps.put("kind", GraphModel.VALUE_KIND_CALLED_RETURN);
     writer.addNode(GraphModel.LABEL_VALUE, callReturnId, retProps);
-    appendChainEvent(file, callReturnId, GraphModel.LABEL_VALUE);
+    // Deferred with the rest of this call's chain (same list referenced by pendingCallChains top).
+    callChain.add(new EventRef(callReturnId, GraphModel.LABEL_VALUE));
     if (scope != null) {
       writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_VALUE, callReturnId);
     }
@@ -1266,6 +1270,7 @@ public final class GraphExtractor {
     props.put("colEnd", rangeColEnd(node));
     props.put("kind", GraphModel.VALUE_KIND_INDEX);
     writer.addNode(GraphModel.LABEL_VALUE, elementId, props);
+    appendChainEvent(file, elementId, GraphModel.LABEL_VALUE);
     String scope = innermostCond();
     if (scope != null) {
       writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_VALUE, elementId);
