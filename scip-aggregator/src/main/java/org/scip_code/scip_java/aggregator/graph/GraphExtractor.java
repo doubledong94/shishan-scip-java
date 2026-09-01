@@ -48,6 +48,23 @@ public final class GraphExtractor {
   private final GraphSink writer;
   private final String project;
   private final Map<String, SymbolInformation> symbols;
+  /** 文件相对路径 -> 源码文本，供字面量节点按 range 取真实文本。 */
+  private final Map<String, String> sources;
+
+  private String literalText(String file, ScipRange range) {
+    if (range == null) return "";
+    String src = sources.get(file);
+    if (src == null) return "";
+    // SCIP range 的 startCharacter/endCharacter 是"行内列偏移"；按行定位再取列区间。
+    int sl = range.startLine();
+    String[] lines = src.split("\n", -1);
+    if (sl < 0 || sl >= lines.length) return "";
+    String ln = lines[sl];
+    int s = range.startCharacter(), e = range.endCharacter();
+    if (s < 0 || e > ln.length() || s > e) return "";
+    String t = ln.substring(s, e).trim();
+    return t.isEmpty() ? ln.trim() : t;
+  }
 
   // Post-pass bookkeeping: created declaration symbols → node label.
   private final Map<String, String> createdSymbolLabel = new LinkedHashMap<>();
@@ -254,9 +271,18 @@ public final class GraphExtractor {
 
   public GraphExtractor(
       GraphSink writer, String project, Map<String, SymbolInformation> symbols) {
+    this(writer, project, symbols, java.util.Collections.emptyMap());
+  }
+
+  public GraphExtractor(
+      GraphSink writer,
+      String project,
+      Map<String, SymbolInformation> symbols,
+      Map<String, String> sources) {
     this.writer = writer;
     this.project = project;
     this.symbols = symbols;
+    this.sources = sources;
   }
 
   // ---------------------------------------------------------------------------
@@ -648,6 +674,41 @@ public final class GraphExtractor {
     }
 
     emitReferenceValues(file, node);
+    emitLiteralIfAny(file, node); // 字面量是树里的节点(非 occurrence)，单独建 LITERAL 节点
+  }
+
+  /** 精确判断：该节点 kind 是否是可打印的字面量（数字/布尔/null/字符串整串等），排除模板切片。 */
+  private static boolean isLiteralNodeKind(String k) {
+    if (k == null) return false;
+    if (k.endsWith("CONSTANT")) return true; // INTEGER_CONSTANT / BOOLEAN_CONSTANT / REAL_CONSTANT…
+    switch (k) {
+      case "NULL", "INTEGER_LITERAL", "STRING_TEMPLATE", "OBJECT_LITERAL", "CLASS_LITERAL_EXPRESSION",
+           "STRING_LITERAL", "CHAR_LITERAL", "BOOLEAN_LITERAL", "INT_LITERAL", "LONG_LITERAL",
+           "FLOAT_LITERAL", "DOUBLE_LITERAL", "NULL_LITERAL" -> { return true; }
+      default -> {}
+    }
+    return false;
+  }
+
+  /** 若当前节点是字面量，为之建 LITERAL Value 节点：真实文本为名、入 NEXT 链、挂 LEADS_TO、可 CONTROLS。 */
+  private void emitLiteralIfAny(String file, SyntaxTree.Node node) {
+    if (node == null || node.range == null || !isLiteralNodeKind(node.kind)) return;
+    String id = runtimeId(project, file, node.range, GraphModel.VALUE_KIND_LITERAL);
+    Map<String, Object> props = new LinkedHashMap<>();
+    props.put("name", literalText(file, node.range)); // 真实源码文本：如 "upgrade"、1300、true
+    props.put("symbol", "");
+    props.put("file", file);
+    props.put("line", rangeLine(node));
+    props.put("col", rangeCol(node));
+    props.put("colEnd", rangeColEnd(node));
+    props.put("kind", GraphModel.VALUE_KIND_LITERAL);
+    props.put("access", "read");
+    writer.addNode(GraphModel.LABEL_VALUE, id, props);
+    appendChainEvent(file, id, GraphModel.LABEL_VALUE, rangeLine(node)); // 顺序 NEXT
+    String scope = innermostCond();
+    if (scope != null) { // 时机 LEADS_TO（和其他 Value 一样锚到作用域条件）
+      writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_VALUE, id);
+    }
   }
 
   private void enterBlock(SyntaxTree.Node node, String file) {
@@ -1253,6 +1314,9 @@ public final class GraphExtractor {
       }
     }
     for (SyntaxTree.Node child : subtree.children) {
+      if (child != null && child.range != null && isLiteralNodeKind(child.kind)) {
+        out.add(runtimeId(project, file, child.range, GraphModel.VALUE_KIND_LITERAL)); // `if(true)` 的 true → CONTROLS
+      }
       collectValueIds(file, child, out);
     }
   }

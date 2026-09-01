@@ -53,6 +53,7 @@ public final class GraphModel {
   public static final String VALUE_KIND_INDEX = "INDEX";
   public static final String VALUE_KIND_DEFAULT_VALUE = "DEFAULT_VALUE";
   public static final String VALUE_KIND_KEY_WORD_VALUE = "KEY_WORD_VALUE";
+  public static final String VALUE_KIND_LITERAL = "LITERAL"; // 字面量(字符串/数字/布尔等)
 
   // Condition kinds (javac tree kinds).
   public static final String CONDITION_KIND_METHOD = "METHOD";

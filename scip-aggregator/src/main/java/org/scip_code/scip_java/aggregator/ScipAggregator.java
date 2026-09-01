@@ -68,6 +68,8 @@ public class ScipAggregator {
   private final ScipAggregatorOptions options;
   private final List<Struct> mergedTrees = new ArrayList<>();
   private final Map<String, SymbolInformation> collectedSymbols = new HashMap<>();
+  /** 文件相对路径 -> 源码文本，供字面量节点按 range 取真实文本。 */
+  private final Map<String, String> sourceByPath = new HashMap<>();
   private final Map<String, SyntaxTree.Node> mergedTreeNodes = new HashMap<>();
 
   public ScipAggregator(ScipWriter writer, ScipAggregatorOptions options) {
@@ -234,7 +236,7 @@ public class ScipAggregator {
     try (Neo4jGraphWriter graph = new Neo4jGraphWriter(config, project)) {
       graph.deleteProject();
       graph.ensureSchema();
-      GraphExtractor extractor = new GraphExtractor(graph, project, collectedSymbols);
+      GraphExtractor extractor = new GraphExtractor(graph, project, collectedSymbols, sourceByPath);
       // Stream per file: extract then release the tree so we never hold all trees in memory.
       java.util.Iterator<Map.Entry<String, SyntaxTree.Node>> it =
           mergedTreeNodes.entrySet().iterator();
@@ -275,6 +277,7 @@ public class ScipAggregator {
       Set<String> definedSymbols) {
     for (Index shardIndex : readShards(shardPath)) {
       for (Document shard : shardIndex.getDocumentsList()) {
+        if (!shard.getRelativePath().isEmpty()) sourceByPath.put(shard.getRelativePath(), shard.getText());
         Document rewritten = rewriteDocument(shard, rewriter, inverseReferences);
         writer.emitTyped(Index.newBuilder().addDocuments(rewritten).build());
         options.reporter().processedOneItem();
