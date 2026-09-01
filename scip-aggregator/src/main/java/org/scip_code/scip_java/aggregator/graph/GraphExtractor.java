@@ -1090,10 +1090,25 @@ public final class GraphExtractor {
 
   private String firstValueRuntimeId(String file, SyntaxTree.Node subtree) {
     SyntaxTree.OccurrenceData occ = firstValueReference(subtree);
-    if (occ == null) return null;
-    String kind = valueKindFor(occ.syntaxKind);
-    if (kind == null) return null;
-    return runtimeId(project, file, occ.range, kind);
+    if (occ != null) {
+      String kind = valueKindFor(occ.syntaxKind);
+      if (kind != null) return runtimeId(project, file, occ.range, kind);
+    }
+    // 字面量不是 occurrence：子树无 identifier 引用时，回退找字面量节点 → LITERAL id（供 FLOWS）
+    return firstLiteralNodeId(file, subtree);
+  }
+
+  /** 在子树里找第一个字面量节点的 LITERAL id（与 emitLiteralIfAny 用同一 id，保证 FLOWS 可连）。 */
+  private String firstLiteralNodeId(String file, SyntaxTree.Node subtree) {
+    if (subtree == null) return null;
+    if (subtree.range != null && isLiteralNodeKind(subtree.kind)) {
+      return runtimeId(project, file, subtree.range, GraphModel.VALUE_KIND_LITERAL);
+    }
+    for (SyntaxTree.Node child : subtree.children) {
+      String id = firstLiteralNodeId(file, child);
+      if (id != null) return id;
+    }
+    return null;
   }
 
   private static SyntaxTree.OccurrenceData firstValueReference(SyntaxTree.Node subtree) {
