@@ -717,8 +717,17 @@ public final class GraphExtractor {
       b.startFrom = pendingBranchStartFrom;
       pendingBranchStartFrom = null;
     } else if (!blockStack.isEmpty()) {
-      EventRef prev = blockStack.peek().lastEvent();
-      if (prev != null) b.startFrom = prev;
+      BlockBuilder parent = blockStack.peek();
+      if (!parent.pendingJoins.isEmpty()) {
+        // 非分支进入块(如 try/finally 体、裸块)时，父块的 lastEvent 仍是"块前"的旧事件，但兄弟块刚
+        // 结束时其链尾已作为同层 pendingJoin 插入父块。把父块的这些合并点移交到本块，使本块首事件
+        // 从兄弟链尾(合并点)续接，而不是再从旧 lastEvent 上分叉(否则一个节点会向多个兄弟块各出 NEXT)。
+        b.pendingJoins.addAll(parent.pendingJoins);
+        parent.pendingJoins.clear();
+      } else {
+        EventRef prev = parent.lastEvent();
+        if (prev != null) b.startFrom = prev;
+      }
     }
     blockStack.push(b);
     // 方法体主块（blockStack 深度 1）：把 METHOD 根条件作为该函数顺序链的首事件（方法入口），

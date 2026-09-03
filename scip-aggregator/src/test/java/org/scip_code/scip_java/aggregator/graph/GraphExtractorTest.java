@@ -776,6 +776,85 @@ class GraphExtractorTest {
   }
 
   @Test
+  void orderChainDoesNotForkFromOneNodeAcrossSiblingBlocks() {
+    // void m() { e0; TRY{BLOCK{x}}CATCH{BLOCK{y}}; TRY{BLOCK{p}}CATCH{BLOCK{q}}; c; }
+    // 回归：兄弟嵌套块（try 体 / catch 体）不能都从同一条链尾 e0 上各出 NEXT 分叉，而应按源序
+    // 线性续接：e0→x→y→p→q→c，e0 仅应有一条出边。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+
+    mBody.children.add(node("IDENTIFIER", 12, ref("pkg/A#e0.", "IdentifierConstant", 12)));
+
+    SyntaxTree.Node try1 = node("TRY", 13);
+    SyntaxTree.Node try1Body = node("BLOCK", 14);
+    try1Body.children.add(node("IDENTIFIER", 15, ref("pkg/A#x.", "IdentifierConstant", 15)));
+    try1.children.add(try1Body);
+    SyntaxTree.Node catch1 = node("CATCH", 16);
+    SyntaxTree.Node catch1Body = node("BLOCK", 17);
+    catch1Body.children.add(node("IDENTIFIER", 18, ref("pkg/A#y.", "IdentifierConstant", 18)));
+    catch1.children.add(catch1Body);
+    try1.children.add(catch1);
+    mBody.children.add(try1);
+
+    SyntaxTree.Node try2 = node("TRY", 19);
+    SyntaxTree.Node try2Body = node("BLOCK", 20);
+    try2Body.children.add(node("IDENTIFIER", 21, ref("pkg/A#p.", "IdentifierConstant", 21)));
+    try2.children.add(try2Body);
+    SyntaxTree.Node catch2 = node("CATCH", 22);
+    SyntaxTree.Node catch2Body = node("BLOCK", 23);
+    catch2Body.children.add(node("IDENTIFIER", 24, ref("pkg/A#q.", "IdentifierConstant", 24)));
+    catch2.children.add(catch2Body);
+    try2.children.add(catch2);
+    mBody.children.add(try2);
+
+    mBody.children.add(node("IDENTIFIER", 25, ref("pkg/A#c.", "IdentifierConstant", 25)));
+
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"e0.", "x.", "y.", "p.", "q.", "c."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.BiPredicate<String, String> next = (from, to) ->
+        nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+
+    String e0 = "test::Foo.java#12:0:FIELD";
+    String x = "test::Foo.java#15:0:FIELD";
+    String y = "test::Foo.java#18:0:FIELD";
+    String p = "test::Foo.java#21:0:FIELD";
+    String q = "test::Foo.java#24:0:FIELD";
+    String c = "test::Foo.java#25:0:FIELD";
+
+    long e0Out = nexts.stream().filter(e -> e0.equals(e.get("_from"))).count();
+    assertEquals(1, e0Out, "e0 must have exactly one outgoing NEXT (into the first try body)");
+    assertTrue(next.test(e0, x), "e0 -> first try body first event");
+
+    // 兄弟块按源序线性续接，不绕过中间块直接回到旧链尾。
+    assertTrue(next.test(x, y), "try body end continues into the catch body");
+    assertTrue(next.test(y, p), "catch body end continues into the second try body");
+    assertTrue(next.test(p, q), "second try body end continues into the second catch body");
+    assertTrue(next.test(q, c), "second catch body end continues to the final event");
+
+    // 原 bug：e0 被当作所有兄弟块的共同前置而直接分叉到 y/p/q。
+    assertTrue(!next.test(e0, y), "e0 must not fork into the catch body");
+    assertTrue(!next.test(e0, p), "e0 must not fork into the second try body");
+    assertTrue(!next.test(e0, q), "e0 must not fork into the second catch body");
+  }
+
+  @Test
   void voidReturnCreatesReturnSlot() {
     // void m() { return; }  → a RETURN slot node exists (order chain has an explicit exit event)
     SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
