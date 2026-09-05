@@ -179,10 +179,11 @@ public final class GraphExtractor {
   private final Deque<BlockBuilder> blockStack = new ArrayDeque<>();
   // Branch kind of the block being walked: "then" (entered via NEXT) or "else" (entered via ELSE).
   private final Deque<String> branchKinds = new ArrayDeque<>();
-  // The most recent Condition event; branch blocks link their first event from it (NEXT=then /
-  // ELSE=else).
-  private EventRef lastConditionEvent = null;
-  private EventRef pendingBranchStartFrom = null;
+  // 进入分支时"该分支起点"（当前条件 / kind=ELSE 条件）。用栈而非单值：嵌套分支/条件下每一层
+  // 有独立快照，避免被递归改写（原全局 lastConditionEvent 曾被 then 分支里的嵌套条件覆盖，
+  // 导致 else 分支的 ELSE 边错位——见 walkConditionChildren）。本条件自身 id 由 enterCondition 压入
+  // conds 作用域栈，不再依赖独立全局。
+  private final Deque<EventRef> pendingBranchStartFrom = new ArrayDeque<>();
   // Cross-function order: callee symbol → its body's first / exit events.
   private final Map<String, java.util.List<EventRef>> methodFirstEvents = new java.util.HashMap<>();
   private final Map<String, java.util.List<EventRef>> methodExitEvents = new java.util.HashMap<>();
@@ -504,10 +505,12 @@ public final class GraphExtractor {
   private void walkConditionChildren(String file, SyntaxTree.Node node) {
     List<SyntaxTree.Node> children = node.children;
     List<SyntaxTree.Node> branches = branchChildren(node);
-    // 捕获当前条件自身的 EventRef：分支遍历（尤其 then 分支里的嵌套条件）会覆盖全局
-    // lastConditionEvent，否则 else 分支的 `IF --ELSE--> ELSE` 边会挂到被覆盖的（最内层）条件上，
-    // 导致本应带 else 的 IF 反而没有 ELSE 边（归属错位）。后续统一用 condRef，而非可能被改写的全局。
-    EventRef condRef = lastConditionEvent;
+    // 当前条件自身 id 已由 enterCondition 压入 conds 作用域栈（栈顶=本条件）。取它作分支锚点，
+    // 不依赖会被嵌套条件改写的全局 lastConditionEvent——否则 else 分支的 `IF --ELSE--> ELSE` 边会
+    // 挂到 then 分支里最内层条件上，导致本应带 else 的 IF 反而没有 ELSE 边（归属错位）。
+    EventRef condRef = null;
+    String curCond = conds.isEmpty() ? null : conds.peek();
+    if (curCond != null) condRef = new EventRef(curCond, GraphModel.LABEL_CONDITION);
 
     for (int i = 0; i < children.size(); i++) {
       SyntaxTree.Node child = children.get(i);
@@ -541,14 +544,17 @@ public final class GraphExtractor {
           writer.addEdge(GraphModel.REL_ELSE, condRef.label, condRef.id,
               GraphModel.LABEL_CONDITION, elseId);
         }
-        pendingBranchStartFrom = new EventRef(elseId, GraphModel.LABEL_CONDITION);
+        pendingBranchStartFrom.push(new EventRef(elseId, GraphModel.LABEL_CONDITION));
       } else {
-        pendingBranchStartFrom = condRef;
+        pendingBranchStartFrom.push(condRef);
       }
+      int depthBefore = pendingBranchStartFrom.size();
       pushBranchScope();
       walk(file, branches.get(i), node, children.indexOf(branches.get(i)));
       branchScopes.add(scopeStack.pop());
-      pendingBranchStartFrom = null;
+      // 恢复分支前的栈深：本分支的起点或被 enterBlock 消费(pop)、或未消费仍留在栈顶——统一弹回，
+      // 保证该起点不被泄漏到下一分支 / 外层（与原来"分支后置空"等价，但各嵌套层独立）。
+      while (pendingBranchStartFrom.size() > depthBefore) pendingBranchStartFrom.pop();
       branchKinds.pop();
     }
     mergeBranchScopes(branchScopes, node);
@@ -717,9 +723,9 @@ public final class GraphExtractor {
 
   private void enterBlock(SyntaxTree.Node node, String file) {
     BlockBuilder b = new BlockBuilder();
-    if (pendingBranchStartFrom != null) {
-      b.startFrom = pendingBranchStartFrom;
-      pendingBranchStartFrom = null;
+    if (!pendingBranchStartFrom.isEmpty()) {
+      // 分支块起点取栈顶（当前分支压入的），弹出使该分支后续的嵌套块不误用同一起点。
+      b.startFrom = pendingBranchStartFrom.pop();
     } else if (!blockStack.isEmpty()) {
       BlockBuilder parent = blockStack.peek();
       if (!parent.pendingJoins.isEmpty()) {
@@ -1378,8 +1384,8 @@ public final class GraphExtractor {
     writer.addNode(GraphModel.LABEL_CONDITION, id, props);
     // 条件节点暂不入链：把它的线性入链延迟到 exit（守卫表达式读取走完后），保证 守卫读 → IF → 分支。
     pendingConditionChains.push(new EventRef(id, GraphModel.LABEL_CONDITION));
-    lastConditionEvent = new EventRef(id, GraphModel.LABEL_CONDITION);
-
+    // 先取父条件（压入本条件之前，否则 innermostCond 会返回自身），再压入本条件自身，
+    // 供 walkConditionChildren 取当前条件作分支锚点。
     String parentCond = innermostCond();
     if (parentCond != null) {
       writer.addEdge(GraphModel.REL_SUB, GraphModel.LABEL_CONDITION, parentCond, GraphModel.LABEL_CONDITION, id);
@@ -1391,7 +1397,6 @@ public final class GraphExtractor {
     if (isElsePosition && parentCond != null) {
       writer.addEdge(GraphModel.REL_ELSE, GraphModel.LABEL_CONDITION, parentCond, GraphModel.LABEL_CONDITION, id);
     }
-
     conds.push(id);
 
     // CONTROLS: values referenced in the condition expression guard this branch.
