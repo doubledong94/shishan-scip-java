@@ -483,6 +483,10 @@ public final class GraphExtractor {
   // ---------------------------------------------------------------------------
 
   private void walk(String file, SyntaxTree.Node node, SyntaxTree.Node parent, int index) {
+    if ("TRY".equals(node.kind)) {
+      handleTryCatch(file, node, parent, index);
+      return;
+    }
     enter(file, node, parent, index);
     if (isConditionKind(node.kind)) {
       walkConditionChildren(file, node);
@@ -558,6 +562,90 @@ public final class GraphExtractor {
       branchKinds.pop();
     }
     mergeBranchScopes(branchScopes, node);
+  }
+
+  // ---------------------------------------------------------------------------
+  // try / catch / finally → 与 if/else 类似的 Condition 节点
+  // ---------------------------------------------------------------------------
+
+  /** 建一个 Condition 节点（kind 为该条件种类）。 */
+  private void addCondNode(String file, String id, String kind, SyntaxTree.Node node) {
+    Map<String, Object> props = new LinkedHashMap<>();
+    props.put("file", file);
+    props.put("line", rangeLine(node));
+    props.put("col", rangeCol(node));
+    props.put("colEnd", rangeColEnd(node));
+    props.put("kind", kind);
+    writer.addNode(GraphModel.LABEL_CONDITION, id, props);
+  }
+
+  /** 以给定条件为分支起点 walk 一个子节点（若为块则其首事件从该条件锚定），并恢复 pendingBranchStartFrom 栈深。 */
+  private void walkBranchFrom(String file, SyntaxTree.Node child, SyntaxTree.Node parent, int index, String condId) {
+    int depth = pendingBranchStartFrom.size();
+    pendingBranchStartFrom.push(new EventRef(condId, GraphModel.LABEL_CONDITION));
+    walk(file, child, parent, index);
+    while (pendingBranchStartFrom.size() > depth) pendingBranchStartFrom.pop();
+  }
+
+  /**
+   * try/catch/finally 物化为 Condition 节点（与 if/else 类似，供图上/search 呈现异常处理结构）：
+   * <ul>
+   *   <li>TRY 自身为 kind=TRY 条件节点（SUB 挂外层），try 体从它锚定；
+   *   <li>每个 CATCH 物化为 kind=CATCH 节点，`TRY --ELSE--> CATCH`（SUB 到 TRY），catch 体从 CATCH 锚定，
+   *       异常参数照常 walk；
+   *   <li>FINALLY 物化为 kind=FINALLY 节点，从 TRY 经 ELSE（SUB 到 TRY）。
+   * </ul>
+   * 体内语句/调用/嵌套条件照常 walk 生成节点。
+   */
+  private void handleTryCatch(String file, SyntaxTree.Node node, SyntaxTree.Node parent, int index) {
+    String tryId = runtimeId(project, file, node.range, null);
+    addCondNode(file, tryId, GraphModel.CONDITION_KIND_TRY, node);
+    String parentCond = innermostCond();
+    if (parentCond != null) {
+      writer.addEdge(GraphModel.REL_SUB, GraphModel.LABEL_CONDITION, parentCond, GraphModel.LABEL_CONDITION, tryId);
+    }
+    conds.push(tryId);
+    try {
+      for (int i = 0; i < node.children.size(); i++) {
+        SyntaxTree.Node child = node.children.get(i);
+        if (child.kind == null || child.kind.isEmpty() || child.kind.equals("WHITE_SPACE")) continue;
+        if ("CATCH".equals(child.kind)) {
+          handleCatch(file, child, node, tryId);
+        } else if ("FINALLY".equals(child.kind)) {
+          String finId = runtimeId(project, file, child.range, null);
+          addCondNode(file, finId, GraphModel.CONDITION_KIND_FINALLY, child);
+          writer.addEdge(GraphModel.REL_ELSE, GraphModel.LABEL_CONDITION, tryId, GraphModel.LABEL_CONDITION, finId);
+          writer.addEdge(GraphModel.REL_SUB, GraphModel.LABEL_CONDITION, tryId, GraphModel.LABEL_CONDITION, finId);
+          conds.push(finId);
+          try { walkBranchFrom(file, child, node, i, finId); } finally { conds.pop(); }
+        } else {
+          // try 体（通常为一块）从 TRY 锚定
+          walkBranchFrom(file, child, node, i, tryId);
+        }
+      }
+    } finally {
+      conds.pop();
+    }
+  }
+
+  /** 物化一个 kind=CATCH 条件节点；`TRY --ELSE--> CATCH`（SUB 到 TRY）；catch 体从 CATCH 锚定，异常参数照常 walk。 */
+  private void handleCatch(String file, SyntaxTree.Node catchNode, SyntaxTree.Node parent, String tryId) {
+    String catchId = runtimeId(project, file, catchNode.range, null);
+    addCondNode(file, catchId, GraphModel.CONDITION_KIND_CATCH, catchNode);
+    writer.addEdge(GraphModel.REL_ELSE, GraphModel.LABEL_CONDITION, tryId, GraphModel.LABEL_CONDITION, catchId);
+    writer.addEdge(GraphModel.REL_SUB, GraphModel.LABEL_CONDITION, tryId, GraphModel.LABEL_CONDITION, catchId);
+    conds.push(catchId);
+    try {
+      for (int i = 0; i < catchNode.children.size(); i++) {
+        SyntaxTree.Node c = catchNode.children.get(i);
+        if (c.kind == null || c.kind.isEmpty() || c.kind.equals("WHITE_SPACE")) continue;
+        // 异常参数等按普通节点 walk；catch 体块从 CATCH 锚定
+        if ("BLOCK".equals(c.kind)) walkBranchFrom(file, c, catchNode, i, catchId);
+        else walk(file, c, catchNode, i);
+      }
+    } finally {
+      conds.pop();
+    }
   }
 
   private void pushBranchScope() {

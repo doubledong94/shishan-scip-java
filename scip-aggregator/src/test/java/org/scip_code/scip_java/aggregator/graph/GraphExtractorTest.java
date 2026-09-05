@@ -777,9 +777,9 @@ class GraphExtractorTest {
 
   @Test
   void orderChainDoesNotForkFromOneNodeAcrossSiblingBlocks() {
-    // void m() { e0; TRY{BLOCK{x}}CATCH{BLOCK{y}}; TRY{BLOCK{p}}CATCH{BLOCK{q}}; c; }
-    // 回归：兄弟嵌套块（try 体 / catch 体）不能都从同一条链尾 e0 上各出 NEXT 分叉，而应按源序
-    // 线性续接：e0→x→y→p→q→c，e0 仅应有一条出边。
+    // void m() { e0; {x} {y} {p} {q} c; }（4 个兄弟裸块——TRY/CATCH 现已是条件节点，这里用通用兄弟块回归）
+    // 回归：兄弟嵌套块不能都从同一条链尾 e0 上各出 NEXT 分叉，而应按源序线性续接：e0→x→y→p→q→c，
+    // e0 仅应有一条出边。
     SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
     SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
     SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
@@ -787,27 +787,18 @@ class GraphExtractorTest {
 
     mBody.children.add(node("IDENTIFIER", 12, ref("pkg/A#e0.", "IdentifierConstant", 12)));
 
-    SyntaxTree.Node try1 = node("TRY", 13);
-    SyntaxTree.Node try1Body = node("BLOCK", 14);
-    try1Body.children.add(node("IDENTIFIER", 15, ref("pkg/A#x.", "IdentifierConstant", 15)));
-    try1.children.add(try1Body);
-    SyntaxTree.Node catch1 = node("CATCH", 16);
-    SyntaxTree.Node catch1Body = node("BLOCK", 17);
-    catch1Body.children.add(node("IDENTIFIER", 18, ref("pkg/A#y.", "IdentifierConstant", 18)));
-    catch1.children.add(catch1Body);
-    try1.children.add(catch1);
-    mBody.children.add(try1);
-
-    SyntaxTree.Node try2 = node("TRY", 19);
-    SyntaxTree.Node try2Body = node("BLOCK", 20);
-    try2Body.children.add(node("IDENTIFIER", 21, ref("pkg/A#p.", "IdentifierConstant", 21)));
-    try2.children.add(try2Body);
-    SyntaxTree.Node catch2 = node("CATCH", 22);
-    SyntaxTree.Node catch2Body = node("BLOCK", 23);
-    catch2Body.children.add(node("IDENTIFIER", 24, ref("pkg/A#q.", "IdentifierConstant", 24)));
-    catch2.children.add(catch2Body);
-    try2.children.add(catch2);
-    mBody.children.add(try2);
+    SyntaxTree.Node b1 = node("BLOCK", 14);
+    b1.children.add(node("IDENTIFIER", 15, ref("pkg/A#x.", "IdentifierConstant", 15)));
+    mBody.children.add(b1);
+    SyntaxTree.Node b2 = node("BLOCK", 17);
+    b2.children.add(node("IDENTIFIER", 18, ref("pkg/A#y.", "IdentifierConstant", 18)));
+    mBody.children.add(b2);
+    SyntaxTree.Node b3 = node("BLOCK", 20);
+    b3.children.add(node("IDENTIFIER", 21, ref("pkg/A#p.", "IdentifierConstant", 21)));
+    mBody.children.add(b3);
+    SyntaxTree.Node b4 = node("BLOCK", 23);
+    b4.children.add(node("IDENTIFIER", 24, ref("pkg/A#q.", "IdentifierConstant", 24)));
+    mBody.children.add(b4);
 
     mBody.children.add(node("IDENTIFIER", 25, ref("pkg/A#c.", "IdentifierConstant", 25)));
 
@@ -901,6 +892,63 @@ class GraphExtractorTest {
     boolean innerHasElse = elseEdges.stream().anyMatch(e -> innerIfId.equals(e.get("_from")));
     assertTrue(outerHasElse, "outer IF must own its ELSE edge");
     assertTrue(!innerHasElse, "nested IF must not steal the outer ELSE edge");
+  }
+
+  @Test
+  void tryCatchBecomesConditionNodesLikeIfElse() {
+    // void m(){ try { a; } catch (e) { b; } }
+    // TRY 物化为 kind=TRY 条件节点、CATCH 物化为 kind=CATCH 条件节点，且 `TRY --ELSE--> CATCH`（SUB 到 TRY）。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 2, def("pkg/A#m().", "IdentifierFunctionDefinition", 2));
+    SyntaxTree.Node mBody = node("BLOCK", 3);
+
+    SyntaxTree.Node tryNode = node("TRY", 10);
+    SyntaxTree.Node tryBody = node("BLOCK", 11);
+    tryBody.children.add(node("IDENTIFIER", 12, ref("pkg/A#a.", "IdentifierConstant", 12)));
+    tryNode.children.add(tryBody);
+    SyntaxTree.Node catchNode = node("CATCH", 13);
+    catchNode.children.add(node("IDENTIFIER", 14, ref("pkg/A#e.", "IdentifierConstant", 14))); // 异常参数
+    SyntaxTree.Node catchBody = node("BLOCK", 15);
+    catchBody.children.add(node("IDENTIFIER", 16, ref("pkg/A#b.", "IdentifierConstant", 16)));
+    catchNode.children.add(catchBody);
+    tryNode.children.add(catchNode);
+    mBody.children.add(tryNode);
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"a.", "e.", "b."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> conds = nodesOf(sink, GraphModel.LABEL_CONDITION);
+    String tryId = null;
+    String catchId = null;
+    for (Map<String, Object> n : conds) {
+      if ("TRY".equals(n.get("kind"))) tryId = (String) n.get("_id");
+      if ("CATCH".equals(n.get("kind"))) catchId = (String) n.get("_id");
+    }
+    final String fTry = tryId;
+    final String fCatch = catchId;
+    assertTrue(fTry != null, "TRY condition node exists");
+    assertTrue(fCatch != null, "CATCH condition node exists");
+    assertTrue(
+        edgesOf(sink, GraphModel.REL_ELSE).stream()
+            .anyMatch(e -> fTry.equals(e.get("_from")) && fCatch.equals(e.get("_to"))),
+        "TRY --ELSE--> CATCH");
+    assertTrue(
+        edgesOf(sink, GraphModel.REL_SUB).stream()
+            .anyMatch(e -> fTry.equals(e.get("_from")) && fCatch.equals(e.get("_to"))),
+        "TRY --SUB--> CATCH (catch 嵌套在 try 下)");
   }
 
   @Test

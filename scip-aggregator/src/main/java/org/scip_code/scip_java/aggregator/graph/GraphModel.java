@@ -60,6 +60,10 @@ public final class GraphModel {
   public static final String CONDITION_KIND_IF = "IF";
   public static final String CONDITION_KIND_ELSE = "ELSE";
   public static final String CONDITION_KIND_LOOP = "LOOP";
+  // 异常处理结构（与 if/else 类似的 Condition 节点）。
+  public static final String CONDITION_KIND_TRY = "TRY";
+  public static final String CONDITION_KIND_CATCH = "CATCH";
+  public static final String CONDITION_KIND_FINALLY = "FINALLY";
 
   private GraphModel() {}
 }
