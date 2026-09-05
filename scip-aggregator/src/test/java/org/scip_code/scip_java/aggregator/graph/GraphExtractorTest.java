@@ -739,29 +739,29 @@ class GraphExtractorTest {
     String c = "test::Foo.java#19:0:FIELD";
     String x = "test::Foo.java#24:0:FIELD";
 
-    // Cross-block: the condition is the fork — then branch via NEXT, else branch via ELSE; both
-    // branch ends link to the continuation, never skipping via the condition.
+    // Cross-block: the condition is the fork — then 经 NEXT、else 的 ELSE 节点再经 NEXT 进入分支；
+    // both branch ends link to the continuation, never skipping via the condition.
     assertTrue(next.test(e0, flag), "e0 before guard read");
     assertTrue(next.test(flag, flagCond), "guard read before condition");
     boolean thenNEXT =
         nexts.stream().anyMatch(e -> flagCond.equals(e.get("_from")) && a.equals(e.get("_to")));
-    // else 分支首节点 b 的前置是一个 kind=ELSE 的 Condition 节点(elseB@17)，其从 flagCond 经 ELSE 进入。
+    // else 分支首节点 b 的前置是一个 kind=ELSE 的 Condition 节点(elseB@17)，其从 flagCond 经 ELSE 进入，
+    // 而 b 本身经 NEXT 从该 ELSE 节点进入（分支首事件都挂顺序链）。
     String elseCond = "test::Foo.java#17:0:ELSE";
     boolean elseChain =
         elseEdges.stream().anyMatch(e -> flagCond.equals(e.get("_from")) && elseCond.equals(e.get("_to")));
-    boolean elseEntry =
-        elseEdges.stream().anyMatch(e -> elseCond.equals(e.get("_from")) && b.equals(e.get("_to")));
+    boolean elseEntry = next.test(elseCond, b);
     assertTrue(thenNEXT, "then branch entered via NEXT from the condition");
     assertTrue(elseChain, "condition -> else node via ELSE");
-    assertTrue(elseEntry, "else node -> else branch first via ELSE");
+    assertTrue(elseEntry, "else node -> else branch first via NEXT");
     assertTrue(next.test(a, c), "then branch end continues after the if");
     assertTrue(next.test(b, c), "else branch end continues after the if");
     assertTrue(!next.test(flagCond, c), "condition must not skip straight to continuation");
 
-    // Branch entry structure: then via NEXT (condition true), else 经 ELSE 进入 kind=ELSE 的条件节点。
+    // Branch entry structure: then / else 首事件都经 NEXT；ELSE 边只作 条件--else节点 的逻辑标记。
     assertTrue(thenNEXT, "then edge entered via NEXT (condition true)");
     assertTrue(elseChain, "else entered via ELSE from condition");
-    assertTrue(elseEntry, "else branch first node's predecessor is the ELSE node");
+    assertTrue(elseEntry, "else branch first node entered via NEXT from the ELSE node");
 
     // Cross-function: call enters callee's first event（现为 METHOD 根条件=方法入口）；void 方法退出流入 calledReturn。
     String calledMethod = "test::Foo.java#20:0";

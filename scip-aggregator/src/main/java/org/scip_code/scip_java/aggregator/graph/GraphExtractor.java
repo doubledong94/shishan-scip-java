@@ -177,8 +177,6 @@ public final class GraphExtractor {
   }
 
   private final Deque<BlockBuilder> blockStack = new ArrayDeque<>();
-  // Branch kind of the block being walked: "then" (entered via NEXT) or "else" (entered via ELSE).
-  private final Deque<String> branchKinds = new ArrayDeque<>();
   // 进入分支时"该分支起点"（当前条件 / kind=ELSE 条件）。用栈而非单值：嵌套分支/条件下每一层
   // 有独立快照，避免被递归改写（原全局 lastConditionEvent 曾被 then 分支里的嵌套条件覆盖，
   // 导致 else 分支的 ELSE 边错位——见 walkConditionChildren）。本条件自身 id 由 enterCondition 压入
@@ -253,11 +251,9 @@ public final class GraphExtractor {
         writer.addEdge(GraphModel.REL_NEXT, prev.label, prev.id, label, id);
       }
     } else if (b.startFrom != null) {
-      // Branch entry: a branch block's first event links from the condition — NEXT for the
-      // then branch, ELSE for the else branch.
-      String kind = branchKinds.isEmpty() ? null : branchKinds.peek();
-      String rel = "else".equals(kind) ? GraphModel.REL_ELSE : GraphModel.REL_NEXT;
-      writer.addEdge(rel, b.startFrom.label, b.startFrom.id, label, id);
+      // 分支块首事件都从条件经 NEXT(顺序/时机)进入——then 从 IF、else 从 ELSE节点。
+      // 这样两条分支的首事件都挂在顺序链上；ELSE 边只作"条件 --ELSE--> else节点"的逻辑标记。
+      writer.addEdge(GraphModel.REL_NEXT, b.startFrom.label, b.startFrom.id, label, id);
       b.startFrom = null;
     }
     b.events.add(new EventRef(id, label));
@@ -529,9 +525,8 @@ public final class GraphExtractor {
 
     List<Scope> branchScopes = new ArrayList<>();
     for (int i = 0; i < branches.size(); i++) {
-      // Then branch is entered via NEXT from the condition; else branches via ELSE.
+      // 分支：then 从条件(next)进入；else 物化为 kind=ELSE 条件节点，两条分支首事件都经 NEXT。
       String kind = isLoopKind(node.kind) ? "then" : (i == 0 ? "then" : "else");
-      branchKinds.push(kind);
       if ("else".equals(kind)) {
         // else 分支也物化成一个 kind=ELSE 的 Condition 节点：IF --ELSE--> ELSE(node)，
         // 并把 else 块首节点的起点锚到该 ELSE 节点（else 不是边，是 Condition 的一种）。
@@ -559,7 +554,6 @@ public final class GraphExtractor {
       // 恢复分支前的栈深：本分支的起点或被 enterBlock 消费(pop)、或未消费仍留在栈顶——统一弹回，
       // 保证该起点不被泄漏到下一分支 / 外层（与原来"分支后置空"等价，但各嵌套层独立）。
       while (pendingBranchStartFrom.size() > depthBefore) pendingBranchStartFrom.pop();
-      branchKinds.pop();
     }
     mergeBranchScopes(branchScopes, node);
   }
