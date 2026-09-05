@@ -133,13 +133,11 @@ class GraphExtractorTest {
     assertTrue(hasEdge(sink, GraphModel.REL_DECLARES, "test::pkg/A#", "test::pkg/A#a()."));
     assertTrue(hasEdge(sink, GraphModel.REL_DECLARES, "test::pkg/A#", "test::pkg/A#f."));
 
-    // Call layer: exactly one CalledMethod, CALLS to a(), anchored to the IF branch via LEADS_TO
-    // (Condition->CalledMethod).
+    // Call layer: exactly one CalledMethod, CALLS to a().
     List<Map<String, Object>> calls = nodesOf(sink, GraphModel.LABEL_CALLED_METHOD);
     assertEquals(1, calls.size(), "one call site");
     String callId = (String) calls.get(0).get("_id");
     assertTrue(hasEdge(sink, GraphModel.REL_CALLS, callId, "test::pkg/A#a()."));
-    assertTrue(hasEdge(sink, GraphModel.REL_LEADS_TO, null, callId), "call anchored to branch via LEADS_TO");
 
     // Branch layer: each method gets a METHOD-kind root condition; the IF is a branch of m's root.
     List<Map<String, Object>> conditions = nodesOf(sink, GraphModel.LABEL_CONDITION);
@@ -158,7 +156,6 @@ class GraphExtractorTest {
             .findFirst()
             .orElseThrow();
     assertTrue(hasEdge(sink, GraphModel.REL_SUB, mRoot, ifCond), "if is sub of m's root");
-    assertTrue(hasEdge(sink, GraphModel.REL_LEADS_TO, ifCond, callId));
   }
 
   @Test

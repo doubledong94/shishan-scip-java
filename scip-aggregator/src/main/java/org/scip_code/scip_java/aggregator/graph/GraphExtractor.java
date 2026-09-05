@@ -802,10 +802,6 @@ public final class GraphExtractor {
     props.put("access", "read");
     writer.addNode(GraphModel.LABEL_VALUE, id, props);
     appendChainEvent(file, id, GraphModel.LABEL_VALUE, rangeLine(node)); // 顺序 NEXT
-    String scope = innermostCond();
-    if (scope != null) { // 时机 LEADS_TO（和其他 Value 一样锚到作用域条件）
-      writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_VALUE, id);
-    }
   }
 
   private void enterBlock(SyntaxTree.Node node, String file) {
@@ -1016,11 +1012,6 @@ public final class GraphExtractor {
       writer.addNode(GraphModel.LABEL_VALUE, id, props);
       if (isWrite) pendingLocalWrites.add(new LocalWrite(rangeLine(occ), id, GraphModel.LABEL_VALUE));
       else appendChainEvent(file, id, GraphModel.LABEL_VALUE, rangeLine(occ));
-
-      String scope = innermostCond();
-      if (scope != null) {
-        writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_VALUE, id);
-      }
 
       if (isWrite) {
         Scope sc = currentScope();
@@ -1254,10 +1245,6 @@ public final class GraphExtractor {
     props.put("kind", GraphModel.VALUE_KIND_RETURN);
     props.put("access", "write");
     writer.addNode(GraphModel.LABEL_VALUE, returnId, props);
-    String scope = innermostCond();
-    if (scope != null) {
-      writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_VALUE, returnId);
-    }
     if (valueOcc != null) {
       String valueId = firstValueRuntimeId(file, operands.get(operands.size() - 1));
       if (valueId != null && !valueId.equals(returnId)) {
@@ -1297,13 +1284,7 @@ public final class GraphExtractor {
       callTargetSymbols.put(target, symbol);
     }
 
-    String scope = innermostCond();
-    if (scope != null) {
-      // 统一锚定边 LEADS_TO（Condition->运行时节点，恒发含方法根）：调用点（CalledMethod）与
-      // Value 数据作用域都走这条边的同一方向。分支/方法归属用 Condition 节点 +
-      // kind(METHOD/IF/LOOP/ELSE) 区分即可。
-      writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_CALLED_METHOD, id);
-    }
+    // 调用点(以及其 Value 数据作用域)经 NEXT 链被其条件/方法根遍历到，不再用 LEADS_TO 逐节点锚定。
 
     // Runtime value nodes for the arguments → ARG_OF; the argument's value flows into the slot.
     // 实参槽/调用/返回不在 enter 时入链，而是压进 pendingCallChains，在调用节点 exit 时才统一入链
@@ -1344,9 +1325,6 @@ public final class GraphExtractor {
       writer.addNode(GraphModel.LABEL_VALUE, valueId, argProps);
       callChain.add(new EventRef(valueId, GraphModel.LABEL_VALUE));
       writer.addEdge(GraphModel.REL_ARG_OF, GraphModel.LABEL_VALUE, valueId, GraphModel.LABEL_CALLED_METHOD, id);
-      if (scope != null) {
-        writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_VALUE, valueId);
-      }
       // The argument expression's value flows into this call slot.
       String argSourceId = firstValueRuntimeId(file, arg);
       if (argSourceId != null && !argSourceId.equals(valueId)) {
@@ -1386,9 +1364,6 @@ public final class GraphExtractor {
     writer.addNode(GraphModel.LABEL_VALUE, callReturnId, retProps);
     // Deferred with the rest of this call's chain (same list referenced by pendingCallChains top).
     callChain.add(new EventRef(callReturnId, GraphModel.LABEL_VALUE));
-    if (scope != null) {
-      writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_VALUE, callReturnId);
-    }
     // Cross-function order: the callee's exit events flow into this call's result.
     if (symbols.containsKey(symbol)) {
       callSites.add(new CallSite(symbol, id, callReturnId));
@@ -1609,10 +1584,6 @@ public final class GraphExtractor {
     props.put("kind", GraphModel.VALUE_KIND_INDEX);
     writer.addNode(GraphModel.LABEL_VALUE, elementId, props);
     appendChainEvent(file, elementId, GraphModel.LABEL_VALUE, rangeLine(node));
-    String scope = innermostCond();
-    if (scope != null) {
-      writer.addEdge(GraphModel.REL_LEADS_TO, GraphModel.LABEL_CONDITION, scope, GraphModel.LABEL_VALUE, elementId);
-    }
     if (!baseId.equals(elementId)) {
       writer.addEdge(GraphModel.REL_INDEX, GraphModel.LABEL_VALUE, baseId, GraphModel.LABEL_VALUE, elementId);
     }
