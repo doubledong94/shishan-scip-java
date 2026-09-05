@@ -855,6 +855,55 @@ class GraphExtractorTest {
   }
 
   @Test
+  void elseEdgeBelongsToOwningIfNotNestedCondition() {
+    // void m(){ if(flag){ if(x){ q; } } else { s; } }
+    // 回归：外层 IF(flag) 的 ELSE 边必须挂到外层 IF 自身（#10:0），而不能被 then 分支里
+    // 嵌套的内层 IF(x) 覆盖——否则外层真正有 else 却分不到 ELSE 边（归属错位）。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 2, def("pkg/A#m().", "IdentifierFunctionDefinition", 2));
+    SyntaxTree.Node mBody = node("BLOCK", 3);
+
+    SyntaxTree.Node outerIf = node("IF", 10);
+    outerIf.children.add(node("IDENTIFIER", 11, ref("pkg/A#flag.", "IdentifierConstant", 11)));
+    SyntaxTree.Node thenB = node("BLOCK", 12);
+    SyntaxTree.Node innerIf = node("IF", 13);
+    innerIf.children.add(node("IDENTIFIER", 14, ref("pkg/A#x.", "IdentifierConstant", 14)));
+    SyntaxTree.Node innerThen = node("BLOCK", 15);
+    innerThen.children.add(node("IDENTIFIER", 16, ref("pkg/A#q.", "IdentifierConstant", 16)));
+    innerIf.children.add(innerThen);
+    thenB.children.add(innerIf);
+    outerIf.children.add(thenB);
+    SyntaxTree.Node elseB = node("BLOCK", 17);
+    elseB.children.add(node("IDENTIFIER", 18, ref("pkg/A#s.", "IdentifierConstant", 18)));
+    outerIf.children.add(elseB);
+    mBody.children.add(outerIf);
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"flag.", "x.", "q.", "s."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> elseEdges = edgesOf(sink, GraphModel.REL_ELSE);
+    String outerIfId = "test::Foo.java#10:0"; // 外层 IF(flag)
+    String innerIfId = "test::Foo.java#13:0"; // then 分支里的内层 IF(x)
+    boolean outerHasElse = elseEdges.stream().anyMatch(e -> outerIfId.equals(e.get("_from")));
+    boolean innerHasElse = elseEdges.stream().anyMatch(e -> innerIfId.equals(e.get("_from")));
+    assertTrue(outerHasElse, "outer IF must own its ELSE edge");
+    assertTrue(!innerHasElse, "nested IF must not steal the outer ELSE edge");
+  }
+
+  @Test
   void voidReturnCreatesReturnSlot() {
     // void m() { return; }  → a RETURN slot node exists (order chain has an explicit exit event)
     SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);

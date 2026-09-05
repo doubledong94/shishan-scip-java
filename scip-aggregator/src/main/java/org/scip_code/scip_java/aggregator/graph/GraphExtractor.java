@@ -504,6 +504,10 @@ public final class GraphExtractor {
   private void walkConditionChildren(String file, SyntaxTree.Node node) {
     List<SyntaxTree.Node> children = node.children;
     List<SyntaxTree.Node> branches = branchChildren(node);
+    // 捕获当前条件自身的 EventRef：分支遍历（尤其 then 分支里的嵌套条件）会覆盖全局
+    // lastConditionEvent，否则 else 分支的 `IF --ELSE--> ELSE` 边会挂到被覆盖的（最内层）条件上，
+    // 导致本应带 else 的 IF 反而没有 ELSE 边（归属错位）。后续统一用 condRef，而非可能被改写的全局。
+    EventRef condRef = lastConditionEvent;
 
     for (int i = 0; i < children.size(); i++) {
       SyntaxTree.Node child = children.get(i);
@@ -533,13 +537,13 @@ public final class GraphExtractor {
         ep.put("colEnd", rangeColEnd(br));
         ep.put("kind", GraphModel.CONDITION_KIND_ELSE);
         writer.addNode(GraphModel.LABEL_CONDITION, elseId, ep);
-        if (lastConditionEvent != null) {
-          writer.addEdge(GraphModel.REL_ELSE, lastConditionEvent.label, lastConditionEvent.id,
+        if (condRef != null) {
+          writer.addEdge(GraphModel.REL_ELSE, condRef.label, condRef.id,
               GraphModel.LABEL_CONDITION, elseId);
         }
         pendingBranchStartFrom = new EventRef(elseId, GraphModel.LABEL_CONDITION);
       } else {
-        pendingBranchStartFrom = lastConditionEvent;
+        pendingBranchStartFrom = condRef;
       }
       pushBranchScope();
       walk(file, branches.get(i), node, children.indexOf(branches.get(i)));
