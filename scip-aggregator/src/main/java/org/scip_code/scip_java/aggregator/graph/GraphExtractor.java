@@ -606,6 +606,8 @@ public final class GraphExtractor {
     }
     conds.push(tryId);
     try {
+      // TRY 入时序链：前一事件 → TRY（含把同语句延后写的 isUpgradeRequest 行号<43 的写冲刷进链）。
+      appendChainEvent(file, tryId, GraphModel.LABEL_CONDITION, rangeLine(node));
       for (int i = 0; i < node.children.size(); i++) {
         SyntaxTree.Node child = node.children.get(i);
         if (child.kind == null || child.kind.isEmpty() || child.kind.equals("WHITE_SPACE")) continue;
@@ -616,6 +618,7 @@ public final class GraphExtractor {
           addCondNode(file, finId, GraphModel.CONDITION_KIND_FINALLY, child);
           writer.addEdge(GraphModel.REL_ELSE, GraphModel.LABEL_CONDITION, tryId, GraphModel.LABEL_CONDITION, finId);
           writer.addEdge(GraphModel.REL_SUB, GraphModel.LABEL_CONDITION, tryId, GraphModel.LABEL_CONDITION, finId);
+          appendChainEvent(file, finId, GraphModel.LABEL_CONDITION, rangeLine(child));
           conds.push(finId);
           try { walkBranchFrom(file, child, node, i, finId); } finally { conds.pop(); }
         } else {
@@ -628,12 +631,14 @@ public final class GraphExtractor {
     }
   }
 
-  /** 物化一个 kind=CATCH 条件节点；`TRY --ELSE--> CATCH`（SUB 到 TRY）；catch 体从 CATCH 锚定，异常参数照常 walk。 */
+  /** 物化一个 kind=CATCH 条件节点；`TRY --ELSE--> CATCH`（SUB 到 TRY）；CATCH 入链（try 体末事件→CATCH→catch 体）。 */
   private void handleCatch(String file, SyntaxTree.Node catchNode, SyntaxTree.Node parent, String tryId) {
     String catchId = runtimeId(project, file, catchNode.range, null);
     addCondNode(file, catchId, GraphModel.CONDITION_KIND_CATCH, catchNode);
     writer.addEdge(GraphModel.REL_ELSE, GraphModel.LABEL_CONDITION, tryId, GraphModel.LABEL_CONDITION, catchId);
     writer.addEdge(GraphModel.REL_SUB, GraphModel.LABEL_CONDITION, tryId, GraphModel.LABEL_CONDITION, catchId);
+    // CATCH 入时序链：从 try 体末事件（同层 pendingJoin）续接。
+    appendChainEvent(file, catchId, GraphModel.LABEL_CONDITION, rangeLine(catchNode));
     conds.push(catchId);
     try {
       for (int i = 0; i < catchNode.children.size(); i++) {

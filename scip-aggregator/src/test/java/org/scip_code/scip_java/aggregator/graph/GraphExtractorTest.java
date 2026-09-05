@@ -903,6 +903,8 @@ class GraphExtractorTest {
     SyntaxTree.Node m = node("METHOD", 2, def("pkg/A#m().", "IdentifierFunctionDefinition", 2));
     SyntaxTree.Node mBody = node("BLOCK", 3);
 
+    mBody.children.add(node("IDENTIFIER", 9, ref("pkg/A#e0.", "IdentifierConstant", 9))); // 前置事件
+
     SyntaxTree.Node tryNode = node("TRY", 10);
     SyntaxTree.Node tryBody = node("BLOCK", 11);
     tryBody.children.add(node("IDENTIFIER", 12, ref("pkg/A#a.", "IdentifierConstant", 12)));
@@ -921,7 +923,7 @@ class GraphExtractorTest {
     Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
     symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
     symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
-    for (String f : new String[] {"a.", "e.", "b."}) {
+    for (String f : new String[] {"e0.", "a.", "e.", "b."}) {
       symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
     }
 
@@ -949,6 +951,14 @@ class GraphExtractorTest {
         edgesOf(sink, GraphModel.REL_SUB).stream()
             .anyMatch(e -> fTry.equals(e.get("_from")) && fCatch.equals(e.get("_to"))),
         "TRY --SUB--> CATCH (catch 嵌套在 try 下)");
+    // TRY 必须进入 NEXT 时序链：前置事件 e0 → TRY → try 体首事件 a。
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.BiPredicate<String, String> next = (from, to) ->
+        nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+    String e0 = "test::Foo.java#9:0:FIELD";
+    String a = "test::Foo.java#12:0:FIELD";
+    assertTrue(next.test(e0, fTry), "preceding event e0 -> TRY (TRY in order chain)");
+    assertTrue(next.test(fTry, a), "TRY -> try body first event a");
   }
 
   @Test
