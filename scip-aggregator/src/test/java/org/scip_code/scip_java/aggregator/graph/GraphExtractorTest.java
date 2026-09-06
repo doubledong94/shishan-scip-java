@@ -1265,6 +1265,57 @@ class GraphExtractorTest {
   }
 
   @Test
+  void javaWhileLoopFormsNextCycleWithCondExit() {
+    // javac 版 while：WHILE_LOOP 子节点 = [条件, body]。与 Kotlin WHILE 同一套共享逻辑，
+    // 验证 loop 的恒 2 分叉 + body 回边成环 + 条件假路径退出对 Java 索引同样生效。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+    SyntaxTree.Node wh = node("WHILE_LOOP", 13);
+    wh.children.add(node("IDENTIFIER", 14, ref("pkg/A#c.", "IdentifierConstant", 14)));
+    SyntaxTree.Node bodyBlock = node("BLOCK", 15);
+    bodyBlock.children.add(node("IDENTIFIER", 16, ref("pkg/A#body.", "IdentifierConstant", 16)));
+    wh.children.add(bodyBlock);
+    mBody.children.add(wh);
+    mBody.children.add(node("IDENTIFIER", 17, ref("pkg/A#next.", "IdentifierConstant", 17)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"c.", "body.", "next."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.Function<String, Long> outCount =
+        id -> nexts.stream().filter(e -> id.equals(e.get("_from"))).count();
+    java.util.function.Function<String, Long> inCount =
+        id -> nexts.stream().filter(e -> id.equals(e.get("_to"))).count();
+    java.util.function.BiPredicate<String, String> next =
+        (from, to) -> nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+
+    String whId = "test::Foo.java#13:0";
+    String c = "test::Foo.java#14:0:FIELD";
+    String body = "test::Foo.java#16:0:FIELD";
+    String nextNode = "test::Foo.java#17:0:FIELD";
+    assertEquals(2L, (long) outCount.apply(whId), "javac while loop condition forks exactly 2");
+    assertTrue(next.test(whId, body), "while true -> body");
+    assertTrue(next.test(whId, nextNode), "while false -> next (exit)");
+    assertTrue(next.test(c, whId), "guard read -> loop condition");
+    assertTrue(next.test(body, c), "body loops back to loop condition");
+    assertEquals(1L, (long) inCount.apply(nextNode), "while exit next joined only by condition false path");
+  }
+
+  @Test
   void forLoopFormsNextCycleWithCondExit() {
     // void m() { for (c) { body } next; }
     // for 的条件恒 2 分叉(真→body,假→next 退出),body 末端回边到条件(有 update 则应经 update,此处简化)。
