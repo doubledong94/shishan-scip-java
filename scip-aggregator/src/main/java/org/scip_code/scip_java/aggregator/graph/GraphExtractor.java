@@ -575,10 +575,6 @@ public final class GraphExtractor {
   private void handleTryCatch(String file, SyntaxTree.Node node, SyntaxTree.Node parent, int index) {
     String tryId = runtimeId(project, file, node.range, null);
     addCondNode(file, tryId, GraphModel.CONDITION_KIND_TRY, node);
-    String parentCond = innermostCond();
-    if (parentCond != null) {
-      writer.addEdge(GraphModel.REL_SUB, GraphModel.LABEL_CONDITION, parentCond, GraphModel.LABEL_CONDITION, tryId);
-    }
     conds.push(tryId);
     try {
       // TRY 入时序链：前一事件 → TRY（含把同语句延后写的 isUpgradeRequest 行号<43 的写冲刷进链）。
@@ -591,8 +587,7 @@ public final class GraphExtractor {
         } else if ("FINALLY".equals(child.kind)) {
           String finId = runtimeId(project, file, child.range, null);
           addCondNode(file, finId, GraphModel.CONDITION_KIND_FINALLY, child);
-          writer.addEdge(GraphModel.REL_ELSE, GraphModel.LABEL_CONDITION, tryId, GraphModel.LABEL_CONDITION, finId);
-          writer.addEdge(GraphModel.REL_SUB, GraphModel.LABEL_CONDITION, tryId, GraphModel.LABEL_CONDITION, finId);
+          // FINALLY 入链(经 NEXT)；不建 SUB/ELSE——try/catch/finally 由 NEXT 连接。
           appendChainEvent(file, finId, GraphModel.LABEL_CONDITION, rangeLine(child));
           conds.push(finId);
           try { walkBranchFrom(file, child, node, i, finId); } finally { conds.pop(); }
@@ -610,9 +605,7 @@ public final class GraphExtractor {
   private void handleCatch(String file, SyntaxTree.Node catchNode, SyntaxTree.Node parent, String tryId) {
     String catchId = runtimeId(project, file, catchNode.range, null);
     addCondNode(file, catchId, GraphModel.CONDITION_KIND_CATCH, catchNode);
-    writer.addEdge(GraphModel.REL_ELSE, GraphModel.LABEL_CONDITION, tryId, GraphModel.LABEL_CONDITION, catchId);
-    writer.addEdge(GraphModel.REL_SUB, GraphModel.LABEL_CONDITION, tryId, GraphModel.LABEL_CONDITION, catchId);
-    // CATCH 入时序链：从 try 体末事件（同层 pendingJoin）续接。
+    // CATCH 入时序链：从 try 体末事件（同层 pendingJoin）经 NEXT 续接；不建 SUB/ELSE。
     appendChainEvent(file, catchId, GraphModel.LABEL_CONDITION, rangeLine(catchNode));
     conds.push(catchId);
     try {

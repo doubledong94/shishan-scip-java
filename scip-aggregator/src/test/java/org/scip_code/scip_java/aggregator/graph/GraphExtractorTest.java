@@ -942,13 +942,11 @@ class GraphExtractorTest {
     assertTrue(fTry != null, "TRY condition node exists");
     assertTrue(fCatch != null, "CATCH condition node exists");
     assertTrue(
-        edgesOf(sink, GraphModel.REL_ELSE).stream()
-            .anyMatch(e -> fTry.equals(e.get("_from")) && fCatch.equals(e.get("_to"))),
-        "TRY --ELSE--> CATCH");
+        edgesOf(sink, GraphModel.REL_ELSE).isEmpty(),
+        "no ELSE edges (try/catch by NEXT)");
     assertTrue(
-        edgesOf(sink, GraphModel.REL_SUB).stream()
-            .anyMatch(e -> fTry.equals(e.get("_from")) && fCatch.equals(e.get("_to"))),
-        "TRY --SUB--> CATCH (catch 嵌套在 try 下)");
+        edgesOf(sink, GraphModel.REL_SUB).isEmpty(),
+        "no SUB edges");
     // TRY 必须进入 NEXT 时序链：前置事件 e0 → TRY → try 体首事件 a。
     List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
     java.util.function.BiPredicate<String, String> next = (from, to) ->
