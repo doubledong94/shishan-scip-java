@@ -999,8 +999,9 @@ public final class GraphExtractor {
         // 与普通 `x = y` 的写节点行为一致，保证每个语句节点都有顺序关系。
         String localId = declId(project, file, symbol);
         writer.addNode(label, localId, props);
-        // 写节点延迟（按行）到 RHS 读之后再入链，保证 `val x = rhs` 先读后写。
-        pendingLocalWrites.add(new LocalWrite(rangeLine(node), localId, GraphModel.LABEL_VALUE));
+        // 写节点延迟到 RHS 读之后再入链，保证 `val x = rhs` 先读后写。用**语句末行**作冲排边界：
+        // 跨行赋值的 RHS 读在更大的行上，若按 LHS 行冲排会在第一个 RHS 读前就把写挤出(写成"先写后读")。
+        pendingLocalWrites.add(new LocalWrite(rangeEndLine(node), localId, GraphModel.LABEL_VALUE));
         return;
       }
     } else {
@@ -1938,6 +1939,10 @@ public final class GraphExtractor {
 
   private static int rangeLine(SyntaxTree.Node node) {
     return node.range == null ? 0 : node.range.startLine();
+  }
+
+  private static int rangeEndLine(SyntaxTree.Node node) {
+    return node.range == null ? 0 : node.range.endLine();
   }
 
   private static int rangeCol(SyntaxTree.OccurrenceData occ) {
