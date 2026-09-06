@@ -155,7 +155,9 @@ class GraphExtractorTest {
             .filter(id -> hasEdge(sink, GraphModel.REL_ROOT, "test::pkg/A#m().", id))
             .findFirst()
             .orElseThrow();
-    assertTrue(hasEdge(sink, GraphModel.REL_SUB, mRoot, ifCond), "if is sub of m's root");
+    // 顺序链：m 根条件 → if 条件的守卫读 → if 条件(条件也入链)。SUB 已移除。
+    assertTrue(hasEdge(sink, GraphModel.REL_ROOT, "test::pkg/A#m().", mRoot), "m root condition");
+    assertTrue(ifCond != null && !ifCond.isEmpty(), "if condition exists");
   }
 
   @Test
@@ -316,14 +318,14 @@ class GraphExtractorTest {
             .anyMatch(e -> ((String) e.get("_from")).contains("Foo.java#13:0:FIELD"));
     assertTrue(ref, "receiver a REF the call");
 
-    // ELSE: else-if chain.
+    // else-if chain: 不再有 ELSE 边（由 NEXT 表达）；else-if 条件节点存在。
     String elseIfCond =
         conditionsOfKind(sink, GraphModel.CONDITION_KIND_IF).stream()
             .filter(c -> ((String) c.get("_id")).contains("Foo.java#15"))
             .findFirst()
             .map(c -> (String) c.get("_id"))
             .orElseThrow();
-    assertTrue(hasEdge(sink, GraphModel.REL_ELSE, ifCond, elseIfCond), "else-if chain");
+    assertTrue(!hasEdge(sink, GraphModel.REL_ELSE, ifCond, elseIfCond), "no ELSE edge for else-if");
   }
 
   @Test
@@ -745,20 +747,16 @@ class GraphExtractorTest {
     // else 分支首节点 b 的前置是一个 kind=ELSE 的 Condition 节点(elseB@17)，其从 flagCond 经 ELSE 进入，
     // 而 b 本身经 NEXT 从该 ELSE 节点进入（分支首事件都挂顺序链）。
     String elseCond = "test::Foo.java#17:0:ELSE";
-    boolean elseChain =
-        elseEdges.stream().anyMatch(e -> flagCond.equals(e.get("_from")) && elseCond.equals(e.get("_to")));
-    boolean elseEntry = next.test(elseCond, b);
+    boolean elseEntry = next.test(flagCond, b);
     assertTrue(thenNEXT, "then branch entered via NEXT from the condition");
-    assertTrue(elseChain, "condition -> else node via ELSE");
-    assertTrue(elseEntry, "else node -> else branch first via NEXT");
+    assertTrue(elseEntry, "else branch first event entered via NEXT from the condition");
     assertTrue(next.test(a, c), "then branch end continues after the if");
     assertTrue(next.test(b, c), "else branch end continues after the if");
     assertTrue(!next.test(flagCond, c), "condition must not skip straight to continuation");
 
-    // Branch entry structure: then / else 首事件都经 NEXT；ELSE 边只作 条件--else节点 的逻辑标记。
+    // Branch entry structure: then / else 首事件都经 NEXT 从条件进入；无 SUB/ELSE 边。
     assertTrue(thenNEXT, "then edge entered via NEXT (condition true)");
-    assertTrue(elseChain, "else entered via ELSE from condition");
-    assertTrue(elseEntry, "else branch first node entered via NEXT from the ELSE node");
+    assertTrue(elseEntry, "else branch first node entered via NEXT from the condition");
 
     // Cross-function: call enters callee's first event（现为 METHOD 根条件=方法入口）；void 方法退出流入 calledReturn。
     String calledMethod = "test::Foo.java#20:0";
@@ -845,8 +843,8 @@ class GraphExtractorTest {
   @Test
   void elseEdgeBelongsToOwningIfNotNestedCondition() {
     // void m(){ if(flag){ if(x){ q; } } else { s; } }
-    // 回归：外层 IF(flag) 的 ELSE 边必须挂到外层 IF 自身（#10:0），而不能被 then 分支里
-    // 嵌套的内层 IF(x) 覆盖——否则外层真正有 else 却分不到 ELSE 边（归属错位）。
+    // 回归：外层 IF(flag) 的 else 分支入口必须从外层 IF 自身(#10:0)经 NEXT 进入，而不能被 then
+    // 分支里嵌套的内层 IF(x) 抢占——否则外层真正有 else 却分不到分支入口(NEXT 指向 s)。
     SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
     SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
     SyntaxTree.Node m = node("METHOD", 2, def("pkg/A#m().", "IdentifierFunctionDefinition", 2));
@@ -882,13 +880,16 @@ class GraphExtractorTest {
     extractor.extractFile("Foo.java", cu);
     extractor.emitRelationships();
 
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
     List<Map<String, Object>> elseEdges = edgesOf(sink, GraphModel.REL_ELSE);
     String outerIfId = "test::Foo.java#10:0"; // 外层 IF(flag)
     String innerIfId = "test::Foo.java#13:0"; // then 分支里的内层 IF(x)
-    boolean outerHasElse = elseEdges.stream().anyMatch(e -> outerIfId.equals(e.get("_from")));
-    boolean innerHasElse = elseEdges.stream().anyMatch(e -> innerIfId.equals(e.get("_from")));
-    assertTrue(outerHasElse, "outer IF must own its ELSE edge");
-    assertTrue(!innerHasElse, "nested IF must not steal the outer ELSE edge");
+    String s = "test::Foo.java#18:0:FIELD";   // else 分支首事件
+    java.util.function.BiPredicate<String, String> nextFrom = (from, to) ->
+        nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+    assertTrue(nextFrom.test(outerIfId, s), "outer IF owns its else-branch entry via NEXT");
+    assertTrue(!nextFrom.test(innerIfId, s), "inner IF must not steal the outer else-branch entry");
+    assertTrue(elseEdges.isEmpty(), "no ELSE edges remain");
   }
 
   @Test

@@ -525,29 +525,10 @@ public final class GraphExtractor {
 
     List<Scope> branchScopes = new ArrayList<>();
     for (int i = 0; i < branches.size(); i++) {
-      // 分支：then 从条件(next)进入；else 物化为 kind=ELSE 条件节点，两条分支首事件都经 NEXT。
-      String kind = isLoopKind(node.kind) ? "then" : (i == 0 ? "then" : "else");
-      if ("else".equals(kind)) {
-        // else 分支也物化成一个 kind=ELSE 的 Condition 节点：IF --ELSE--> ELSE(node)，
-        // 并把 else 块首节点的起点锚到该 ELSE 节点（else 不是边，是 Condition 的一种）。
-        SyntaxTree.Node br = branches.get(i);
-        String elseId = runtimeId(project, file, br.range, "ELSE");
-        Map<String, Object> ep = new LinkedHashMap<>();
-        ep.put("file", file);
-        ep.put("line", rangeLine(br));
-        ep.put("col", rangeCol(br));
-        ep.put("colEnd", rangeColEnd(br));
-        ep.put("kind", GraphModel.CONDITION_KIND_ELSE);
-        writer.addNode(GraphModel.LABEL_CONDITION, elseId, ep);
-        if (condRef != null) {
-          writer.addEdge(GraphModel.REL_ELSE, condRef.label, condRef.id,
-              GraphModel.LABEL_CONDITION, elseId);
-        }
-        pendingBranchStartFrom.push(new EventRef(elseId, GraphModel.LABEL_CONDITION));
-      } else {
-        pendingBranchStartFrom.push(condRef);
-      }
+      // 每条分支(then/else/else-if)首事件都从条件经 NEXT 进入；else 不再物化 kind=ELSE 节点。
+      // 分支块首事件经 enterBlock 消费 startFrom；else-if(IF 节点)走其自身 walk，守卫值先入链。
       int depthBefore = pendingBranchStartFrom.size();
+      pendingBranchStartFrom.push(condRef);
       pushBranchScope();
       walk(file, branches.get(i), node, children.indexOf(branches.get(i)));
       branchScopes.add(scopeStack.pop());
@@ -1446,19 +1427,8 @@ public final class GraphExtractor {
     writer.addNode(GraphModel.LABEL_CONDITION, id, props);
     // 条件节点暂不入链：把它的线性入链延迟到 exit（守卫表达式读取走完后），保证 守卫读 → IF → 分支。
     pendingConditionChains.push(new EventRef(id, GraphModel.LABEL_CONDITION));
-    // 先取父条件（压入本条件之前，否则 innermostCond 会返回自身），再压入本条件自身，
-    // 供 walkConditionChildren 取当前条件作分支锚点。
-    String parentCond = innermostCond();
-    if (parentCond != null) {
-      writer.addEdge(GraphModel.REL_SUB, GraphModel.LABEL_CONDITION, parentCond, GraphModel.LABEL_CONDITION, id);
-    }
-    // else-if chain: Kotlin wraps the else branch in an ELSE node; javac puts it at child index >= 2.
-    boolean isElsePosition =
-        (parent != null && parent.kind.equals("ELSE"))
-            || (parent != null && isConditionKind(parent.kind) && index >= 2);
-    if (isElsePosition && parentCond != null) {
-      writer.addEdge(GraphModel.REL_ELSE, GraphModel.LABEL_CONDITION, parentCond, GraphModel.LABEL_CONDITION, id);
-    }
+    // 本条件自身 id 压入作用域栈（供 walkConditionChildren 取当前条件作分支锚点）。不建 SUB/ELSE——
+    // 条件之间(含 else-if 链)的连接一律由 NEXT 表达。
     conds.push(id);
 
     // CONTROLS: values referenced in the condition expression guard this branch.
