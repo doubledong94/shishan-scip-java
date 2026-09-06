@@ -921,6 +921,150 @@ class GraphExtractorTest {
   }
 
   @Test
+  void nestedWithElseIfAsLastStatementFansTailsIntoOuterMerge() {
+    // void m() { e0; if (c1) { X; if (c2) { A } else { B } } else { D } end; }
+    // 内层有 else 的 if(c2) 是 c1-then 的最后一条语句：它在本块内没有"之后的事件"，故不在块内
+    // 单独设合流点；其两条分支链尾 A/B 作为 c1-then 的末端上汇到外层合流点 end。c2 条件(有 else)
+    // 不是叶终端、不汇入 end。=> end 汇入 3 条叶终端：A(内层真尾)、B(内层假尾)、D(外层 else 尾)。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+    mBody.children.add(node("IDENTIFIER", 12, ref("pkg/A#e0.", "IdentifierConstant", 12)));
+
+    SyntaxTree.Node c1 = node("IF", 13);
+    c1.children.add(node("IDENTIFIER", 14, ref("pkg/A#c1.", "IdentifierConstant", 14)));
+    SyntaxTree.Node c1Then = node("BLOCK", 15);
+    c1Then.children.add(node("IDENTIFIER", 16, ref("pkg/A#X.", "IdentifierConstant", 16)));
+    SyntaxTree.Node c2 = node("IF", 17);
+    c2.children.add(node("IDENTIFIER", 18, ref("pkg/A#c2.", "IdentifierConstant", 18)));
+    SyntaxTree.Node c2Then = node("BLOCK", 19);
+    c2Then.children.add(node("IDENTIFIER", 20, ref("pkg/A#A.", "IdentifierConstant", 20)));
+    c2.children.add(c2Then);
+    SyntaxTree.Node c2Else = node("BLOCK", 21);
+    c2Else.children.add(node("IDENTIFIER", 22, ref("pkg/A#B.", "IdentifierConstant", 22)));
+    c2.children.add(c2Else);
+    c1Then.children.add(c2);
+    c1.children.add(c1Then);
+    SyntaxTree.Node c1Else = node("BLOCK", 23);
+    c1Else.children.add(node("IDENTIFIER", 24, ref("pkg/A#D.", "IdentifierConstant", 24)));
+    c1.children.add(c1Else);
+    mBody.children.add(c1);
+    mBody.children.add(node("IDENTIFIER", 25, ref("pkg/A#end.", "IdentifierConstant", 25)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"e0.", "c1.", "X.", "c2.", "A.", "B.", "D.", "end."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.Function<String, Long> outCount =
+        id -> nexts.stream().filter(e -> id.equals(e.get("_from"))).count();
+    java.util.function.Function<String, Long> inCount =
+        id -> nexts.stream().filter(e -> id.equals(e.get("_to"))).count();
+    java.util.function.BiPredicate<String, String> next =
+        (from, to) -> nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+
+    String c1id = "test::Foo.java#13:0";
+    String c2id = "test::Foo.java#17:0";
+    String X = "test::Foo.java#16:0:FIELD";
+    String A = "test::Foo.java#20:0:FIELD";
+    String B = "test::Foo.java#22:0:FIELD";
+    String D = "test::Foo.java#24:0:FIELD";
+    String end = "test::Foo.java#25:0:FIELD";
+    // 内层 / 外层各自恒 2 分叉。
+    assertEquals(2L, (long) outCount.apply(c2id), "inner if forks 2");
+    assertEquals(2L, (long) outCount.apply(c1id), "outer if forks 2");
+    assertTrue(next.test(c2id, A), "inner true -> then branch");
+    assertTrue(next.test(c2id, B), "inner false -> else branch");
+    assertTrue(next.test(c1id, X), "outer true -> then branch");
+    assertTrue(next.test(c1id, D), "outer false -> else branch");
+    // 内层条件(有 else)与外层条件都不是叶终端，不汇入 end。
+    assertTrue(!next.test(c2id, end), "inner with-else condition is not a terminal at outer merge");
+    assertTrue(!next.test(c1id, end), "outer condition is not a terminal at its own merge");
+    // 合流点 end 汇入 3 条叶终端：内层真尾 + 内层假尾 + 外层 else 尾。
+    assertEquals(3L, (long) inCount.apply(end), "outer merge joined by inner-if's 2 tails + outer else tail");
+    assertTrue(next.test(A, end), "inner then tail merges at outer continuation");
+    assertTrue(next.test(B, end), "inner else tail merges at outer continuation");
+    assertTrue(next.test(D, end), "outer else tail merges at outer continuation");
+  }
+
+  @Test
+  void noElseNestedIfConditionIsFallthroughTerminal() {
+    // void m() { e0; if (c1) { X; if (c2) { A } } else { D } end; }
+    // 内层无 else 的 if(c2) 是 c1-then 最后一条：其条件作为假路径 fall-through 叶终端汇入 end。
+    // 合流点 end 汇入 A(真尾)、c2(条件 fall-through)、D(外层 else 尾)。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+    mBody.children.add(node("IDENTIFIER", 12, ref("pkg/A#e0.", "IdentifierConstant", 12)));
+
+    SyntaxTree.Node c1 = node("IF", 13);
+    c1.children.add(node("IDENTIFIER", 14, ref("pkg/A#c1.", "IdentifierConstant", 14)));
+    SyntaxTree.Node c1Then = node("BLOCK", 15);
+    c1Then.children.add(node("IDENTIFIER", 16, ref("pkg/A#X.", "IdentifierConstant", 16)));
+    SyntaxTree.Node c2 = node("IF", 17);
+    c2.children.add(node("IDENTIFIER", 18, ref("pkg/A#c2.", "IdentifierConstant", 18)));
+    SyntaxTree.Node c2Then = node("BLOCK", 19);
+    c2Then.children.add(node("IDENTIFIER", 20, ref("pkg/A#A.", "IdentifierConstant", 20)));
+    c2.children.add(c2Then);
+    c1Then.children.add(c2);
+    c1.children.add(c1Then);
+    SyntaxTree.Node c1Else = node("BLOCK", 23);
+    c1Else.children.add(node("IDENTIFIER", 24, ref("pkg/A#D.", "IdentifierConstant", 24)));
+    c1.children.add(c1Else);
+    mBody.children.add(c1);
+    mBody.children.add(node("IDENTIFIER", 25, ref("pkg/A#end.", "IdentifierConstant", 25)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"e0.", "c1.", "X.", "c2.", "A.", "D.", "end."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.Function<String, Long> outCount =
+        id -> nexts.stream().filter(e -> id.equals(e.get("_from"))).count();
+    java.util.function.Function<String, Long> inCount =
+        id -> nexts.stream().filter(e -> id.equals(e.get("_to"))).count();
+    java.util.function.BiPredicate<String, String> next =
+        (from, to) -> nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+
+    String c1id = "test::Foo.java#13:0";
+    String c2id = "test::Foo.java#17:0";
+    String A = "test::Foo.java#20:0:FIELD";
+    String D = "test::Foo.java#24:0:FIELD";
+    String end = "test::Foo.java#25:0:FIELD";
+    assertEquals(2L, (long) outCount.apply(c2id), "inner no-else if forks 2 (true + fall-through)");
+    assertTrue(next.test(c2id, A), "inner true -> then branch");
+    assertTrue(next.test(c2id, end), "inner no-else condition is the fall-through terminal into end");
+    // 合流点 end 汇入 A(真尾)、c2(条件 fall-through)、D(外层 else 尾)。
+    assertEquals(3L, (long) inCount.apply(end), "merge joined by then tail + no-else condition + outer else tail");
+    assertTrue(next.test(A, end), "then tail merges at outer continuation");
+    assertTrue(next.test(D, end), "outer else tail merges at outer continuation");
+  }
+
+  @Test
   void orderChainDoesNotForkFromOneNodeAcrossSiblingBlocks() {
     // void m() { e0; {x} {y} {p} {q} c; }（4 个兄弟裸块——TRY/CATCH 现已是条件节点，这里用通用兄弟块回归）
     // 回归：兄弟嵌套块不能都从同一条链尾 e0 上各出 NEXT 分叉，而应按源序线性续接：e0→x→y→p→q→c，
