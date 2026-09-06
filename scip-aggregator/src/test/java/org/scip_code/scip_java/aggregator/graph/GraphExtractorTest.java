@@ -921,6 +921,80 @@ class GraphExtractorTest {
   }
 
   @Test
+  void whenExpressionForksLikeIfElseIf() {
+    // fun m() { e0; when { g1 -> { A } else -> { B } }; end; }
+    // when 恒 2：条件(守卫 g1)真→A 分支首、假→else B 分支首；守卫读 g1 在条件之前；A 尾 + B 尾汇入 end。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+    mBody.children.add(node("IDENTIFIER", 12, ref("pkg/A#e0.", "IdentifierConstant", 12)));
+
+    SyntaxTree.Node when = node("WHEN", 13);
+    // entry1: g1 -> { A }
+    SyntaxTree.Node entry1 = node("WHEN_ENTRY", 14);
+    SyntaxTree.Node guard = node("WHEN_CONDITION_WITH_EXPRESSION", 14);
+    guard.children.add(node("IDENTIFIER", 15, ref("pkg/A#g1.", "IdentifierConstant", 15)));
+    entry1.children.add(guard);
+    entry1.children.add(node("ARROW", 14));
+    SyntaxTree.Node aBlock = node("BLOCK", 16);
+    aBlock.children.add(node("IDENTIFIER", 16, ref("pkg/A#a.", "IdentifierConstant", 16)));
+    entry1.children.add(aBlock);
+    when.children.add(entry1);
+    // entry2: else -> { B }
+    SyntaxTree.Node entry2 = node("WHEN_ENTRY", 17);
+    entry2.children.add(node("else", 17));
+    entry2.children.add(node("ARROW", 17));
+    SyntaxTree.Node bBlock = node("BLOCK", 18);
+    bBlock.children.add(node("IDENTIFIER", 18, ref("pkg/A#b.", "IdentifierConstant", 18)));
+    entry2.children.add(bBlock);
+    when.children.add(entry2);
+    mBody.children.add(when);
+    mBody.children.add(node("IDENTIFIER", 19, ref("pkg/A#end.", "IdentifierConstant", 19)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"e0.", "g1.", "a.", "b.", "end."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.Function<String, Long> nextOutCount =
+        id -> nexts.stream().filter(e -> id.equals(e.get("_from"))).count();
+    java.util.function.Function<String, Long> nextInCount =
+        id -> nexts.stream().filter(e -> id.equals(e.get("_to"))).count();
+    java.util.function.BiPredicate<String, String> next =
+        (from, to) -> nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+
+    String cond = "test::Foo.java#14:0";
+    String g1 = "test::Foo.java#15:0:FIELD";
+    String A = "test::Foo.java#16:0:FIELD";
+    String B = "test::Foo.java#18:0:FIELD";
+    String end = "test::Foo.java#19:0:FIELD";
+    // when 条件恒 2 分叉：真→A 分支首，假→else B 分支首（不再把守卫读当分支），共 2 条，不是 N 叉。
+    assertEquals(2L, (long) nextOutCount.apply(cond), "when condition forks exactly 2");
+    assertTrue(next.test(cond, A), "when true path -> first branch body");
+    assertTrue(next.test(cond, B), "when false path -> else branch body");
+    assertTrue(!next.test(cond, g1), "guard read is not a branch of the when condition");
+    // 守卫读在条件之前：g1 → 条件（先读后判定）。
+    assertTrue(next.test(g1, cond), "guard read precedes the when condition");
+    // 合并点 end 汇入 A 尾 + B 尾（条件不是叶终端，不汇入）。
+    assertEquals(2L, (long) nextInCount.apply(end), "when merge (end) joined by A + B tails");
+    assertTrue(next.test(A, end), "branch A tail merges");
+    assertTrue(next.test(B, end), "branch B tail merges");
+    assertTrue(!next.test(cond, end), "when condition is not a terminal at the merge");
+  }
+
+  @Test
   void nestedWithElseIfAsLastStatementFansTailsIntoOuterMerge() {
     // void m() { e0; if (c1) { X; if (c2) { A } else { B } } else { D } end; }
     // 内层有 else 的 if(c2) 是 c1-then 的最后一条语句：它在本块内没有"之后的事件"，故不在块内

@@ -490,6 +490,10 @@ public final class GraphExtractor {
       handleTryCatch(file, node, parent, index);
       return;
     }
+    if ("WHEN".equals(node.kind)) {
+      handleWhen(file, node, parent, index);
+      return;
+    }
     enter(file, node, parent, index);
     if (isConditionKind(node.kind)) {
       walkConditionChildren(file, node);
@@ -670,6 +674,120 @@ public final class GraphExtractor {
     } finally {
       conds.pop();
     }
+  }
+
+  /**
+   * Kotlin `when {}`（含 `x = when{…}` 表达式）按 if-else-if 建模：每个非 else 的 WHEN_ENTRY 守卫
+   * 物化为一个 kind=IF 条件节点，守卫读先入链，条件恒 2 分叉（真→本分支体首、假→下一个守卫/else），
+   * 所有落到底的分支体尾汇入合并点（= when 之后的下一事件；若是 `x = when{…}` 则先读后写汇入 `x` 的写）。
+   *
+   * 之前把整个 WHEN 当 kind=IF 条件、把每个 WHEN_ENTRY 都当一条独立分支（N 叉），且把守卫读当成分支
+   * 目标（常形成恒 3/N 分叉）；本实现改为逐守卫建链，与 if/else-if 的"恒 2"一致。
+   */
+  private void handleWhen(String file, SyntaxTree.Node node, SyntaxTree.Node parent, int index) {
+    List<SyntaxTree.Node> entries = branchChildren(node);
+    // 1) 头部/主语（非 WHEN_ENTRY 子节点，如 `when (subject)` 的 subject、括号）照常 walk，主语读先入链。
+    for (int i = 0; i < node.children.size(); i++) {
+      SyntaxTree.Node child = node.children.get(i);
+      if (!entries.contains(child)) walk(file, child, node, i);
+    }
+
+    // 2) 逐非 else 守卫建条件节点并链成 if-else-if（守卫读 → 条件；条件假路径 → 下一守卫/条件）。
+    List<Scope> branchScopes = new ArrayList<>();
+    List<SyntaxTree.Node> condEntries = new ArrayList<>();
+    List<String> condIds = new ArrayList<>();
+    EventRef prevCond = null;
+    for (SyntaxTree.Node entry : entries) {
+      if (isElseEntry(entry)) continue;
+      List<SyntaxTree.Node> guards = whenGuards(entry);
+      if (guards.isEmpty()) continue;
+      SyntaxTree.Node guard = guards.get(0);
+      String condId = runtimeId(project, file, guard.range, null);
+      addCondNode(file, condId, GraphModel.CONDITION_KIND_IF, guard);
+      conds.push(condId);
+      try {
+        for (SyntaxTree.Node g : guards) walk(file, g, entry, entry.children.indexOf(g));
+        appendChainEvent(file, condId, GraphModel.LABEL_CONDITION, rangeLine(guard));
+        for (SyntaxTree.Node g : guards) {
+          List<String> vids = new ArrayList<>();
+          collectValueIds(file, g, vids);
+          for (String vid : vids) {
+            writer.addEdge(GraphModel.REL_CONTROLS, GraphModel.LABEL_VALUE, vid, GraphModel.LABEL_CONDITION, condId);
+          }
+        }
+        if (prevCond != null) {
+          writer.addEdge(GraphModel.REL_NEXT, prevCond.label, prevCond.id, GraphModel.LABEL_CONDITION, condId);
+        }
+        prevCond = new EventRef(condId, GraphModel.LABEL_CONDITION);
+      } finally {
+        conds.pop();
+      }
+      condEntries.add(entry);
+      condIds.add(condId);
+    }
+
+    // 3) 走每条分支体（真路径从各自条件进入）；合并分支作用域。
+    for (int i = 0; i < condEntries.size(); i++) {
+      SyntaxTree.Node body = whenBody(condEntries.get(i));
+      if (body == null) continue;
+      pushBranchScope();
+      int depth = pendingBranchStartFrom.size();
+      pendingBranchStartFrom.push(new EventRef(condIds.get(i), GraphModel.LABEL_CONDITION));
+      walk(file, body, condEntries.get(i), condEntries.get(i).children.indexOf(body));
+      while (pendingBranchStartFrom.size() > depth) pendingBranchStartFrom.pop();
+      branchScopes.add(scopeStack.pop());
+    }
+
+    // 4) else 体从最后一个条件的假路径进入；无 else 时该条件作为 fall-through 终端汇入 when 之后。
+    SyntaxTree.Node elseEntry = null;
+    for (SyntaxTree.Node entry : entries) {
+      if (isElseEntry(entry)) { elseEntry = entry; break; }
+    }
+    SyntaxTree.Node elseBody = elseEntry == null ? null : whenBody(elseEntry);
+    if (elseBody != null && prevCond != null) {
+      pushBranchScope();
+      int depth = pendingBranchStartFrom.size();
+      pendingBranchStartFrom.push(prevCond);
+      walk(file, elseBody, elseEntry, elseEntry.children.indexOf(elseBody));
+      while (pendingBranchStartFrom.size() > depth) pendingBranchStartFrom.pop();
+      branchScopes.add(scopeStack.pop());
+    } else if (prevCond != null && !blockStack.isEmpty()) {
+      blockStack.peek().pendingJoins.add(new Join(prevCond.id, prevCond.label));
+    }
+    mergeBranchScopes(branchScopes, node);
+  }
+
+  /** 该 WHEN_ENTRY 是否为 `else ->` 兜底分支（以 else 关键字而非条件开头）。 */
+  private static boolean isElseEntry(SyntaxTree.Node entry) {
+    for (SyntaxTree.Node c : entry.children) {
+      if (c.kind == null || c.kind.isEmpty() || c.kind.equals("WHITE_SPACE")) continue;
+      return c.kind.equals("else");
+    }
+    return false;
+  }
+
+  /** WHEN_ENTRY 的守卫表达式子节点（`g1`/`is X`/`in a..b`；都在 ARROW 之前；else 无守卫）。 */
+  private static List<SyntaxTree.Node> whenGuards(SyntaxTree.Node entry) {
+    List<SyntaxTree.Node> guards = new ArrayList<>();
+    for (SyntaxTree.Node c : entry.children) {
+      if (c.kind == null || c.kind.isEmpty() || c.kind.equals("WHITE_SPACE")) continue;
+      if (c.kind.equals("else")) continue;
+      if (c.kind.equals("ARROW")) break; // 守卫条件都在 ARROW 之前
+      guards.add(c);
+    }
+    return guards;
+  }
+
+  /** WHEN_ENTRY 的分支体（ARROW 之后的块/表达式）。 */
+  private static SyntaxTree.Node whenBody(SyntaxTree.Node entry) {
+    SyntaxTree.Node body = null;
+    boolean afterArrow = false;
+    for (SyntaxTree.Node c : entry.children) {
+      if (c.kind == null || c.kind.isEmpty() || c.kind.equals("WHITE_SPACE")) continue;
+      if (c.kind.equals("ARROW")) { afterArrow = true; continue; }
+      if (afterArrow) body = c;
+    }
+    return body;
   }
 
 
