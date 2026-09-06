@@ -167,9 +167,16 @@ public final class GraphExtractor {
 
     List<Join> finish() {
       List<Join> ends = new ArrayList<>(pendingJoins);
-      EventRef last = lastEvent();
-      if (last != null) {
-        ends.add(new Join(last.id, last.label));
+      // 仅当还没有任何待合并末端时才把 lastEvent 当作末端：若本块以"尚未被后续事件消耗的
+      // 分支合并点(pendingJoin)"结束(即 fork 是本块最后一条语句)，这些 pendingJoin 才是本块
+      // 真正的续接末端；此时 lastEvent 往往是被 fork 后遗留的分叉条件自身，不应作为末端泄漏到
+      // 父块的下一个事件(否则有 else 兜底的 if 会额外连一条"条件→下一事件")。无 else 的 if
+      // 由 walkConditionChildren 的 cond-as-join 把条件也放入 pendingJoin，其 fall-through 不受影响。
+      if (ends.isEmpty()) {
+        EventRef last = lastEvent();
+        if (last != null) {
+          ends.add(new Join(last.id, last.label));
+        }
       }
       pendingJoins.clear();
       return ends;
@@ -1802,7 +1809,7 @@ public final class GraphExtractor {
   /** Look up a symbol's {@link SymbolInformation}. 局部符号（"local N"）每文件各自编号、跨文件
    *  会重号，须按 (文件相对路径, 符号) 区分；非局部符号全局唯一，直接按符号查。 */
   private SymbolInformation infoOf(String file, String symbol) {
-    if (ScipSymbols.isLocal(symbol)) return symbols.get(file + " " + symbol);
+    if (ScipSymbols.isLocal(symbol)) return symbols.get(file + "\u0000" + symbol);
     return symbols.get(symbol);
   }
 

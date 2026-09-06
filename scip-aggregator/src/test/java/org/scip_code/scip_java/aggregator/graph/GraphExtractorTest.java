@@ -771,6 +771,84 @@ class GraphExtractorTest {
   }
 
   @Test
+  void withElseIfLastStatementDoesNotLeakConditionToParentNext() {
+    // void m() { e0; if (c1) { a0; if (c2) { a1; } else { b1; } } else { d; } c; }
+    // 回归：有 else 兜底的 if(c2) 是 c1-then 块的最后一条语句。之前该块退出时把分叉条件 c2
+    // 也当作块末端泄漏到父块的下一个事件 c（即 okhttp #56(if responseBuilder==null) 泄漏到
+    // #81 requestBody 的问题）。有 else 的 if 分叉应受限：只连 then/else 分支，不再连
+    // "整个 if 之后的下一个事件"；只有无 else 的 if 才 fall-through 到下一事件。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+    mBody.children.add(node("IDENTIFIER", 12, ref("pkg/A#e0.", "IdentifierConstant", 12)));
+
+    // outer if(c1){ ... } else { d; }
+    SyntaxTree.Node c1 = node("IF", 13);
+    c1.children.add(node("IDENTIFIER", 14, ref("pkg/A#c1.", "IdentifierConstant", 14)));
+    SyntaxTree.Node c1Then = node("BLOCK", 15);
+    c1Then.children.add(node("IDENTIFIER", 16, ref("pkg/A#a0.", "IdentifierConstant", 16)));
+    // inner with-else if(c2){ a1; } else { b1; } — c1-then 块的最后一条语句
+    SyntaxTree.Node c2 = node("IF", 17);
+    c2.children.add(node("IDENTIFIER", 18, ref("pkg/A#c2.", "IdentifierConstant", 18)));
+    SyntaxTree.Node c2Then = node("BLOCK", 19);
+    c2Then.children.add(node("IDENTIFIER", 20, ref("pkg/A#a1.", "IdentifierConstant", 20)));
+    c2.children.add(c2Then);
+    SyntaxTree.Node c2Else = node("BLOCK", 21);
+    c2Else.children.add(node("IDENTIFIER", 22, ref("pkg/A#b1.", "IdentifierConstant", 22)));
+    c2.children.add(c2Else);
+    c1Then.children.add(c2);
+    c1.children.add(c1Then);
+    SyntaxTree.Node c1Else = node("BLOCK", 23);
+    c1Else.children.add(node("IDENTIFIER", 24, ref("pkg/A#d.", "IdentifierConstant", 24)));
+    c1.children.add(c1Else);
+    mBody.children.add(c1);
+
+    mBody.children.add(node("IDENTIFIER", 25, ref("pkg/A#c.", "IdentifierConstant", 25)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"e0.", "c1.", "a0.", "c2.", "a1.", "b1.", "d.", "c."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    java.util.function.BiPredicate<String, String> next =
+        (from, to) ->
+            edgesOf(sink, GraphModel.REL_NEXT).stream()
+                .anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+
+    String c1Cond = "test::Foo.java#13:0";
+    String c2Cond = "test::Foo.java#17:0";
+    String a0 = "test::Foo.java#16:0:FIELD";
+    String a1 = "test::Foo.java#20:0:FIELD";
+    String b1 = "test::Foo.java#22:0:FIELD";
+    String d = "test::Foo.java#24:0:FIELD";
+    String c = "test::Foo.java#25:0:FIELD";
+
+    // 有 else 的 if 分叉受限：条件只连 then/else 分支首事件。
+    assertTrue(next.test(c1Cond, a0), "outer then branch from condition (true path)");
+    assertTrue(next.test(c1Cond, d), "outer else branch from condition (false path)");
+    assertTrue(next.test(c2Cond, a1), "inner then branch from condition (true path)");
+    assertTrue(next.test(c2Cond, b1), "inner else branch from condition (false path)");
+    // 关键回归：有 else 的条件不泄漏到父块的下一个事件。
+    assertTrue(!next.test(c1Cond, c), "outer with-else condition must not leak to next event");
+    assertTrue(!next.test(c2Cond, c), "inner with-else condition must not leak to next event");
+    // 分支尾(真实末端)汇入下一个事件。
+    assertTrue(next.test(a1, c), "inner then tail merges at next event");
+    assertTrue(next.test(b1, c), "inner else tail merges at next event");
+    assertTrue(next.test(d, c), "outer else tail merges at next event");
+  }
+
+  @Test
   void orderChainDoesNotForkFromOneNodeAcrossSiblingBlocks() {
     // void m() { e0; {x} {y} {p} {q} c; }（4 个兄弟裸块——TRY/CATCH 现已是条件节点，这里用通用兄弟块回归）
     // 回归：兄弟嵌套块不能都从同一条链尾 e0 上各出 NEXT 分叉，而应按源序线性续接：e0→x→y→p→q→c，
