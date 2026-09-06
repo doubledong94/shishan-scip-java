@@ -610,23 +610,62 @@ public final class GraphExtractor {
     addCondNode(file, tryId, GraphModel.CONDITION_KIND_TRY, node);
     conds.push(tryId);
     try {
-      // TRY 入时序链：前一事件 → TRY（含把同语句延后写的 isUpgradeRequest 行号<43 的写冲刷进链）。
+      // TRY 入时序链：前一事件 → TRY。
       appendChainEvent(file, tryId, GraphModel.LABEL_CONDITION, rangeLine(node));
+      // 收集 try 体 / catch 链 / finally
+      SyntaxTree.Node tryBody = null;
+      List<SyntaxTree.Node> catchNodes = new ArrayList<>();
+      SyntaxTree.Node finNode = null;
       for (int i = 0; i < node.children.size(); i++) {
-        SyntaxTree.Node child = node.children.get(i);
-        if (child.kind == null || child.kind.isEmpty() || child.kind.equals("WHITE_SPACE")) continue;
-        if ("CATCH".equals(child.kind)) {
-          handleCatch(file, child, node, tryId);
-        } else if ("FINALLY".equals(child.kind)) {
-          String finId = runtimeId(project, file, child.range, null);
-          addCondNode(file, finId, GraphModel.CONDITION_KIND_FINALLY, child);
-          // FINALLY 入链(经 NEXT)；不建 SUB/ELSE——try/catch/finally 由 NEXT 连接。
-          appendChainEvent(file, finId, GraphModel.LABEL_CONDITION, rangeLine(child));
-          conds.push(finId);
-          try { walkBranchFrom(file, child, node, i, finId); } finally { conds.pop(); }
-        } else {
-          // try 体（通常为一块）从 TRY 锚定
-          walkBranchFrom(file, child, node, i, tryId);
+        SyntaxTree.Node c = node.children.get(i);
+        if (c.kind == null || c.kind.isEmpty() || c.kind.equals("WHITE_SPACE")) continue;
+        if ("CATCH".equals(c.kind)) catchNodes.add(c);
+        else if ("FINALLY".equals(c.kind)) finNode = c;
+        else tryBody = c;
+      }
+      // 1) try 体从 TRY 进入；其正常链尾留在父块 pendingJoins → 汇入 finally/next（正常完成）。
+      if (tryBody != null) {
+        walkBranchFrom(file, tryBody, node, node.children.indexOf(tryBody), tryId);
+      }
+      // try 体末端 = 父块当前 pendingJoins 的最后一条链尾，作为异常跳转源。
+      String exceptionSource = lastPendingJoinId();
+      // 2) 异常路径：try 体末 → CATCH1 → CATCH2 → …（else-if 式，未匹配才落到下一 catch）；每条 catch 体尾汇入父块 pendingJoins。
+      String prevCatch = null;
+      for (SyntaxTree.Node cat : catchNodes) {
+        String catchId = runtimeId(project, file, cat.range, null);
+        addCondNode(file, catchId, GraphModel.CONDITION_KIND_CATCH, cat);
+        conds.push(catchId);
+        try {
+          if (prevCatch == null) {
+            if (exceptionSource != null) {
+              writer.addEdge(GraphModel.REL_NEXT, GraphModel.LABEL_VALUE, exceptionSource, GraphModel.LABEL_CONDITION, catchId);
+            }
+          } else {
+            writer.addEdge(GraphModel.REL_NEXT, GraphModel.LABEL_CONDITION, prevCatch, GraphModel.LABEL_CONDITION, catchId);
+          }
+          // catch 体从 CATCH 锚定。只 walk 体块(BLOCK):异常参数若按顺序事件 walk 会 appendChainEvent
+          // 到父块、把 try 体末的 pendingJoin 合并点消费掉,破坏"try 体末→finally(正常)"与 catch 链。
+          for (SyntaxTree.Node cc : cat.children) {
+            if (cc.kind == null || cc.kind.isEmpty() || cc.kind.equals("WHITE_SPACE")) continue;
+            if ("BLOCK".equals(cc.kind)) {
+              walkBranchFrom(file, cc, cat, cat.children.indexOf(cc), catchId);
+            }
+          }
+          prevCatch = catchId;
+        } finally {
+          conds.pop();
+        }
+      }
+      // 3) finally：入链（从父块 pendingJoins 汇聚 try 正常尾 + 各 catch 体尾），作为公共汇合；finally 体末 → next。
+      if (finNode != null) {
+        String finId = runtimeId(project, file, finNode.range, null);
+        addCondNode(file, finId, GraphModel.CONDITION_KIND_FINALLY, finNode);
+        appendChainEvent(file, finId, GraphModel.LABEL_CONDITION, rangeLine(finNode));
+        conds.push(finId);
+        try {
+          walkBranchFrom(file, finNode, node, node.children.indexOf(finNode), finId);
+        } finally {
+          conds.pop();
         }
       }
     } finally {
@@ -634,24 +673,11 @@ public final class GraphExtractor {
     }
   }
 
-  /** 物化一个 kind=CATCH 条件节点；`TRY --ELSE--> CATCH`（SUB 到 TRY）；CATCH 入链（try 体末事件→CATCH→catch 体）。 */
-  private void handleCatch(String file, SyntaxTree.Node catchNode, SyntaxTree.Node parent, String tryId) {
-    String catchId = runtimeId(project, file, catchNode.range, null);
-    addCondNode(file, catchId, GraphModel.CONDITION_KIND_CATCH, catchNode);
-    // CATCH 入时序链：从 try 体末事件（同层 pendingJoin）经 NEXT 续接；不建 SUB/ELSE。
-    appendChainEvent(file, catchId, GraphModel.LABEL_CONDITION, rangeLine(catchNode));
-    conds.push(catchId);
-    try {
-      for (int i = 0; i < catchNode.children.size(); i++) {
-        SyntaxTree.Node c = catchNode.children.get(i);
-        if (c.kind == null || c.kind.isEmpty() || c.kind.equals("WHITE_SPACE")) continue;
-        // 异常参数等按普通节点 walk；catch 体块从 CATCH 锚定
-        if ("BLOCK".equals(c.kind)) walkBranchFrom(file, c, catchNode, i, catchId);
-        else walk(file, c, catchNode, i);
-      }
-    } finally {
-      conds.pop();
-    }
+  /** 当前块待合并末端(pendingJoins)的最后一条事件 id，用作 try 体异常跳转源；无则 null。 */
+  private String lastPendingJoinId() {
+    BlockBuilder b = blockStack.peek();
+    if (b == null || b.pendingJoins.isEmpty()) return null;
+    return b.pendingJoins.get(b.pendingJoins.size() - 1).id;
   }
 
   private void pushBranchScope() {

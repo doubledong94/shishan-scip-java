@@ -1543,6 +1543,74 @@ class GraphExtractorTest {
   }
 
   @Test
+  void tryCatchFinallyForkAtTryBodyEnd() {
+    // void m(){ e0; try { a; } catch(e){ b; } finally { f; } next; }
+    // TRY 入链;try 体末分叉恒 2——正常 → finally(公共汇合)、异常 → CATCH;
+    // catch 链 else-if 式、catch 体尾 → finally;finally → finally 体 → next。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 2, def("pkg/A#m().", "IdentifierFunctionDefinition", 2));
+    SyntaxTree.Node mBody = node("BLOCK", 3);
+    mBody.children.add(node("IDENTIFIER", 9, ref("pkg/A#e0.", "IdentifierConstant", 9)));
+
+    SyntaxTree.Node tryNode = node("TRY", 10);
+    SyntaxTree.Node tryBody = node("BLOCK", 11);
+    tryBody.children.add(node("IDENTIFIER", 12, ref("pkg/A#a.", "IdentifierConstant", 12)));
+    tryNode.children.add(tryBody);
+    SyntaxTree.Node catchNode = node("CATCH", 13);
+    catchNode.children.add(node("IDENTIFIER", 14, ref("pkg/A#e.", "IdentifierConstant", 14)));
+    SyntaxTree.Node catchBody = node("BLOCK", 15);
+    catchBody.children.add(node("IDENTIFIER", 16, ref("pkg/A#b.", "IdentifierConstant", 16)));
+    catchNode.children.add(catchBody);
+    tryNode.children.add(catchNode);
+    SyntaxTree.Node finNode = node("FINALLY", 17);
+    SyntaxTree.Node finBody = node("BLOCK", 18);
+    finBody.children.add(node("IDENTIFIER", 19, ref("pkg/A#f.", "IdentifierConstant", 19)));
+    finNode.children.add(finBody);
+    tryNode.children.add(finNode);
+    mBody.children.add(tryNode);
+    mBody.children.add(node("IDENTIFIER", 20, ref("pkg/A#next.", "IdentifierConstant", 20)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"e0.", "a.", "e.", "b.", "f.", "next."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.BiPredicate<String, String> next =
+        (from, to) -> nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+    String tryId = "test::Foo.java#10:0";
+    String catchId = "test::Foo.java#13:0";
+    String finId = "test::Foo.java#17:0";
+    String a = "test::Foo.java#12:0:FIELD";
+    String b = "test::Foo.java#16:0:FIELD";
+    String f = "test::Foo.java#19:0:FIELD";
+    String nextNode = "test::Foo.java#20:0:FIELD";
+    // 入口:前置 → TRY → try 体首。
+    assertTrue(next.test("test::Foo.java#9:0:FIELD", tryId), "e0 -> TRY");
+    assertTrue(next.test(tryId, a), "TRY -> try body first event");
+    // try 体末分叉恒 2:正常 → finally、异常 → CATCH。
+    assertTrue(next.test(a, finId), "try body end (normal) -> finally merge");
+    assertTrue(next.test(a, catchId), "try body end (exception) -> CATCH");
+    // catch 体、finally 体进入 & 汇合。
+    assertTrue(next.test(catchId, b), "CATCH -> catch body first event");
+    assertTrue(next.test(b, finId), "catch body end -> finally merge");
+    assertTrue(next.test(finId, f), "FINALLY -> finally body first event");
+    // finally 体末 → 下一事件;next 只由 finally 汇入。
+    assertTrue(next.test(f, nextNode), "finally body end -> next");
+  }
+
+  @Test
   void voidReturnCreatesReturnSlot() {
     // void m() { return; }  → a RETURN slot node exists (order chain has an explicit exit event)
     SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
