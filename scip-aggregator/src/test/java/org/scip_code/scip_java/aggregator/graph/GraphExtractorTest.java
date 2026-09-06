@@ -849,6 +849,78 @@ class GraphExtractorTest {
   }
 
   @Test
+  void ifConditionForksExactlyTwoNextEdges() {
+    // void m() { e0; if (c1) { a; } if (c2) { b; } else { d; } end; }
+    // 不变量：每个 if 条件节点的 NEXT 出边恒为 2（1 真 + 1 假），不多不少——
+    //   - 无 else：真→then 分支首，假→fall-through 到下一事件（否则只有 1 条=“少”，即缺假路径）；
+    //   - 有 else：真→then 分支首，假→else 分支首，分叉受限、不再多连下一事件/合并点
+    //              （否则 3 条=“多”）。
+    // 合并点（分支尾→下一事件）由分支尾承担，不占 if 条件自己的分叉。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+    mBody.children.add(node("IDENTIFIER", 12, ref("pkg/A#e0.", "IdentifierConstant", 12)));
+
+    // if (c1) { a; } —— 无 else
+    SyntaxTree.Node c1 = node("IF", 13);
+    c1.children.add(node("IDENTIFIER", 14, ref("pkg/A#c1.", "IdentifierConstant", 14)));
+    SyntaxTree.Node c1Then = node("BLOCK", 15);
+    c1Then.children.add(node("IDENTIFIER", 16, ref("pkg/A#a.", "IdentifierConstant", 16)));
+    c1.children.add(c1Then);
+    mBody.children.add(c1);
+
+    // if (c2) { b; } else { d; } —— 有 else
+    SyntaxTree.Node c2 = node("IF", 17);
+    c2.children.add(node("IDENTIFIER", 18, ref("pkg/A#c2.", "IdentifierConstant", 18)));
+    SyntaxTree.Node c2Then = node("BLOCK", 19);
+    c2Then.children.add(node("IDENTIFIER", 20, ref("pkg/A#b.", "IdentifierConstant", 20)));
+    c2.children.add(c2Then);
+    SyntaxTree.Node c2Else = node("BLOCK", 21);
+    c2Else.children.add(node("IDENTIFIER", 22, ref("pkg/A#d.", "IdentifierConstant", 22)));
+    c2.children.add(c2Else);
+    mBody.children.add(c2);
+
+    mBody.children.add(node("IDENTIFIER", 23, ref("pkg/A#end.", "IdentifierConstant", 23)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"e0.", "c1.", "a.", "c2.", "b.", "d.", "end."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.Function<String, Long> nextOutCount =
+        id -> nexts.stream().filter(e -> id.equals(e.get("_from"))).count();
+    java.util.function.BiPredicate<String, String> next =
+        (from, to) -> nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+
+    String c1id = "test::Foo.java#13:0";
+    String c2id = "test::Foo.java#17:0";
+    String a = "test::Foo.java#16:0:FIELD";
+    String b = "test::Foo.java#20:0:FIELD";
+    String d = "test::Foo.java#22:0:FIELD";
+    String end = "test::Foo.java#23:0:FIELD";
+    // 每个 if 条件节点恰好 2 条 NEXT 出边（1 真 + 1 假），不多不少。
+    assertEquals(2L, (long) nextOutCount.apply(c1id), "no-else if forks exactly 2 (then + fall-through)");
+    assertEquals(2L, (long) nextOutCount.apply(c2id), "with-else if forks exactly 2 (then + else, no more)");
+    // 方向语义：真→then 分支首；有 else 的假→else 分支首且不再多连下一事件。
+    assertTrue(next.test(c1id, a), "no-else true path -> then branch");
+    assertTrue(next.test(c2id, b), "with-else true path -> then branch");
+    assertTrue(next.test(c2id, d), "with-else false path -> else branch");
+    assertTrue(!next.test(c2id, end), "with-else must not also fork to the following event (no 3rd edge)");
+  }
+
+  @Test
   void orderChainDoesNotForkFromOneNodeAcrossSiblingBlocks() {
     // void m() { e0; {x} {y} {p} {q} c; }（4 个兄弟裸块——TRY/CATCH 现已是条件节点，这里用通用兄弟块回归）
     // 回归：兄弟嵌套块不能都从同一条链尾 e0 上各出 NEXT 分叉，而应按源序线性续接：e0→x→y→p→q→c，
