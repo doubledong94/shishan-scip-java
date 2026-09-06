@@ -758,16 +758,18 @@ class GraphExtractorTest {
     assertTrue(thenNEXT, "then edge entered via NEXT (condition true)");
     assertTrue(elseEntry, "else branch first node entered via NEXT from the condition");
 
-    // Cross-function: call enters callee's first event（现为 METHOD 根条件=方法入口）；void 方法退出流入 calledReturn。
+    // 跨函数：NEXT 只在单方法体内建立（不再有 calledMethod→callee 首事件 / callee 退出→calledReturn
+    // 这类跨函数 NEXT）。被调 foo 自己的链（Method 根→q）独立成立；调用方 m 的链在调用点后继续
+    // （calledReturn→y）。跨函数关联由 CALLS 等逻辑边表达，不再用 NEXT 串起来。
     String calledMethod = "test::Foo.java#20:0";
     String fooRoot = "test::Foo.java#2:0:root"; // callee foo 的 METHOD 根条件（顺序链首事件）
     String q = "test::Foo.java#5:0:FIELD";
     String calledReturn = "test::Foo.java#20:0:CALLED_RETURN";
     String y = "test::Foo.java#25:0:FIELD";
-    assertTrue(next.test(calledMethod, fooRoot), "call enters callee METHOD-root first event");
-    assertTrue(next.test(fooRoot, q), "callee body starts after METHOD root");
-    assertTrue(next.test(q, calledReturn), "callee fall-through exit flows to calledReturn");
-    assertTrue(next.test(calledReturn, y), "caller continues after the call");
+    assertTrue(!next.test(calledMethod, fooRoot), "no cross-function NEXT into callee METHOD-root");
+    assertTrue(next.test(fooRoot, q), "callee body starts after METHOD root (within callee)");
+    assertTrue(!next.test(q, calledReturn), "no cross-function NEXT from callee exit to calledReturn");
+    assertTrue(next.test(calledReturn, y), "caller continues after the call (within caller)");
   }
 
   @Test

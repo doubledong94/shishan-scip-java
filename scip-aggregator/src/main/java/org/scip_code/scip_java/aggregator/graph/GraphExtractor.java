@@ -465,33 +465,15 @@ public final class GraphExtractor {
   }
 
   /**
-   * Cross-function order (called at the end of {@link #emitRelationships()}): a call site enters
-   * the callee's first event, and the callee's exit events flow back into the caller's
-   * calledReturn — so order paths continue across function boundaries without dangling.
+   * Cross-function order (called at the end of {@link #emitRelationships()}).
+   *
+   * <p><b>不再建立跨函数的 NEXT 边</b>：NEXT(时序)只表达<b>单个方法体内</b>的事件先后。
+   * 跨函数关系由 {@code CALLS}/{@code RET_OF}/{@code ARG_OF} 等逻辑边表达，但不再用 NEXT 把
+   * 调用点接到被调方法首事件、或被调方法退出接到调用返回。这样 NEXT 从某方法 {@code ROOT} 条件
+   * 沿可达走时只会留在该函数体内，不会被 NEXT 漏进同文件/其他文件的方法——'按函数限域'才干净。
    */
   private void emitOrderRelationships() {
-    for (CallSite cs : callSites) {
-      if (!symbols.containsKey(cs.calleeSymbol)) continue;
-      java.util.List<EventRef> firsts = methodFirstEvents.get(cs.calleeSymbol);
-      if (firsts != null && !firsts.isEmpty()) {
-        EventRef f = firsts.get(0);
-        writer.addEdge(
-            GraphModel.REL_NEXT,
-            GraphModel.LABEL_CALLED_METHOD, cs.calledMethodId,
-            f.label, f.id);
-      }
-      java.util.List<EventRef> exits = methodExitEvents.get(cs.calleeSymbol);
-      if (exits != null) {
-        for (EventRef ex : exits) {
-          if (!ex.id.equals(cs.calledReturnId)) {
-            writer.addEdge(
-                GraphModel.REL_NEXT,
-                ex.label, ex.id,
-                GraphModel.LABEL_VALUE, cs.calledReturnId);
-          }
-        }
-      }
-    }
+    // intentionally no-op: cross-function NEXT is disabled (see method javadoc).
   }
 
   // ---------------------------------------------------------------------------
