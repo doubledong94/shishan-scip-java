@@ -921,6 +921,77 @@ class GraphExtractorTest {
   }
 
   @Test
+  void reassignmentWriteDefersPastWhenRhsSoBranchesMergeAtWrite() {
+    // fun m() { response = when { g1 -> { A } else -> { B } }; end; }
+    // `x = when{…}` 的写应延迟到整个 when RHS 求值完再入链(先读后写)：
+    // response 写(原 LHS 行)在 when 里各分支事件(更大行)之前就被创建，若不延迟会写成"先写后读"、
+    // 且分支尾无合并点。用赋值节点末行作冲排边界后，写接收 A 尾 + B 尾，再续到 end。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+
+    SyntaxTree.Node bin = node("BINARY_EXPRESSION", 12);
+    // 赋值节点 span 从 LHS 到 RHS(when)末行(16)，供"写"以语句末行为冲排边界。
+    bin.range = new ScipRange(12, 0, 16, 5);
+    SyntaxTree.Node lhs = node("REFERENCE_EXPRESSION", 12);
+    lhs.children.add(node("IDENTIFIER", 12, ref("pkg/A#response.", "IdentifierLocal", 12)));
+    bin.children.add(lhs);
+    SyntaxTree.Node opRef = node("OPERATION_REFERENCE", 12);
+    opRef.children.add(node("EQ", 12));
+    bin.children.add(opRef);
+
+    SyntaxTree.Node when = node("WHEN", 12);
+    SyntaxTree.Node entry1 = node("WHEN_ENTRY", 13);
+    SyntaxTree.Node guard = node("WHEN_CONDITION_WITH_EXPRESSION", 13);
+    guard.children.add(node("IDENTIFIER", 13, ref("pkg/A#g1.", "IdentifierConstant", 13)));
+    entry1.children.add(guard);
+    entry1.children.add(node("ARROW", 13));
+    SyntaxTree.Node aBlock = node("BLOCK", 14);
+    aBlock.children.add(node("IDENTIFIER", 14, ref("pkg/A#a.", "IdentifierConstant", 14)));
+    entry1.children.add(aBlock);
+    when.children.add(entry1);
+    SyntaxTree.Node entry2 = node("WHEN_ENTRY", 15);
+    entry2.children.add(node("else", 15));
+    entry2.children.add(node("ARROW", 15));
+    SyntaxTree.Node bBlock = node("BLOCK", 15);
+    bBlock.children.add(node("IDENTIFIER", 15, ref("pkg/A#b.", "IdentifierConstant", 15)));
+    entry2.children.add(bBlock);
+    when.children.add(entry2);
+    bin.children.add(when);
+    mBody.children.add(bin);
+    mBody.children.add(node("IDENTIFIER", 30, ref("pkg/A#end.", "IdentifierConstant", 30)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"response.", "g1.", "a.", "b.", "end."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.BiPredicate<String, String> next =
+        (from, to) -> nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+    String response = "test::Foo.java#12:0:LOCAL_VAR";
+    String A = "test::Foo.java#14:0:FIELD";
+    String B = "test::Foo.java#15:0:FIELD";
+    String end = "test::Foo.java#30:0:FIELD";
+    assertTrue(hasNode(sink, GraphModel.LABEL_VALUE, response), "reassignment write node exists");
+    // 写延迟到 when RHS 之后：A 尾 + B 尾汇入 response 写(合并点)，再续到 end(先读后写)。
+    assertTrue(next.test(A, response), "when true-branch tail merges at response write");
+    assertTrue(next.test(B, response), "when else-branch tail merges at response write");
+    assertTrue(next.test(response, end), "response write continues to next event (merge point in chain)");
+  }
+
+  @Test
   void whenExpressionForksLikeIfElseIf() {
     // fun m() { e0; when { g1 -> { A } else -> { B } }; end; }
     // when 恒 2：条件(守卫 g1)真→A 分支首、假→else B 分支首；守卫读 g1 在条件之前；A 尾 + B 尾汇入 end。

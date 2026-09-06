@@ -101,6 +101,10 @@ public final class GraphExtractor {
   private final Deque<Scope> scopeStack = new ArrayDeque<>();
   // Runtime ids that are assignment targets (writes).
   private final java.util.Set<String> writeRuntimeIds = new java.util.HashSet<>();
+  // 赋值/声明的"写"延迟到 RHS 求值后再入链：`x = <跨行 RHS>`(如 when/if 表达式)的写要等整个 RHS
+  // 求值完才能作为"写"入链，否则会把写排到 RHS 读之前(先写后读)。记录每个写对应的 flush 行 =
+  // 赋值语句末行，emitReferenceValues 用它冲排(缺省回退 LHS 行)。
+  private final java.util.Map<String, Integer> writeFlushLines = new java.util.HashMap<>();
 
   /** A data-flow scope: symbol → set of possible last-write runtime ids, plus reads with no source. */
   private static final class Scope {
@@ -230,6 +234,15 @@ public final class GraphExtractor {
     }
   }
   private void flushAllLocalWrites(String file) { flushLocalWrites(file, Integer.MAX_VALUE); }
+
+  /** 冲掉"写行 <= upto"的延迟写(含等号)：块退出时用块末行，使属于本块的写入链、跨多行 RHS 的写保留。 */
+  private void flushLocalWritesUpTo(String file, int upto) {
+    for (int i = 0; i < pendingLocalWrites.size(); ) {
+      LocalWrite w = pendingLocalWrites.get(i);
+      if (w.line <= upto) { pendingLocalWrites.remove(i); appendChainEvent(file, w.id, w.label, w.line); }
+      else i++;
+    }
+  }
 
   /** 入链一个运行时事件（带源行，供按行冲排延迟写）。 */
   private void appendChainEvent(String file, String id, String label, int line) {
@@ -983,7 +996,7 @@ public final class GraphExtractor {
       if (!methodSymbols.isEmpty()) methodSymbols.pop();
     }
     if (node.kind.equals("BLOCK")) {
-      exitBlock(file);
+      exitBlock(file, rangeEndLine(node));
     }
     // Invocation exit: commit this call's deferred chain events (args → calledMethod → calledReturn)
     // into the enclosing block, after the arg-internal reads that were chained during child walk.
@@ -999,8 +1012,10 @@ public final class GraphExtractor {
    * enclosing block's next event (via pendingJoin) — or, for the method body, become the method's
    * cross-function exit events.
    */
-  private void exitBlock(String file) {
-    flushAllLocalWrites(file); // 方法体/块结束前冲掉末尾遗留的延迟写
+  private void exitBlock(String file, int endLine) {
+    // 块结束前冲掉"属于本块"的遗留延迟写(写行 <= 块末行)。用块末行而非 MAX_INT，避免把跨行 RHS
+    // (如 `x = when{…}`)的写提前冲进分支子块——该写的冲排行在 RHS 末行，应等链推进到其后才入链。
+    flushLocalWritesUpTo(file, endLine);
     BlockBuilder b = blockStack.pop();
     List<Join> ends = b.finish();
     if (blockStack.isEmpty()) {
@@ -1155,7 +1170,7 @@ public final class GraphExtractor {
       props.put("kind", kind);
       props.put("access", isWrite ? "write" : "read");
       writer.addNode(GraphModel.LABEL_VALUE, id, props);
-      if (isWrite) pendingLocalWrites.add(new LocalWrite(rangeLine(occ), id, GraphModel.LABEL_VALUE));
+      if (isWrite) pendingLocalWrites.add(new LocalWrite(writeFlushLines.getOrDefault(id, rangeLine(occ)), id, GraphModel.LABEL_VALUE));
       else appendChainEvent(file, id, GraphModel.LABEL_VALUE, rangeLine(occ));
 
       if (isWrite) {
@@ -1232,6 +1247,9 @@ public final class GraphExtractor {
     }
 
     writeRuntimeIds.add(writeId);
+    // 写延迟到整个赋值语句(RHS 含多行表达式时)求值完再入链，保证 `x = when{…}` / `x = if(…)` 先读后写，
+    // 且分支尾能以该写为合并点。用赋值节点末行作冲排边界。
+    writeFlushLines.put(writeId, rangeEndLine(node));
     String rhsId = firstValueRuntimeId(file, rhs);
     if (rhsId != null && !rhsId.equals(writeId)) {
       writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, rhsId, GraphModel.LABEL_VALUE, writeId);
