@@ -1506,13 +1506,23 @@ public final class GraphExtractor {
 
   private static SyntaxTree.Node conditionExpression(SyntaxTree.Node node) {
     if (node.kind.equals("IF")) {
+      // Kotlin 的 if 子节点形如 [if][WHITE][LPAR][CONDITION][RPAR]...,条件是 CONDITION 子节点;
+      // 若按"首个非关键字子节点"会取到 LPAR,取不到守卫、CONTROLS 缺失(Java 的 IF 首子节点即条件)。
       for (SyntaxTree.Node child : node.children) {
-        if (!child.kind.equals("WHITE_SPACE")
-            && !child.kind.equals("THEN")
-            && !child.kind.equals("ELSE")
-            && !child.kind.equals("else")) {
-          return child;
+        if (child.kind.equals("CONDITION")) return child;
+      }
+      for (SyntaxTree.Node child : node.children) {
+        String k = child.kind;
+        if (k.equals("WHITE_SPACE")
+            || k.equals("THEN")
+            || k.equals("ELSE")
+            || k.equals("else")
+            || k.equals("IF_KEYWORD")
+            || k.equals("KEYWORD")
+            || k.equals("if")) {
+          continue;
         }
+        return child;
       }
       return null;
     }

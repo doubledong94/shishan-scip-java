@@ -1273,6 +1273,47 @@ class GraphExtractorTest {
   }
 
   @Test
+  void kotlinIfConditionProducesControls() {
+    // void m() { if (flag) { a; } else { b; } }
+    // Kotlin 的 if 表达式:IF 节点的首子节点是 `if` 关键字(IF_KEYWORD),条件表达式紧随其后。
+    // 回归:conditionExpression 若把关键字当条件表达式,取不到守卫、CONTROLS 边缺失(Java IF
+    // 首子节点即条件,不受影响)。应跳过 IF_KEYWORD 取 flag,生成 flag->IF。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+    SyntaxTree.Node iff = node("IF", 13);
+    iff.children.add(node("IF_KEYWORD", 13));
+    iff.children.add(node("IDENTIFIER", 14, ref("pkg/A#flag.", "IdentifierConstant", 14)));
+    SyntaxTree.Node thenB = node("BLOCK", 15);
+    thenB.children.add(node("IDENTIFIER", 16, ref("pkg/A#a.", "IdentifierConstant", 16)));
+    iff.children.add(thenB);
+    SyntaxTree.Node elseB = node("BLOCK", 17);
+    elseB.children.add(node("IDENTIFIER", 18, ref("pkg/A#b.", "IdentifierConstant", 18)));
+    iff.children.add(elseB);
+    mBody.children.add(iff);
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"flag.", "a.", "b."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    String flagId = "test::Foo.java#14:0:FIELD";
+    String ifCond = "test::Foo.java#13:0";
+    assertTrue(hasEdge(sink, GraphModel.REL_CONTROLS, flagId, ifCond), "CONTROLS from the condition value `flag` to the Kotlin IF");
+  }
+
+  @Test
   void orderChainDoesNotForkFromOneNodeAcrossSiblingBlocks() {
     // void m() { e0; {x} {y} {p} {q} c; }（4 个兄弟裸块——TRY/CATCH 现已是条件节点，这里用通用兄弟块回归）
     // 回归：兄弟嵌套块不能都从同一条链尾 e0 上各出 NEXT 分叉，而应按源序线性续接：e0→x→y→p→q→c，
