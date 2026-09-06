@@ -536,6 +536,12 @@ public final class GraphExtractor {
       // 保证该起点不被泄漏到下一分支 / 外层（与原来"分支后置空"等价，但各嵌套层独立）。
       while (pendingBranchStartFrom.size() > depthBefore) pendingBranchStartFrom.pop();
     }
+    // 单分支、无 else 的 if(非循环):条件为假时直落到整个 if 语句之后的下一个事件。
+    // 把条件自身作为同层 pendingJoin 交到父块,使下一事件同时从"条件(假路径,跳过分支)"与
+    // "分支末尾(真路径)"接入——否则该 if 只有一条"条件→分支首事件",缺了假路径的下一条。
+    if (!isLoopKind(node.kind) && branches.size() == 1 && condRef != null && !blockStack.isEmpty()) {
+      blockStack.peek().pendingJoins.add(new Join(condRef.id, condRef.label));
+    }
     mergeBranchScopes(branchScopes, node);
   }
 

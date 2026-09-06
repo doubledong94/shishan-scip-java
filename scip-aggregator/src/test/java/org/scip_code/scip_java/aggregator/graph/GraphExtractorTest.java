@@ -893,6 +893,48 @@ class GraphExtractorTest {
   }
 
   @Test
+  void singleBranchIfFallsThroughToNextEvent() {
+    // void m(){ if (x) { q; } r; }   —— 单分支、无 else 的 if
+    // 条件为假时应直落到 if 之后的下一个事件 r：ifCond --NEXT--> q(真) 且 ifCond --NEXT--> r(假)。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 2, def("pkg/A#m().", "IdentifierFunctionDefinition", 2));
+    SyntaxTree.Node mBody = node("BLOCK", 3);
+    SyntaxTree.Node ifNode = node("IF", 10);
+    ifNode.children.add(node("IDENTIFIER", 11, ref("pkg/A#x.", "IdentifierConstant", 11)));
+    SyntaxTree.Node thenB = node("BLOCK", 12);
+    thenB.children.add(node("IDENTIFIER", 13, ref("pkg/A#q.", "IdentifierConstant", 13)));
+    ifNode.children.add(thenB);
+    mBody.children.add(ifNode);
+    mBody.children.add(node("IDENTIFIER", 20, ref("pkg/A#r.", "IdentifierConstant", 20)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"x.", "q.", "r."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.BiPredicate<String, String> nextFrom = (from, to) ->
+        nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+    String ifCond = "test::Foo.java#10:0";
+    String q = "test::Foo.java#13:0:FIELD";
+    String r = "test::Foo.java#20:0:FIELD";
+    assertTrue(nextFrom.test(ifCond, q), "ifCond -> then-branch first event (true path)");
+    assertTrue(nextFrom.test(ifCond, r), "ifCond -> next event after the if (false-path fall-through)");
+    assertTrue(nextFrom.test(q, r), "then-branch end continues to the next event");
+  }
+
+  @Test
   void tryCatchBecomesConditionNodesLikeIfElse() {
     // void m(){ try { a; } catch (e) { b; } }
     // TRY 物化为 kind=TRY 条件节点、CATCH 物化为 kind=CATCH 条件节点，且 `TRY --ELSE--> CATCH`（SUB 到 TRY）。
