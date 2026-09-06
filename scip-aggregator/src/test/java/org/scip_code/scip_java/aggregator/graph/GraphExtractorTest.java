@@ -1065,6 +1065,214 @@ class GraphExtractorTest {
   }
 
   @Test
+  void whileLoopFormsNextCycleWithCondExit() {
+    // void m() { while (c) { body } next; }
+    // 循环条件恒 2 分叉：真→body 首事件；假→next(退出)。body 末端回边到条件，形成 NEXT 环；
+    // next 只从条件(假路径)汇入。守卫读 c → 条件。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+    SyntaxTree.Node wh = node("WHILE", 13);
+    wh.children.add(node("IDENTIFIER", 14, ref("pkg/A#c.", "IdentifierConstant", 14)));
+    SyntaxTree.Node bodyBlock = node("BLOCK", 15);
+    bodyBlock.children.add(node("IDENTIFIER", 16, ref("pkg/A#body.", "IdentifierConstant", 16)));
+    wh.children.add(bodyBlock);
+    mBody.children.add(wh);
+    mBody.children.add(node("IDENTIFIER", 17, ref("pkg/A#next.", "IdentifierConstant", 17)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"c.", "body.", "next."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.Function<String, Long> outCount =
+        id -> nexts.stream().filter(e -> id.equals(e.get("_from"))).count();
+    java.util.function.Function<String, Long> inCount =
+        id -> nexts.stream().filter(e -> id.equals(e.get("_to"))).count();
+    java.util.function.BiPredicate<String, String> next =
+        (from, to) -> nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+
+    String whId = "test::Foo.java#13:0";
+    String c = "test::Foo.java#14:0:FIELD";
+    String body = "test::Foo.java#16:0:FIELD";
+    String nextNode = "test::Foo.java#17:0:FIELD";
+    // 循环条件恒 2 分叉：真→body，假→next(退出)。
+    assertEquals(2L, (long) outCount.apply(whId), "loop condition forks exactly 2");
+    assertTrue(next.test(whId, body), "loop condition true path -> body first event");
+    assertTrue(next.test(whId, nextNode), "loop condition false path -> next (exit)");
+    // 守卫读 → 条件；body 末端回边到条件(形成 NEXT 环)。
+    assertTrue(next.test(c, whId), "guard read -> loop condition node");
+    assertTrue(next.test(body, c), "body last event loops back to the loop condition guard event");
+    // next 只从条件的假路径汇入(1 条)，因为 body 回环、不再线性续到 next。
+    assertEquals(1L, (long) inCount.apply(nextNode), "loop exit next joined only by the condition false path");
+  }
+
+  @Test
+  void forLoopFormsNextCycleWithCondExit() {
+    // void m() { for (c) { body } next; }
+    // for 的条件恒 2 分叉(真→body,假→next 退出),body 末端回边到条件(有 update 则应经 update,此处简化)。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+    SyntaxTree.Node fr = node("FOR", 13);
+    fr.children.add(node("IDENTIFIER", 14, ref("pkg/A#c.", "IdentifierConstant", 14)));
+    SyntaxTree.Node bodyBlock = node("BLOCK", 15);
+    bodyBlock.children.add(node("IDENTIFIER", 16, ref("pkg/A#body.", "IdentifierConstant", 16)));
+    fr.children.add(bodyBlock);
+    mBody.children.add(fr);
+    mBody.children.add(node("IDENTIFIER", 17, ref("pkg/A#next.", "IdentifierConstant", 17)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"c.", "body.", "next."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.Function<String, Long> outCount =
+        id -> nexts.stream().filter(e -> id.equals(e.get("_from"))).count();
+    java.util.function.BiPredicate<String, String> next =
+        (from, to) -> nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+
+    String frId = "test::Foo.java#13:0";
+    String body = "test::Foo.java#16:0:FIELD";
+    String c = "test::Foo.java#14:0:FIELD";
+    String nextNode = "test::Foo.java#17:0:FIELD";
+    assertEquals(2L, (long) outCount.apply(frId), "for-loop condition forks exactly 2");
+    assertTrue(next.test(frId, body), "for condition true -> body");
+    assertTrue(next.test(frId, nextNode), "for condition false -> next (exit)");
+    assertTrue(next.test(body, c), "for body last event loops back to the condition guard event");
+  }
+
+  @Test
+  void doWhileLoopFormsNextCycleWithCondExit() {
+    // void m() { do { body } while (c); next; }
+    // do-while:主体先执行、条件在末。条件恒 2 分叉(真→body，假→next 退出)；body 末端回边到条件。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+    SyntaxTree.Node dw = node("DO_WHILE", 13);
+    SyntaxTree.Node bodyBlock = node("BLOCK", 14);
+    bodyBlock.children.add(node("IDENTIFIER", 15, ref("pkg/A#body.", "IdentifierConstant", 15)));
+    dw.children.add(bodyBlock);
+    dw.children.add(node("IDENTIFIER", 16, ref("pkg/A#c.", "IdentifierConstant", 16)));
+    mBody.children.add(dw);
+    mBody.children.add(node("IDENTIFIER", 17, ref("pkg/A#next.", "IdentifierConstant", 17)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"body.", "c.", "next."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.Function<String, Long> outCount =
+        id -> nexts.stream().filter(e -> id.equals(e.get("_from"))).count();
+    java.util.function.BiPredicate<String, String> next =
+        (from, to) -> nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+
+    String dwId = "test::Foo.java#13:0";
+    String body = "test::Foo.java#15:0:FIELD";
+    String c = "test::Foo.java#16:0:FIELD";
+    String nextNode = "test::Foo.java#17:0:FIELD";
+    assertEquals(2L, (long) outCount.apply(dwId), "do-while condition forks exactly 2");
+    assertTrue(next.test(dwId, body), "do-while condition true -> body");
+    assertTrue(next.test(dwId, nextNode), "do-while condition false -> next (exit)");
+    assertTrue(next.test(body, c), "do-while body last event loops back to the condition guard event");
+  }
+
+  @Test
+  void whileLoopPredicateConditionControlsFromCallReturn() {
+    // void m() { while (shouldIgnore(code)) { body } next; }
+    // 回归：loop 条件是谓词调用 `shouldIgnore(code)` 时，守卫值是调用返回(CALLED_RETURN)，
+    // 而非实参读 `code`——CONTROLS 应从 CALLED_RETURN 指向 loop，回边(body 尾)也应指向 CALLED_RETURN。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+    SyntaxTree.Node wh = node("WHILE", 13);
+    SyntaxTree.Node call = node("CALL_EXPRESSION", 14);
+    call.children.add(node("OPERATION_REFERENCE", 15, ref("pkg/A#shouldIgnore().", "IdentifierFunction", 15)));
+    SyntaxTree.Node args = node("VALUE_ARGUMENT_LIST", 16);
+    SyntaxTree.Node va = node("VALUE_ARGUMENT", 17);
+    va.children.add(node("IDENTIFIER", 18, ref("pkg/A#code.", "IdentifierConstant", 18)));
+    args.children.add(va);
+    call.children.add(args);
+    wh.children.add(call);
+    SyntaxTree.Node bodyBlock = node("BLOCK", 19);
+    bodyBlock.children.add(node("IDENTIFIER", 20, ref("pkg/A#body.", "IdentifierConstant", 20)));
+    wh.children.add(bodyBlock);
+    mBody.children.add(wh);
+    mBody.children.add(node("IDENTIFIER", 21, ref("pkg/A#next.", "IdentifierConstant", 21)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    symbols.put("pkg/A#shouldIgnore().", info(SymbolInformation.Kind.Method, "shouldIgnore"));
+    for (String f : new String[] {"code.", "body.", "next."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.BiPredicate<String, String> next =
+        (from, to) -> nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+
+    String loopId = "test::Foo.java#13:0";
+    String callReturnId = "test::Foo.java#14:0:CALLED_RETURN";
+    String codeId = "test::Foo.java#18:0:FIELD";
+    String body = "test::Foo.java#20:0:FIELD";
+    String nextNode = "test::Foo.java#21:0:FIELD";
+    // 守卫值 = 谓词调用返回，非实参读 code。
+    assertTrue(hasEdge(sink, GraphModel.REL_CONTROLS, callReturnId, loopId), "CONTROLS from the predicate CALLED_RETURN");
+    assertTrue(!hasEdge(sink, GraphModel.REL_CONTROLS, codeId, loopId), "CONTROLS must NOT come from the argument read `code`");
+    // 回边指向条件句首事件(第一个值读 code)，而非 CALLED_RETURN 或 LOOP 节点。
+    assertTrue(next.test(body, codeId), "body last event loops back to the condition's first event (arg read `code`)");
+    // loop 恒 2：真→body，假→next(退出)。
+    assertTrue(next.test(loopId, body), "loop condition true -> body");
+    assertTrue(next.test(loopId, nextNode), "loop condition false -> next (exit)");
+  }
+
+  @Test
   void orderChainDoesNotForkFromOneNodeAcrossSiblingBlocks() {
     // void m() { e0; {x} {y} {p} {q} c; }（4 个兄弟裸块——TRY/CATCH 现已是条件节点，这里用通用兄弟块回归）
     // 回归：兄弟嵌套块不能都从同一条链尾 e0 上各出 NEXT 分叉，而应按源序线性续接：e0→x→y→p→q→c，

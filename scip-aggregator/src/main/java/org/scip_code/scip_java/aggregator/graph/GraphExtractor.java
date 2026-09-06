@@ -543,6 +543,26 @@ public final class GraphExtractor {
       // 保证该起点不被泄漏到下一分支 / 外层（与原来"分支后置空"等价，但各嵌套层独立）。
       while (pendingBranchStartFrom.size() > depthBefore) pendingBranchStartFrom.pop();
     }
+    // 循环(while/for/do-while):条件恒 2 分叉——真路径→循环体首事件，假路径→退出(本块下一事件)。
+    // 与 if 不同，循环体末端不"汇合到 next"，而是**回边到条件**，形成 NEXT 环(重复执行)；
+    // 退出只能由条件变假，故 next 只从条件(假路径)汇入。为此：把 body 分支的末端(exitBlock 已放入
+    // 本块 pendingJoins)定向为回边到条件，而不再线性续到 next；随后把条件自身放入 pendingJoins，
+    // 使本块下一个事件从条件(退出=假路径)接入。
+    if (isLoopKind(node.kind) && condRef != null && !blockStack.isEmpty()) {
+      BlockBuilder parent = blockStack.peek();
+      // 回边指向"条件句首事件/守卫事件"(谓词调用→其 CALLED_RETURN，否则条件首值读)，而非 LOOP 标记节点，
+      // 使循环再次执行时从条件求值进入。
+      String loopEventId = loopConditionEventId(file, node);
+      for (Join j : parent.pendingJoins) {
+        if (loopEventId != null) {
+          writer.addEdge(GraphModel.REL_NEXT, j.label, j.id, GraphModel.LABEL_VALUE, loopEventId);
+        } else {
+          writer.addEdge(GraphModel.REL_NEXT, j.label, j.id, condRef.label, condRef.id);
+        }
+      }
+      parent.pendingJoins.clear();
+      parent.pendingJoins.add(new Join(condRef.id, condRef.label));
+    }
     // 单分支、无 else 的 if(非循环):条件为假时直落到整个 if 语句之后的下一个事件。
     // 把条件自身作为同层 pendingJoin 交到父块,使下一事件同时从"条件(假路径,跳过分支)"与
     // "分支末尾(真路径)"接入——否则该 if 只有一条"条件→分支首事件",缺了假路径的下一条。
@@ -1450,8 +1470,38 @@ public final class GraphExtractor {
   private List<String> conditionValueIds(String file, SyntaxTree.Node node) {
     SyntaxTree.Node expr = conditionExpression(node);
     List<String> out = new ArrayList<>();
-    if (expr != null) collectValueIds(file, expr, out);
+    if (expr == null) return out;
+    // 守卫是谓词调用时(如 `while (f(x))`、`if (f(x))`)，守卫值是其返回(CALLED_RETURN)，而非实参读 `x`。
+    // 条件表达式可能被包装(非直接调用节点)，故递归找其中首个调用。
+    SyntaxTree.Node call = findConditionCall(expr);
+    if (call != null) {
+      out.add(runtimeId(project, file, call.range, GraphModel.VALUE_KIND_CALLED_RETURN));
+      return out;
+    }
+    collectValueIds(file, expr, out);
     return out;
+  }
+
+  /** 条件表达式内首个谓词调用节点(守卫)，无则 null。 */
+  private static SyntaxTree.Node findConditionCall(SyntaxTree.Node expr) {
+    if (expr == null) return null;
+    if (isInvocationKind(expr.kind)) return expr;
+    for (SyntaxTree.Node child : expr.children) {
+      SyntaxTree.Node r = findConditionCall(child);
+      if (r != null) return r;
+    }
+    return null;
+  }
+
+  /** 循环条件的"首事件"id=条件表达式**首个值读**(实参/左值,如 `while(f(code))` 的 `code`)。
+   *  loop 回边应指向它(循环再次执行从条件求值的第一步进入),而非 CALLED_RETURN(末事件)或 LOOP 标记节点。
+   *  注意:CONTROLS 的守卫仍取自谓词调用的 CALLED_RETURN(见 conditionValueIds),两者不同目标。 */
+  private String loopConditionEventId(String file, SyntaxTree.Node node) {
+    SyntaxTree.Node expr = conditionExpression(node);
+    if (expr == null) return null;
+    List<String> ids = new ArrayList<>();
+    collectValueIds(file, expr, ids);
+    return ids.isEmpty() ? null : ids.get(0);
   }
 
   private static SyntaxTree.Node conditionExpression(SyntaxTree.Node node) {
@@ -1465,6 +1515,11 @@ public final class GraphExtractor {
         }
       }
       return null;
+    }
+    // do { body } while (cond):条件在末(体在前)。
+    if (node.kind.equals("DO_WHILE")) {
+      List<SyntaxTree.Node> kids = nonWhitespaceChildren(node);
+      return kids.isEmpty() ? null : kids.get(kids.size() - 1);
     }
     // Loops: javac first child; Kotlin the CONDITION child.
     for (SyntaxTree.Node child : node.children) {
@@ -1620,6 +1675,13 @@ public final class GraphExtractor {
       for (SyntaxTree.Node k : kids) {
         if (k.kind.equals("WHEN_ENTRY")) out.add(k);
       }
+    } else if (node.kind.equals("DO_WHILE")) {
+      // do { body } while (cond):body 先执行、条件在末，故主体是 do 体(通常为 BLOCK)，不能像 while/for 那样
+      // 取"最后一个孩子"(那是条件)。取主体块；若主体是单语句(非块)则回退到倒数第二个孩子。
+      for (SyntaxTree.Node k : kids) {
+        if (k.kind.equals("BLOCK")) out.add(k);
+      }
+      if (out.isEmpty() && kids.size() >= 2) out.add(kids.get(kids.size() - 2));
     } else {
       if (!kids.isEmpty()) out.add(kids.get(kids.size() - 1));
     }
