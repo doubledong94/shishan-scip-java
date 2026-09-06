@@ -624,12 +624,13 @@ public final class GraphExtractor {
         else tryBody = c;
       }
       // 1) try 体从 TRY 进入；其正常链尾留在父块 pendingJoins → 汇入 finally/next（正常完成）。
+      //    注意：try 体以嵌套 if/循环结尾时，其末端 = 嵌套分支尾巴（finish() 已去掉条件锚点），
+      //    与"if 块最后一条语句是 if"同理，天然正确。
       if (tryBody != null) {
         walkBranchFrom(file, tryBody, node, node.children.indexOf(tryBody), tryId);
       }
-      // try 体末端 = 父块当前 pendingJoins 的最后一条链尾，作为异常跳转源。
-      String exceptionSource = lastPendingJoinId();
-      // 2) 异常路径：try 体末 → CATCH1 → CATCH2 → …（else-if 式，未匹配才落到下一 catch）；每条 catch 体尾汇入父块 pendingJoins。
+      // 2) 异常路径：TRY → CATCH1 → CATCH2 → …（else-if 式，未匹配才落到下一 catch）；每条 catch 体尾汇入父块 pendingJoins。
+      //    异常边从 TRY 直接连 CATCH，不依赖"try 体末事件"定位（避免嵌套结尾时抓错节点）。
       String prevCatch = null;
       for (SyntaxTree.Node cat : catchNodes) {
         String catchId = runtimeId(project, file, cat.range, null);
@@ -637,9 +638,7 @@ public final class GraphExtractor {
         conds.push(catchId);
         try {
           if (prevCatch == null) {
-            if (exceptionSource != null) {
-              writer.addEdge(GraphModel.REL_NEXT, GraphModel.LABEL_VALUE, exceptionSource, GraphModel.LABEL_CONDITION, catchId);
-            }
+            writer.addEdge(GraphModel.REL_NEXT, GraphModel.LABEL_CONDITION, tryId, GraphModel.LABEL_CONDITION, catchId);
           } else {
             writer.addEdge(GraphModel.REL_NEXT, GraphModel.LABEL_CONDITION, prevCatch, GraphModel.LABEL_CONDITION, catchId);
           }
@@ -673,12 +672,6 @@ public final class GraphExtractor {
     }
   }
 
-  /** 当前块待合并末端(pendingJoins)的最后一条事件 id，用作 try 体异常跳转源；无则 null。 */
-  private String lastPendingJoinId() {
-    BlockBuilder b = blockStack.peek();
-    if (b == null || b.pendingJoins.isEmpty()) return null;
-    return b.pendingJoins.get(b.pendingJoins.size() - 1).id;
-  }
 
   private void pushBranchScope() {
     Scope parent = currentScope();

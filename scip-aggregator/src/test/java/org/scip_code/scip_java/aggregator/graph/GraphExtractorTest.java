@@ -1599,9 +1599,9 @@ class GraphExtractorTest {
     // 入口:前置 → TRY → try 体首。
     assertTrue(next.test("test::Foo.java#9:0:FIELD", tryId), "e0 -> TRY");
     assertTrue(next.test(tryId, a), "TRY -> try body first event");
-    // try 体末分叉恒 2:正常 → finally、异常 → CATCH。
+    // try 体末分叉恒 2:正常 → finally、异常 → CATCH(异常边从 TRY 直连,不依赖 try 体末定位)。
     assertTrue(next.test(a, finId), "try body end (normal) -> finally merge");
-    assertTrue(next.test(a, catchId), "try body end (exception) -> CATCH");
+    assertTrue(next.test(tryId, catchId), "TRY -> CATCH (exception path)");
     // catch 体、finally 体进入 & 汇合。
     assertTrue(next.test(catchId, b), "CATCH -> catch body first event");
     assertTrue(next.test(b, finId), "catch body end -> finally merge");
