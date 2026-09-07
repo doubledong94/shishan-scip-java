@@ -636,7 +636,25 @@ public final class GraphExtractor {
   }
 
   private SyntaxTree.OccurrenceData catchTypeOccurrence(SyntaxTree.Node cat) {
-    return findTypeOccurrence(cat);
+    SyntaxTree.OccurrenceData occ = findTypeOccurrence(cat);
+    if (occ != null) return occ;
+    // 回退：catch 头(排除体块)里第一个非 local 的 role0 occurrence（就是异常类型，如 IOException）。
+    return findNonLocalOccurrence(cat);
+  }
+
+  private SyntaxTree.OccurrenceData findNonLocalOccurrence(SyntaxTree.Node n) {
+    for (SyntaxTree.OccurrenceData occ : n.occurrences) {
+      if (occ.role == 0 && occ.symbol != null && !occ.symbol.isEmpty()
+          && !ScipSymbols.isLocal(occ.symbol)) {
+        return occ;
+      }
+    }
+    for (SyntaxTree.Node c : n.children) {
+      if (c.kind == null || c.kind.isEmpty() || c.kind.equals("WHITE_SPACE") || c.kind.equals("BLOCK")) continue;
+      SyntaxTree.OccurrenceData r = findNonLocalOccurrence(c);
+      if (r != null) return r;
+    }
+    return null;
   }
 
   /** 递归在 catch 头(排除体块)里找类型引用 occurrence（异常类型名）。大小写不敏感匹配 Type/TYPE。 */
