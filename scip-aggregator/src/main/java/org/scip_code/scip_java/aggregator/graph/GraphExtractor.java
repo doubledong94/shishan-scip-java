@@ -192,7 +192,12 @@ public final class GraphExtractor {
       if (ends.isEmpty()) {
         EventRef last = lastEvent();
         if (last != null) {
-          ends.add(new Join(last.id, last.label));
+          // 条件是块末(如无 else if 的 fall-through 终端)时，其续接父块下一事件的边即假路径
+          // (条件不真、跳过分支才走到父块下一个事件)，标 branch="false"。
+          ends.add(
+              GraphModel.LABEL_CONDITION.equals(last.label)
+                  ? new Join(last.id, last.label, Map.of("branch", "false"))
+                  : new Join(last.id, last.label));
         }
       }
       pendingJoins.clear();
@@ -784,7 +789,9 @@ public final class GraphExtractor {
           }
         }
         if (prevCond != null) {
-          writer.addEdge(GraphModel.REL_NEXT, prevCond.label, prevCond.id, GraphModel.LABEL_CONDITION, condId);
+          // 前一守卫未匹配(假)才落到下一个守卫，此链边标 branch="false"。
+          writer.addEdge(GraphModel.REL_NEXT, prevCond.label, prevCond.id, GraphModel.LABEL_CONDITION, condId,
+              Map.of("branch", "false"));
         }
         prevCond = new EventRef(condId, GraphModel.LABEL_CONDITION);
       } finally {
