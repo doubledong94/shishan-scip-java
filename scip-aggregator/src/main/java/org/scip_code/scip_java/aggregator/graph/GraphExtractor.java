@@ -888,7 +888,7 @@ public final class GraphExtractor {
     }
 
     SyntaxTree.OccurrenceData def = definition(node);
-    if (def != null) createDeclaration(file, node, def);
+    if (def != null) createDeclaration(file, node, def, parent);
 
     if (isAssignment(node)) {
       handleAssignment(file, node);
@@ -1062,7 +1062,8 @@ public final class GraphExtractor {
     conds.push(rootCond);
   }
 
-  private void createDeclaration(String file, SyntaxTree.Node node, SyntaxTree.OccurrenceData def) {
+  private void createDeclaration(
+      String file, SyntaxTree.Node node, SyntaxTree.OccurrenceData def, SyntaxTree.Node parent) {
     String symbol = def.symbol;
     if (symbol.isEmpty()) return;
     String syntaxKind = def.syntaxKind;
@@ -1116,7 +1117,11 @@ public final class GraphExtractor {
         writer.addNode(label, localId, props);
         // 写节点延迟到 RHS 读之后再入链，保证 `val x = rhs` 先读后写。用**语句末行**作冲排边界：
         // 跨行赋值的 RHS 读在更大的行上，若按 LHS 行冲排会在第一个 RHS 读前就把写挤出(写成"先写后读")。
-        pendingLocalWrites.add(new LocalWrite(rangeEndLine(node), localId, GraphModel.LABEL_VALUE));
+        // 写延迟到整个声明语句(含多行 RHS)求值完再入链，保证 `val x = <跨行 RHS>` 先读后写。
+        // Kotlin 的 LHS def 挂在 IDENTIFIER 上(行号仅到 LHS)，RHS 是其兄弟——取声明节点(父)末行；
+        // javac 的 def 在声明节点(如 VARIABLE)上、自身已含 initializer，用 node 末行即可。
+        pendingLocalWrites.add(
+            new LocalWrite(declarationEndLine(node, parent), localId, GraphModel.LABEL_VALUE));
         return;
       }
     } else {
@@ -2061,6 +2066,28 @@ public final class GraphExtractor {
 
   private static int rangeEndLine(SyntaxTree.Node node) {
     return node.range == null ? 0 : node.range.endLine();
+  }
+
+  /** 声明语句的末行：javac 的 def 挂在声明节点(如 VARIABLE，自身已含 initializer)上，用 node 末行；
+   *  Kotlin 的 def 挂在 LHS IDENTIFIER 上(行号仅到 LHS)，RHS 是其兄弟——取父(声明)节点末行。
+   *  父若是块体(非声明容器)则退回 node，避免把写推迟到块末。 */
+  private static int declarationEndLine(SyntaxTree.Node node, SyntaxTree.Node parent) {
+    int end = rangeEndLine(node);
+    if (parent != null && parent.range != null && !isBlockBodyKind(parent.kind)) {
+      int pe = rangeEndLine(parent);
+      if (pe > end) end = pe;
+    }
+    return end;
+  }
+
+  private static boolean isBlockBodyKind(String kind) {
+    return kind.equals("BLOCK")
+        || kind.equals("CLASS_BODY")
+        || kind.equals("BODY")
+        || kind.equals("FILE")
+        || kind.equals("COMPILATION_UNIT")
+        || kind.equals("METHOD")
+        || kind.equals("FUN");
   }
 
   private static int rangeCol(SyntaxTree.OccurrenceData occ) {
