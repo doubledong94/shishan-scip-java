@@ -148,14 +148,21 @@ public final class GraphExtractor {
     }
   }
 
-  /** A runtime event in an order chain, with its node label. */
+  /** A runtime event in an order chain, with its node label, plus optional entry-edge props
+   *  (e.g. {@code branch:"true"/"false"} for if/when 分支入口，{@code exception:<全名>} for catch 入口)。 */
   private static final class EventRef {
     final String id;
     final String label;
+    final Map<String, Object> props;
 
     EventRef(String id, String label) {
+      this(id, label, null);
+    }
+
+    EventRef(String id, String label, Map<String, Object> props) {
       this.id = id;
       this.label = label;
+      this.props = props;
     }
   }
 
@@ -273,7 +280,8 @@ public final class GraphExtractor {
     } else if (b.startFrom != null) {
       // 分支块首事件都从条件经 NEXT(顺序/时机)进入——then 从 IF、else 从 ELSE节点。
       // 这样两条分支的首事件都挂在顺序链上；ELSE 边只作"条件 --ELSE--> else节点"的逻辑标记。
-      writer.addEdge(GraphModel.REL_NEXT, b.startFrom.label, b.startFrom.id, label, id);
+      // 分支入口边带 startFrom 的 props，如 if 的 branch=true/false、catch 的 exception=<全名>。
+      writer.addEdge(GraphModel.REL_NEXT, b.startFrom.label, b.startFrom.id, label, id, b.startFrom.props);
       b.startFrom = null;
     }
     b.events.add(new EventRef(id, label));
@@ -534,7 +542,11 @@ public final class GraphExtractor {
       // 每条分支(then/else/else-if)首事件都从条件经 NEXT 进入；else 不再物化 kind=ELSE 节点。
       // 分支块首事件经 enterBlock 消费 startFrom；else-if(IF 节点)走其自身 walk，守卫值先入链。
       int depthBefore = pendingBranchStartFrom.size();
-      pendingBranchStartFrom.push(condRef);
+      // 分支入口边带 branch 属性：if 分支0=then(true)、分支1=else(false)；循环体进入=条件为真(true)。
+      pendingBranchStartFrom.push(
+          condRef != null
+              ? new EventRef(condRef.id, condRef.label, branchEntryProps(node, i))
+              : null);
       pushBranchScope();
       walk(file, branches.get(i), node, children.indexOf(branches.get(i)));
       branchScopes.add(scopeStack.pop());
@@ -575,6 +587,15 @@ public final class GraphExtractor {
   // try / catch / finally → 与 if/else 类似的 Condition 节点
   // ---------------------------------------------------------------------------
 
+  /** 分支入口边带的属性：if 分支0=真路径(true)、分支1=假路径(false)；loop 进入体=条件为真(true)。 */
+  private Map<String, Object> branchEntryProps(SyntaxTree.Node node, int branchIndex) {
+    if (node.kind.equals("IF")) {
+      return Map.of("branch", branchIndex == 0 ? "true" : "false");
+    }
+    if (isLoopKind(node.kind)) return Map.of("branch", "true");
+    return null;
+  }
+
   /** 建一个 Condition 节点（kind 为该条件种类）。 */
   private void addCondNode(String file, String id, String kind, SyntaxTree.Node node) {
     Map<String, Object> props = new LinkedHashMap<>();
@@ -588,21 +609,57 @@ public final class GraphExtractor {
 
   /** 以给定条件为分支起点 walk 一个子节点（若为块则其首事件从该条件锚定），并恢复 pendingBranchStartFrom 栈深。 */
   private void walkBranchFrom(String file, SyntaxTree.Node child, SyntaxTree.Node parent, int index, String condId) {
+    walkBranchFrom(file, child, parent, index, condId, null);
+  }
+
+  /** 同 {@link #walkBranchFrom}，但分支入口 NEXT 边带 entryProps（如 if 的 branch、catch 的 exception）。 */
+  private void walkBranchFrom(
+      String file, SyntaxTree.Node child, SyntaxTree.Node parent, int index, String condId,
+      Map<String, Object> entryProps) {
     int depth = pendingBranchStartFrom.size();
-    pendingBranchStartFrom.push(new EventRef(condId, GraphModel.LABEL_CONDITION));
+    pendingBranchStartFrom.push(new EventRef(condId, GraphModel.LABEL_CONDITION, entryProps));
     walk(file, child, parent, index);
     while (pendingBranchStartFrom.size() > depth) pendingBranchStartFrom.pop();
   }
 
+  /** 提取 catch 子句异常类型的**全限定名**（取自 catch 头部的类型 occurrence 符号，如 {@code java/io/IOException#} → {@code java.io.IOException}）。 */
+  private String catchExceptionType(String file, SyntaxTree.Node cat) {
+    SyntaxTree.OccurrenceData occ = catchTypeOccurrence(cat);
+    if (occ == null) return null;
+    // SCIP 类符号形如 <modpath>Path/Name#：取 # 前、去掉空格分隔的模块/工具前缀，把 / 换成 . 得全限定名。
+    String symbol = occ.symbol;
+    int hash = symbol.lastIndexOf('#');
+    String path = hash >= 0 ? symbol.substring(0, hash) : symbol;
+    int sp = path.lastIndexOf(' ');
+    if (sp >= 0) path = path.substring(sp + 1);
+    return path.replace('/', '.');
+  }
+
+  private SyntaxTree.OccurrenceData catchTypeOccurrence(SyntaxTree.Node cat) {
+    return findTypeOccurrence(cat);
+  }
+
+  /** 递归在 catch 头(排除体块)里找类型引用 occurrence（异常类型名）。大小写不敏感匹配 Type/TYPE。 */
+  private SyntaxTree.OccurrenceData findTypeOccurrence(SyntaxTree.Node n) {
+    for (SyntaxTree.OccurrenceData occ : n.occurrences) {
+      if (occ.syntaxKind != null && occ.syntaxKind.toUpperCase().contains("TYPE")) return occ;
+    }
+    for (SyntaxTree.Node c : n.children) {
+      if (c.kind == null || c.kind.isEmpty() || c.kind.equals("WHITE_SPACE") || c.kind.equals("BLOCK")) continue;
+      SyntaxTree.OccurrenceData r = findTypeOccurrence(c);
+      if (r != null) return r;
+    }
+    return null;
+  }
+
   /**
-   * try/catch/finally 物化为 Condition 节点（与 if/else 类似，供图上/search 呈现异常处理结构）：
+   * try/catch/finally（与 if/else 类似，供图上/search 呈现异常处理结构）：
    * <ul>
-   *   <li>TRY 自身为 kind=TRY 条件节点（SUB 挂外层），try 体从它锚定；
-   *   <li>每个 CATCH 物化为 kind=CATCH 节点，`TRY --ELSE--> CATCH`（SUB 到 TRY），catch 体从 CATCH 锚定，
-   *       异常参数照常 walk；
-   *   <li>FINALLY 物化为 kind=FINALLY 节点，从 TRY 经 ELSE（SUB 到 TRY）。
+   *   <li>TRY 自身为 kind=TRY 条件节点，try 体从它锚定（正常完成 → finally/next）；
+   *   <li>每个 catch 体**从 TRY 直接经 NEXT 扇出进入**，且该 NEXT 边带
+   *       {@code exception=<异常类型全名>} 属性——不再物化 kind=CATCH 节点、无 ELSE 边；
+   *   <li>FINALLY 仍为 kind=FINALLY 公共汇合节点，try 正常尾 + 各 catch 体尾汇入它，finally 体末 → next。
    * </ul>
-   * 体内语句/调用/嵌套条件照常 walk 生成节点。
    */
   private void handleTryCatch(String file, SyntaxTree.Node node, SyntaxTree.Node parent, int index) {
     String tryId = runtimeId(project, file, node.range, null);
@@ -628,30 +685,19 @@ public final class GraphExtractor {
       if (tryBody != null) {
         walkBranchFrom(file, tryBody, node, node.children.indexOf(tryBody), tryId);
       }
-      // 2) 异常路径：TRY → CATCH1 → CATCH2 → …（else-if 式，未匹配才落到下一 catch）；每条 catch 体尾汇入父块 pendingJoins。
-      //    异常边从 TRY 直接连 CATCH，不依赖"try 体末事件"定位（避免嵌套结尾时抓错节点）。
-      String prevCatch = null;
+      // 2) 异常路径：不再物化 kind=CATCH 条件节点/ELSE 边。每个 catch 体从 TRY 直接经 NEXT 扇出进入，
+      //    且该 NEXT 边带 exception=<异常类型全名> 属性（区分是哪种异常被抓）。catch 体尾汇入父块 pendingJoins。
       for (SyntaxTree.Node cat : catchNodes) {
-        String catchId = runtimeId(project, file, cat.range, null);
-        addCondNode(file, catchId, GraphModel.CONDITION_KIND_CATCH, cat);
-        conds.push(catchId);
-        try {
-          if (prevCatch == null) {
-            writer.addEdge(GraphModel.REL_NEXT, GraphModel.LABEL_CONDITION, tryId, GraphModel.LABEL_CONDITION, catchId);
-          } else {
-            writer.addEdge(GraphModel.REL_NEXT, GraphModel.LABEL_CONDITION, prevCatch, GraphModel.LABEL_CONDITION, catchId);
+        String exceptionType = catchExceptionType(file, cat);
+        Map<String, Object> entryProps =
+            exceptionType != null ? Map.of("exception", exceptionType) : null;
+        // catch 体从 TRY 锚定（走 startFrom 边，带 exception 属性）。只 walk 体块(BLOCK)：
+        // 异常参数若按顺序事件 walk 会 appendChainEvent 到父块、把 try 体末的 pendingJoin 合并点消费掉。
+        for (SyntaxTree.Node cc : cat.children) {
+          if (cc.kind == null || cc.kind.isEmpty() || cc.kind.equals("WHITE_SPACE")) continue;
+          if ("BLOCK".equals(cc.kind)) {
+            walkBranchFrom(file, cc, cat, cat.children.indexOf(cc), tryId, entryProps);
           }
-          // catch 体从 CATCH 锚定。只 walk 体块(BLOCK):异常参数若按顺序事件 walk 会 appendChainEvent
-          // 到父块、把 try 体末的 pendingJoin 合并点消费掉,破坏"try 体末→finally(正常)"与 catch 链。
-          for (SyntaxTree.Node cc : cat.children) {
-            if (cc.kind == null || cc.kind.isEmpty() || cc.kind.equals("WHITE_SPACE")) continue;
-            if ("BLOCK".equals(cc.kind)) {
-              walkBranchFrom(file, cc, cat, cat.children.indexOf(cc), catchId);
-            }
-          }
-          prevCatch = catchId;
-        } finally {
-          conds.pop();
         }
       }
       // 3) finally：入链（从父块 pendingJoins 汇聚 try 正常尾 + 各 catch 体尾），作为公共汇合；finally 体末 → next。
@@ -727,7 +773,9 @@ public final class GraphExtractor {
       if (body == null) continue;
       pushBranchScope();
       int depth = pendingBranchStartFrom.size();
-      pendingBranchStartFrom.push(new EventRef(condIds.get(i), GraphModel.LABEL_CONDITION));
+      // 守卫匹配(真) → 本分支体，分支入口边带 branch="true"。
+      pendingBranchStartFrom.push(
+          new EventRef(condIds.get(i), GraphModel.LABEL_CONDITION, Map.of("branch", "true")));
       walk(file, body, condEntries.get(i), condEntries.get(i).children.indexOf(body));
       while (pendingBranchStartFrom.size() > depth) pendingBranchStartFrom.pop();
       branchScopes.add(scopeStack.pop());
@@ -742,7 +790,9 @@ public final class GraphExtractor {
     if (elseBody != null && prevCond != null) {
       pushBranchScope();
       int depth = pendingBranchStartFrom.size();
-      pendingBranchStartFrom.push(prevCond);
+      // 全部守卫都不匹配(假) → else 体，分支入口边带 branch="false"。
+      pendingBranchStartFrom.push(
+          new EventRef(prevCond.id, prevCond.label, Map.of("branch", "false")));
       walk(file, elseBody, elseEntry, elseEntry.children.indexOf(elseBody));
       while (pendingBranchStartFrom.size() > depth) pendingBranchStartFrom.pop();
       branchScopes.add(scopeStack.pop());

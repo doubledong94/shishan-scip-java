@@ -1715,29 +1715,30 @@ class GraphExtractorTest {
 
     List<Map<String, Object>> conds = nodesOf(sink, GraphModel.LABEL_CONDITION);
     String tryId = null;
-    String catchId = null;
+    boolean hasCatchCond = false;
     for (Map<String, Object> n : conds) {
       if ("TRY".equals(n.get("kind"))) tryId = (String) n.get("_id");
-      if ("CATCH".equals(n.get("kind"))) catchId = (String) n.get("_id");
+      if ("CATCH".equals(n.get("kind"))) hasCatchCond = true;
     }
     final String fTry = tryId;
-    final String fCatch = catchId;
     assertTrue(fTry != null, "TRY condition node exists");
-    assertTrue(fCatch != null, "CATCH condition node exists");
+    assertTrue(!hasCatchCond, "no CATCH condition node (removed; catch by edge prop)");
     assertTrue(
         edgesOf(sink, GraphModel.REL_ELSE).isEmpty(),
         "no ELSE edges (try/catch by NEXT)");
     assertTrue(
         edgesOf(sink, GraphModel.REL_SUB).isEmpty(),
         "no SUB edges");
-    // TRY 必须进入 NEXT 时序链：前置事件 e0 → TRY → try 体首事件 a。
+    // TRY 进入 NEXT 时序链：前置事件 e0 → TRY → try 体首事件 a；且 TRY → catch 体首事件 b（异常路径经 NEXT 扇出）。
     List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
     java.util.function.BiPredicate<String, String> next = (from, to) ->
         nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
     String e0 = "test::Foo.java#9:0:FIELD";
     String a = "test::Foo.java#12:0:FIELD";
+    String b = "test::Foo.java#16:0:FIELD";
     assertTrue(next.test(e0, fTry), "preceding event e0 -> TRY (TRY in order chain)");
     assertTrue(next.test(fTry, a), "TRY -> try body first event a");
+    assertTrue(next.test(fTry, b), "TRY -> catch body first event b (exception path via NEXT)");
   }
 
   @Test
@@ -1788,7 +1789,6 @@ class GraphExtractorTest {
     java.util.function.BiPredicate<String, String> next =
         (from, to) -> nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
     String tryId = "test::Foo.java#10:0";
-    String catchId = "test::Foo.java#13:0";
     String finId = "test::Foo.java#17:0";
     String a = "test::Foo.java#12:0:FIELD";
     String b = "test::Foo.java#16:0:FIELD";
@@ -1797,11 +1797,10 @@ class GraphExtractorTest {
     // 入口:前置 → TRY → try 体首。
     assertTrue(next.test("test::Foo.java#9:0:FIELD", tryId), "e0 -> TRY");
     assertTrue(next.test(tryId, a), "TRY -> try body first event");
-    // try 体末分叉恒 2:正常 → finally、异常 → CATCH(异常边从 TRY 直连,不依赖 try 体末定位)。
+    // try 体末正常 → finally 汇合；异常路径：TRY 直接经 NEXT 进入 catch 体首(不物化 CATCH 节点)。
     assertTrue(next.test(a, finId), "try body end (normal) -> finally merge");
-    assertTrue(next.test(tryId, catchId), "TRY -> CATCH (exception path)");
-    // catch 体、finally 体进入 & 汇合。
-    assertTrue(next.test(catchId, b), "CATCH -> catch body first event");
+    assertTrue(next.test(tryId, b), "TRY -> catch body first event (exception path via NEXT)");
+    // catch 体尾、finally 体进入 & 汇合。
     assertTrue(next.test(b, finId), "catch body end -> finally merge");
     assertTrue(next.test(finId, f), "FINALLY -> finally body first event");
     // finally 体末 → 下一事件;next 只由 finally 汇入。
