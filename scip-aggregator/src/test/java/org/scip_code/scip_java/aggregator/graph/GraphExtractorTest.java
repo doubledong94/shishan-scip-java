@@ -972,6 +972,54 @@ class GraphExtractorTest {
   }
 
   @Test
+  void noElseIfFallthroughEdgeCarriesFalse() {
+    // void m() { if (c) { a; } end; }
+    // 无 else 的 if：条件真→then 首事件(branch="true")；假→fall-through 到 if 之后的下一事件 end，
+    // 该汇入边也要带 branch="false"——保证无论有无 else，if 的"真+假"两条 NEXT 都带 branch 属性。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+    SyntaxTree.Node ifNode = node("IF", 12);
+    ifNode.children.add(node("IDENTIFIER", 13, ref("pkg/A#c.", "IdentifierConstant", 13)));
+    SyntaxTree.Node thenB = node("BLOCK", 14);
+    thenB.children.add(node("IDENTIFIER", 15, ref("pkg/A#a.", "IdentifierConstant", 15)));
+    ifNode.children.add(thenB);
+    mBody.children.add(ifNode);
+    mBody.children.add(node("IDENTIFIER", 20, ref("pkg/A#end.", "IdentifierConstant", 20)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"c.", "a.", "end."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    String condId = "test::Foo.java#12:0";
+    String a = "test::Foo.java#15:0:FIELD";
+    String end = "test::Foo.java#20:0:FIELD";
+    long outCount = nexts.stream().filter(e -> condId.equals(e.get("_from"))).count();
+    assertEquals(2L, outCount, "no-else if forks exactly 2 (then + fall-through)");
+    java.util.function.Function<String, String> branchOf =
+        target -> nexts.stream()
+            .filter(e -> condId.equals(e.get("_from")) && target.equals(e.get("_to")))
+            .map(e -> (String) ((Map<String, Object>) e.get("_props")).get("branch"))
+            .findFirst()
+            .orElse(null);
+    assertEquals("true", branchOf.apply(a), "then branch edge carries branch=true");
+    assertEquals("false", branchOf.apply(end), "no-else fall-through edge carries branch=false");
+  }
+
+  @Test
   void reassignmentWriteDefersPastWhenRhsSoBranchesMergeAtWrite() {
     // fun m() { response = when { g1 -> { A } else -> { B } }; end; }
     // `x = when{…}` 的写应延迟到整个 when RHS 求值完再入链(先读后写)：

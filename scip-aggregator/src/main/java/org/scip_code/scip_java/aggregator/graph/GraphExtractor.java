@@ -141,10 +141,16 @@ public final class GraphExtractor {
   private static final class Join {
     final String id;
     final String label;
+    final Map<String, Object> props; // 汇入边属性（如无 else if 的 fall-through=branch:false、loop 退出=false）
 
     Join(String id, String label) {
+      this(id, label, null);
+    }
+
+    Join(String id, String label, Map<String, Object> props) {
       this.id = id;
       this.label = label;
+      this.props = props;
     }
   }
 
@@ -269,7 +275,7 @@ public final class GraphExtractor {
     if (b == null) return;
     boolean hasJoins = !b.pendingJoins.isEmpty();
     for (Join j : b.pendingJoins) {
-      writer.addEdge(GraphModel.REL_NEXT, j.label, j.id, label, id);
+      writer.addEdge(GraphModel.REL_NEXT, j.label, j.id, label, id, j.props);
     }
     b.pendingJoins.clear();
     EventRef prev = b.lastEvent();
@@ -572,13 +578,16 @@ public final class GraphExtractor {
         }
       }
       parent.pendingJoins.clear();
-      parent.pendingJoins.add(new Join(condRef.id, condRef.label));
+      // loop 退出由条件变假，故进入 next 的汇入边即假路径，标 branch="false"。
+      parent.pendingJoins.add(new Join(condRef.id, condRef.label, Map.of("branch", "false")));
     }
     // 单分支、无 else 的 if(非循环):条件为假时直落到整个 if 语句之后的下一个事件。
     // 把条件自身作为同层 pendingJoin 交到父块,使下一事件同时从"条件(假路径,跳过分支)"与
     // "分支末尾(真路径)"接入——否则该 if 只有一条"条件→分支首事件",缺了假路径的下一条。
     if (!isLoopKind(node.kind) && branches.size() == 1 && condRef != null && !blockStack.isEmpty()) {
-      blockStack.peek().pendingJoins.add(new Join(condRef.id, condRef.label));
+      // 无 else 的 if：条件为假时直落到 if 之后的下一个事件，这条 fall-through 汇入边即假路径，
+      // 标记 branch="false"，保证 if 的"真+假"两条 NEXT 都带 branch(不变量成立)。
+      blockStack.peek().pendingJoins.add(new Join(condRef.id, condRef.label, Map.of("branch", "false")));
     }
     mergeBranchScopes(branchScopes, node);
   }
@@ -815,7 +824,8 @@ public final class GraphExtractor {
       while (pendingBranchStartFrom.size() > depth) pendingBranchStartFrom.pop();
       branchScopes.add(scopeStack.pop());
     } else if (prevCond != null && !blockStack.isEmpty()) {
-      blockStack.peek().pendingJoins.add(new Join(prevCond.id, prevCond.label));
+      // when 无 else：全部守卫不匹配则落入 when 之后，fall-through 汇入边即假路径，标 branch="false"。
+      blockStack.peek().pendingJoins.add(new Join(prevCond.id, prevCond.label, Map.of("branch", "false")));
     }
     mergeBranchScopes(branchScopes, node);
   }
