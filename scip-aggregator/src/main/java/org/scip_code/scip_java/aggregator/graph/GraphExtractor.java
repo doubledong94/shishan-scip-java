@@ -268,6 +268,7 @@ public final class GraphExtractor {
     doAppendChainEvent(file, id, label);
   }
 
+
   /**
    * Append a runtime event to the current block's order chain, linking it from the previous event
    * and resolving any pending branch joins. {@code label} is the event node's label.
