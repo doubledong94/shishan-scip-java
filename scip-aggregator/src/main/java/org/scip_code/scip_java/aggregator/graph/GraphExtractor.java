@@ -234,6 +234,9 @@ public final class GraphExtractor {
   // invocation node's exit so arg-internal reads (chained during child traversal) precede the call
   // in execution order — matching eval-order: ... → argExpr reads → args → call → return → ...
   private final Deque<java.util.List<EventRef>> pendingCallChains = new ArrayDeque<>();
+  // RETURN 的链入延迟到其子节点(返回值)读取之后(在 exit 时才入链)：`return x` 先读 x 再返回，故
+  // 链序应为 …→x 读→RETURN，而非 RETUREN→x(当前 enter 时即入链导致 NEXT 方向反了)。
+  private final Deque<String> pendingReturnChains = new ArrayDeque<>();
   // 赋值/声明的"写"延迟到 RHS 读之后再入链：`x = rhs` / `val x = rhs` 执行顺序是"先求值 RHS（读），
   // 再写 LHS"。Write 在遍历 LHS（或声明）时最先遇到，若立刻入链会把写排到 RHS 读之前。
   // 用"行"作语句边界：同一行内的写先挂着，待链推进到下一行（该语句的 RHS 读及之后的语句）再统一入链。
@@ -1073,6 +1076,10 @@ public final class GraphExtractor {
         appendChainEvent(file, e.id, e.label, rangeLine(node));
       }
     }
+    // RETURN exit: 在返回值读取之后把 RETURN 入链(…→x 读→RETURN)，修复 NEXT 方向颠倒。
+    if (isReturnKind(node.kind) && !pendingReturnChains.isEmpty()) {
+      appendChainEvent(file, pendingReturnChains.pop(), GraphModel.LABEL_VALUE, rangeLine(node));
+    }
   }
 
   /**
@@ -1487,7 +1494,8 @@ public final class GraphExtractor {
         writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, valueId, GraphModel.LABEL_VALUE, returnId);
       }
     }
-    appendChainEvent(file, returnId, GraphModel.LABEL_VALUE, rangeLine(node));
+    // RETURN 延迟到子节点(返回值)读取之后入链(exit 时 flush)，使 `return x` 的 NEXT 为 …→x 读→RETURN。
+    pendingReturnChains.push(returnId);
     // Record this return slot against the enclosing method for cross-method return binding.
     String methodSymbol = methodSymbols.isEmpty() ? null : methodSymbols.peek();
     if (methodSymbol != null && !methodSymbol.isEmpty()) {
