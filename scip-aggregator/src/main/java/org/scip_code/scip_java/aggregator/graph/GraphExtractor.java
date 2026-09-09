@@ -387,19 +387,46 @@ public final class GraphExtractor {
     return null;
   }
 
-  /** 由形参名合成 SCIP 形参符号：`方法().(参数名)`（外部方法无独立形参 SymbolInformation 时用）。 */
-  private static String paramSymbolFor(String calleeSymbol, String paramName) {
+  /** 由形参名合成 SCIP 形参符号：`方法().(参数名)`（外部方法无独立形参 SymbolInformation 时用）。
+   *  方法符号形如 `…/foo().` 或 `…/foo(+13).`（重载位置消歧，也以 `.` 结尾），都可直接拼 `. (参数名)`；
+   *  之前只认 `().` 结尾，导致重载方法槽的 symbol 落空。 */
+  static String paramSymbolFor(String calleeSymbol, String paramName) {
     if (calleeSymbol == null || paramName == null || paramName.isEmpty()) return null;
-    return calleeSymbol.endsWith("().") ? calleeSymbol + "(" + paramName + ")" : null;
+    if (calleeSymbol.endsWith(".")) return calleeSymbol + "(" + paramName + ")";
+    return null;
+  }
+
+  /** 清理形参名：scip-java 对 Kotlin 合成/内联函数（`apply`/`also`/`use` 等）的形参显示名会把注解文本
+   *  `) @InlineOnly() @JvmName(...) …` 漏进来（这类字符串里并无真正参数名），回退成 `#argIndex` 保持一致，
+   *  不吐注解垃圾。正常名（如 `HttpUrl arg0`、`vararg elements` 的空白兜底）原样保留。 */
+  static String cleanParamName(String raw, int argIndex) {
+    if (raw == null) return "#" + argIndex;
+    String s = raw.trim();
+    if (s.isEmpty()) return "#" + argIndex;
+    if (s.contains("@") || s.contains(") ")) return "#" + argIndex;
+    return s;
+  }
+
+  private static boolean isPlainName(String s) {
+    if (s == null || s.isEmpty()) return false;
+    boolean anyLetter = false;
+    for (int i = 0; i < s.length(); i++) {
+      char c = s.charAt(i);
+      if (Character.isLetter(c)) anyLetter = true;
+      if (!(Character.isLetterOrDigit(c) || c == '_' || c == '`' || c == '$')) return false;
+    }
+    return anyLetter;
   }
 
   /** 全部文件提取完后，把 CALLED_PARAM 槽的符号/名字后置补正为被调函数对应形参（paramsByMethod 此时已完整）。 */
   private void fixupArgSlots() {
     for (ArgSlotFixup f : pendingArgFixups) {
-      java.util.List<String> ps = paramNamesOf(f.calleeSymbol);
-      if (ps == null || f.argIndex >= ps.size()) continue;
-      String pName = ps.get(f.argIndex);
-      String pSym = paramSymbolFor(f.calleeSymbol, pName);
+      java.util.List<String> pSyms = paramsByMethod.get(f.calleeSymbol);
+      java.util.List<String> pNames = paramNamesOf(f.calleeSymbol);
+      if (pNames == null || f.argIndex >= pNames.size()) continue;
+      String pName = cleanParamName(pNames.get(f.argIndex), f.argIndex);
+      String pSym = (pSyms != null && f.argIndex < pSyms.size()) ? pSyms.get(f.argIndex) : null;
+      if (pSym == null || pSym.isEmpty()) pSym = paramSymbolFor(f.calleeSymbol, pName);
       Map<String, Object> m = new LinkedHashMap<>();
       m.put("name", pName);
       if (pSym != null) m.put("symbol", pSym);
@@ -1550,15 +1577,17 @@ public final class GraphExtractor {
       // 形参解析不到（外部/顺序对不上）时回退到实参的取值符号（字段等）。
       String slotSym = null, slotName = null;
       if (calleeParamNames != null && argIndex < calleeParamNames.size()) {
-        slotName = calleeParamNames.get(argIndex);
+        slotName = cleanParamName(calleeParamNames.get(argIndex), argIndex);
         if (calleeParamSyms != null && argIndex < calleeParamSyms.size()) slotSym = calleeParamSyms.get(argIndex);
         else slotSym = paramSymbolFor(symbol, slotName); // 外部方法：按签名合成 方法().(形参)
       }
       String valueSymbol = slotSym != null ? slotSym : (argSym != null ? argSym : null);
+      String name = cleanParamName(slotName != null ? slotName : (argSym != null && !argSym.isEmpty() ? valueName(file, argSym) : null), argIndex);
+      // 形参/实参符号都取不到（实参全为局部变量）时，用干净名字合成形参符号，避免 symbol 落空。
+      if ((valueSymbol == null || valueSymbol.isEmpty()) && isPlainName(name)) valueSymbol = paramSymbolFor(symbol, name);
       String safeSym = valueSymbol == null || valueSymbol.isEmpty() ? ("#" + argIndex) : valueSymbol;
       String valueId = runtimeId(project, file, arg.range, argIndex + ":" + safeSym);
       Map<String, Object> argProps = new LinkedHashMap<>();
-      String name = slotName != null ? slotName : (argSym != null && !argSym.isEmpty() ? valueName(file, argSym) : ("#" + argIndex));
       argProps.put("name", name);
       argProps.put("symbol", valueSymbol != null ? valueSymbol : "");
       argProps.put("file", file);

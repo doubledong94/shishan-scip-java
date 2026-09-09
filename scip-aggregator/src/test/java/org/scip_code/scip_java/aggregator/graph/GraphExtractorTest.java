@@ -219,6 +219,28 @@ class GraphExtractorTest {
   }
 
   @Test
+  void calledParamSlotNamingIsConsistent() {
+    // 外部重载方法符号以 `(+N).` 结尾，同样要能合成 `.(形参名)` —— 之前只认 `().` 导致 symbol 落空。
+    assertEquals(
+        "scip-java maven maven/test/Foo#bar(+13).(expected)",
+        GraphExtractor.paramSymbolFor("scip-java maven maven/test/Foo#bar(+13).", "expected"));
+    assertEquals(
+        "scip-java maven maven/test/Request#<init>(+1).(url)",
+        GraphExtractor.paramSymbolFor("scip-java maven maven/test/Request#<init>(+1).", "url"));
+    assertEquals(null, GraphExtractor.paramSymbolFor("…/foo", "x"));
+
+    // 注解文本污染的形参名应回退 #N（保持一致，不吐注解垃圾）；正常名/空白兜底名原样保留。
+    assertEquals(
+        "#0",
+        GraphExtractor.cleanParamName(
+            ") @InlineOnly() @JvmName(...) public final inline fun <T> T.apply(block", 0));
+    assertEquals("expected", GraphExtractor.cleanParamName("expected", 1));
+    assertEquals("HttpUrl arg0", GraphExtractor.cleanParamName("HttpUrl arg0", 1));
+    assertEquals("#2", GraphExtractor.cleanParamName(null, 2));
+    assertEquals("#3", GraphExtractor.cleanParamName(") @InlineOnly() public final inline fun <reified T", 3));
+  }
+
+  @Test
   void extractsRuntimeEdges() {
     // class A { int f; void m() { f = g; if (f>0) a.b(); else if (x>1) c(); } }
     SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
