@@ -80,6 +80,11 @@ public final class GraphExtractor {
   private final Deque<String> methodRootConds = new ArrayDeque<>();
   private final Deque<String> conds = new ArrayDeque<>();
   private final Deque<String> methodSymbols = new ArrayDeque<>();
+  // 独立方法单元：被调方为 `local N` 的方法（匿名对象成员/lambda/局部函数）不应把方法体并进
+  // 外层函数的 NEXT 执行链。isolatedStack 与 methodSymbols 平行；isolatedBodies 是其体链记录器，
+  // 出口不回并父块。
+  private final Deque<Boolean> isolatedStack = new ArrayDeque<>();
+  private final java.util.Set<BlockBuilder> isolatedBodies = new java.util.HashSet<>();
   // Cross-method binding: callee method symbol → its params in declaration order.
   private final Map<String, java.util.List<String>> paramsByMethod = new java.util.HashMap<>();
   // CALLED_PARAM 槽的形参后置补正：paramsByMethod 在处理到被调文件时才填充，调用点可能在它
@@ -1093,6 +1098,11 @@ public final class GraphExtractor {
       } else {
         EventRef prev = parent.lastEvent();
         if (prev != null) b.startFrom = prev;
+        else if (isolatedBodies.contains(parent) && parent.startFrom != null) {
+          // 独立方法体的首块：从该方法的根条件起链（不含外层函数块），保证独立方法自成一条时序。
+          b.startFrom = parent.startFrom;
+          parent.startFrom = null;
+        }
       }
     }
     blockStack.push(b);
@@ -1110,6 +1120,12 @@ public final class GraphExtractor {
       if (!conds.isEmpty()) conds.pop(); // method root condition
       if (!scopeStack.isEmpty()) scopeStack.pop();
       if (!methodSymbols.isEmpty()) methodSymbols.pop();
+      if (!isolatedStack.isEmpty() && isolatedStack.pop()) {
+        // 独立方法体出口：链末端不回并外层函数块（该方法是独立单元，不在外层执行序中）。
+        BlockBuilder iso = blockStack.pop();
+        iso.finish();
+        isolatedBodies.remove(iso);
+      }
     }
     if (node.kind.equals("BLOCK")) {
       exitBlock(file, rangeEndLine(node));
@@ -1158,6 +1174,9 @@ public final class GraphExtractor {
     scopeStack.push(new Scope());
     String symbol = def != null ? def.symbol : "";
     boolean hasSymbol = def != null && !symbol.isEmpty() && !ScipSymbols.isLocal(symbol);
+    // 匿名对象成员/lambda/局部函数：独立方法单元，方法体不进外层函数 NEXT 链。
+    boolean isolated = def != null && ScipSymbols.isLocal(def.symbol);
+    isolatedStack.push(isolated);
     if (hasSymbol) {
       String id = declId(project, file, symbol);
       SymbolInformation info = symbols.get(symbol);
@@ -1198,6 +1217,17 @@ public final class GraphExtractor {
     }
     methodRootConds.push(rootCond);
     conds.push(rootCond);
+    if (isolated) {
+      // 独立方法体的链记录器：其链从本方法根条件起（方法入口），且出口不回并外层函数块。
+      BlockBuilder iso = new BlockBuilder();
+      iso.startFrom = new EventRef(rootCond, GraphModel.LABEL_CONDITION);
+      blockStack.push(iso);
+      isolatedBodies.add(iso);
+      // 匿名/局部方法自身作为独立方法单元：加 ROOT 锚点（作为独立方法可发现）。
+      writer.addEdge(
+          GraphModel.REL_ROOT, GraphModel.LABEL_METHOD, declId(project, file, symbol),
+          GraphModel.LABEL_CONDITION, rootCond);
+    }
   }
 
   private void createDeclaration(

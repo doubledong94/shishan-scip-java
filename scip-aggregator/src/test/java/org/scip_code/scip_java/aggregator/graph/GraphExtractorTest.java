@@ -1,6 +1,7 @@
 package org.scip_code.scip_java.aggregator.graph;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
@@ -274,6 +275,74 @@ class GraphExtractorTest {
         calls.stream().filter(c -> "local 1".equals(c.get("symbol"))).findFirst().orElse(null);
     assertTrue(localCall != null, "local-callee call site exists");
     assertEquals("localFn", localCall.get("name"), "local callee uses source name, not bare number");
+  }
+
+  @Test
+  void anonymousObjectMethodIsolatedFromEnclosingFlow() {
+    // `bar` 内 `.trailers(object : T { fun peek() = x.peekTrailers() })`。
+    // peek 是匿名对象成员（`local 1` 符号）：其方法体应作为独立方法单元，不并进 bar 的 NEXT 链。
+    SyntaxTree.Node cls = node("CLASS", 0);
+    cls.children.add(node("IDENTIFIER", 1, def("pkg/Foo#", "IdentifierType", 1)));
+    SyntaxTree.Node fun = node("FUN", 2);
+    fun.children.add(node("IDENTIFIER", 3, def("pkg/Foo#bar().", "IdentifierFunctionDefinition", 3)));
+    SyntaxTree.Node body = node("BLOCK", 4);
+    SyntaxTree.Node call = node("CALL_EXPRESSION", 5);
+    call.children.add(node("OPERATION_REFERENCE", 6, ref("pkg/Foo#trailers().", "IdentifierFunction", 6)));
+    SyntaxTree.Node argList = node("VALUE_ARGUMENT_LIST", 7);
+    SyntaxTree.Node arg = node("VALUE_ARGUMENT", 8);
+    SyntaxTree.Node obj = node("OBJECT_LITERAL", 9);
+    SyntaxTree.Node peek = node("FUN", 10);
+    peek.children.add(node("IDENTIFIER", 11, def("local 1", "IdentifierFunctionDefinition", 11)));
+    SyntaxTree.Node peekBody = node("BLOCK", 12);
+    SyntaxTree.Node peekCall = node("CALL_EXPRESSION", 13);
+    peekCall.children.add(node("OPERATION_REFERENCE", 14, ref("pkg/Foo#peekTrailers().", "IdentifierFunction", 14)));
+    peekBody.children.add(peekCall);
+    peek.children.add(peekBody);
+    obj.children.add(peek);
+    arg.children.add(obj);
+    argList.children.add(arg);
+    call.children.add(argList);
+    body.children.add(call);
+    fun.children.add(body);
+    cls.children.add(fun);
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/Foo#", info(SymbolInformation.Kind.Class, "Foo"));
+    symbols.put("pkg/Foo#bar().", info(SymbolInformation.Kind.Method, "bar"));
+    symbols.put("pkg/Foo#trailers().", info(SymbolInformation.Kind.Method, "trailers"));
+    symbols.put("pkg/Foo#peekTrailers().", info(SymbolInformation.Kind.Method, "peekTrailers"));
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "kotest", symbols);
+    extractor.extractFile("Foo.kt", cu);
+    extractor.emitRelationships();
+
+    // 匿名 peek 成为独立方法：有 METHOD 节点 + ROOT 锚点。
+    String peekId = "kotest::Foo.kt::local 1";
+    assertTrue(hasNode(sink, GraphModel.LABEL_METHOD, peekId), "anonymous peek method node");
+    assertTrue(hasEdge(sink, GraphModel.REL_ROOT, peekId, null), "anonymous peek has ROOT anchor");
+
+    // peek 体里的 peekTrailers 调用点，不应从主流程 trailers() 直接 NEXT 到达（方法体已隔离）。
+    List<Map<String, Object>> calls = nodesOf(sink, GraphModel.LABEL_CALLED_METHOD);
+    String trailersId =
+        calls.stream()
+            .filter(c -> String.valueOf(c.get("symbol")).endsWith("trailers()."))
+            .map(c -> (String) c.get("_id"))
+            .findFirst()
+            .orElse(null);
+    String peekTrailersId =
+        calls.stream()
+            .filter(c -> String.valueOf(c.get("symbol")).endsWith("peekTrailers()."))
+            .map(c -> (String) c.get("_id"))
+            .findFirst()
+            .orElse(null);
+    assertTrue(trailersId != null, "trailers call node exists");
+    assertTrue(peekTrailersId != null, "peekTrailers call node exists");
+    assertFalse(
+        hasEdge(sink, GraphModel.REL_NEXT, trailersId, peekTrailersId),
+        "anonymous object method body is not inlined into enclosing flow");
   }
 
   @Test
