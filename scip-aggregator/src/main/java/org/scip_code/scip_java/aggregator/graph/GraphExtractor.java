@@ -91,6 +91,10 @@ public final class GraphExtractor {
     }
   }
   private final java.util.List<ArgSlotFixup> pendingArgFixups = new java.util.ArrayList<>();
+  // Local-symbol 调用点的标签后置补正：enterInvocation 时 localNamesByFile 可能还没处理到该 local 的声明
+  // （Kotlin 匿名对象/lambda/局部函数的被调方只有 `local N` 符号），全文件跑完后再把 `local N` 换成它的
+  // 源码局部名，避免 CALLED_METHOD 标签显示成裸数字 `N`。存 (callId, file, localSymbol)。
+  private final java.util.List<String[]> pendingLocalCallNames = new java.util.ArrayList<>();
   // Cross-method binding: callee method symbol → its return-slot runtime ids.
   private final Map<String, java.util.List<String>> returnsByMethod = new java.util.HashMap<>();
   // Local variables get per-file SCIP symbols ("local N"); map (file, localSymbol) → source name.
@@ -435,8 +439,22 @@ public final class GraphExtractor {
     pendingArgFixups.clear();
   }
 
+  /** 全文件跑完后，把 `local N` 调用点的标签换成其源码局部名（声明的处理可能晚于调用点）。 */
+  private void fixupLocalCallNames() {
+    for (String[] f : pendingLocalCallNames) {
+      Map<String, String> m = localNamesByFile.get(f[1]);
+      String sn = m == null ? null : m.get(f[2]);
+      if (sn == null || sn.isEmpty()) continue;
+      Map<String, Object> p = new LinkedHashMap<>();
+      p.put("name", sn);
+      writer.addNode(GraphModel.LABEL_CALLED_METHOD, f[0], p); // MERGE by id → 更新标签
+    }
+    pendingLocalCallNames.clear();
+  }
+
   public void emitRelationships() {
     fixupArgSlots();
+    fixupLocalCallNames();
     for (Map.Entry<String, String> entry : createdSymbolLabel.entrySet()) {
       String symbol = entry.getKey();
       String label = entry.getValue();
@@ -1539,7 +1557,18 @@ public final class GraphExtractor {
     if (symbol == null) return;
     String id = runtimeId(project, file, node.range, null);
     Map<String, Object> props = new LinkedHashMap<>();
-    props.put("name", shortName(symbol));
+    String dispName;
+    if (ScipSymbols.isLocal(symbol)) {
+      // 局部符号（匿名对象/lambda/局部函数）没有可真名：有源码局部名用其名，否则保留完整 `local N`
+      // （而不是被 shortName 截成裸数字 N），后置补正。
+      Map<String, String> m = localNamesByFile.get(file);
+      String sn = m == null ? null : m.get(symbol);
+      dispName = (sn != null && !sn.isEmpty()) ? sn : symbol;
+      pendingLocalCallNames.add(new String[] {id, file, symbol});
+    } else {
+      dispName = shortName(symbol);
+    }
+    props.put("name", dispName);
     props.put("symbol", symbol);
     props.put("file", file);
     props.put("line", node.range == null ? 0 : node.range.startLine());

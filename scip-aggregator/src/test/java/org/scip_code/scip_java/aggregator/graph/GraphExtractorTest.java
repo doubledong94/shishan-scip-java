@@ -241,6 +241,42 @@ class GraphExtractorTest {
   }
 
   @Test
+  void localCalleeCallNodeNamedBySourceName() {
+    // 匿名对象/lambda/局部函数的被调方只有 `local N` 符号；CALLED_METHOD 的标签应为该局部的源码名
+    // （经 localNamesByFile 后置补正），而不是裸数字 `N`。
+    SyntaxTree.Node cls = node("CLASS", 0);
+    cls.children.add(node("IDENTIFIER", 1, def("pkg/Foo#", "IdentifierType", 1)));
+    SyntaxTree.Node fun = node("FUN", 2);
+    fun.children.add(node("IDENTIFIER", 3, def("pkg/Foo#bar().", "IdentifierFunctionDefinition", 3)));
+    // 局部声明：local 1 的源码名是 `localFn`。
+    fun.children.add(node("IDENTIFIER", 4, def("local 1", "IdentifierLocal", 4)));
+    // 调用该局部函数。
+    SyntaxTree.Node call = node("CALL_EXPRESSION", 5);
+    call.children.add(node("OPERATION_REFERENCE", 6, ref("local 1", "IdentifierFunction", 6)));
+    call.children.add(node("VALUE_ARGUMENT_LIST", 7));
+    fun.children.add(call);
+    cls.children.add(fun);
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/Foo#", info(SymbolInformation.Kind.Class, "Foo"));
+    symbols.put("pkg/Foo#bar().", info(SymbolInformation.Kind.Method, "bar"));
+    symbols.put("Foo.kt local 1", info(SymbolInformation.Kind.Variable, "localFn"));
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "kotest", symbols);
+    extractor.extractFile("Foo.kt", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> calls = nodesOf(sink, GraphModel.LABEL_CALLED_METHOD);
+    Map<String, Object> localCall =
+        calls.stream().filter(c -> "local 1".equals(c.get("symbol"))).findFirst().orElse(null);
+    assertTrue(localCall != null, "local-callee call site exists");
+    assertEquals("localFn", localCall.get("name"), "local callee uses source name, not bare number");
+  }
+
+  @Test
   void extractsRuntimeEdges() {
     // class A { int f; void m() { f = g; if (f>0) a.b(); else if (x>1) c(); } }
     SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
