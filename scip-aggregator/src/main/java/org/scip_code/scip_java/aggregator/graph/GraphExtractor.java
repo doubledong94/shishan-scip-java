@@ -7,6 +7,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import org.scip_code.scip.SymbolInformation;
+import org.scip_code.scip_java.shared.NodeKind;
 import org.scip_code.scip_java.shared.ScipRange;
 import org.scip_code.scip_java.shared.ScipSymbols;
 import org.scip_code.scip_java.shared.SyntaxTree;
@@ -1055,11 +1056,12 @@ public final class GraphExtractor {
   /** 精确判断：该节点 kind 是否是可打印的字面量（数字/布尔/null/字符串整串等），排除模板切片。 */
   private static boolean isLiteralNodeKind(String k) {
     if (k == null) return false;
-    if (k.endsWith("CONSTANT")) return true; // INTEGER_CONSTANT / BOOLEAN_CONSTANT / REAL_CONSTANT…
+    k = NodeKind.canonical(k); // Kotlin INTEGER_CONSTANT/STRING_TEMPLATE/NULL 等归一到字面量规范名
+    if (k.endsWith("CONSTANT")) return true; // 未映射的其它 *CONSTANT 字面量
     switch (k) {
-      case "NULL", "INTEGER_LITERAL", "STRING_TEMPLATE", "OBJECT_LITERAL", "CLASS_LITERAL_EXPRESSION",
-           "STRING_LITERAL", "CHAR_LITERAL", "BOOLEAN_LITERAL", "INT_LITERAL", "LONG_LITERAL",
-           "FLOAT_LITERAL", "DOUBLE_LITERAL", "NULL_LITERAL" -> { return true; }
+      case "NULL_LITERAL", "INT_LITERAL", "LONG_LITERAL", "FLOAT_LITERAL", "DOUBLE_LITERAL",
+           "BOOLEAN_LITERAL", "CHAR_LITERAL", "STRING_LITERAL", "OBJECT_LITERAL",
+           "CLASS_LITERAL_EXPRESSION" -> { return true; }
       default -> {}
     }
     return false;
@@ -1752,9 +1754,7 @@ public final class GraphExtractor {
   /** The receiver chain child of an invocation (the object expression being called on), or null. */
   private static SyntaxTree.Node receiverSubtree(SyntaxTree.Node node) {
     for (SyntaxTree.Node child : node.children) {
-      if (child.kind.equals("DOT_QUALIFIED_EXPRESSION")
-          || child.kind.equals("SAFE_ACCESS_EXPRESSION")
-          || child.kind.equals("MEMBER_SELECT")) {
+      if (isMemberSelectKind(child.kind)) {
         return child;
       }
     }
@@ -1852,7 +1852,7 @@ public final class GraphExtractor {
       return null;
     }
     // do { body } while (cond):条件在末(体在前)。
-    if (node.kind.equals("DO_WHILE")) {
+    if (isKind(node.kind, NodeKind.DO_WHILE_LOOP)) {
       List<SyntaxTree.Node> kids = nonWhitespaceChildren(node);
       return kids.isEmpty() ? null : kids.get(kids.size() - 1);
     }
@@ -1870,60 +1870,50 @@ public final class GraphExtractor {
   // Kind classification (javac + Kotlin PSI)
   // ---------------------------------------------------------------------------
 
+  /** 判断某 kind 是否属于规范词表：先经 {@link NodeKind#canonical} 归一，再按规范名匹配。这样
+   *  Java 原生 kind（如 {@code WHILE_LOOP}/{@code MEMBER_SELECT}）与 Kotlin 原生 kind
+   *  （如 {@code WHILE}/{@code DOT_QUALIFIED_EXPRESSION}）都归到同一词表判类，无需逐处区分语言。 */
+  private static boolean isKind(String kind, String... canonical) {
+    String k = NodeKind.canonical(kind);
+    if (k == null) return false;
+    for (String c : canonical) if (c.equals(k)) return true;
+    return false;
+  }
+
   private static boolean isTypeKind(String kind) {
-    return kind.equals("CLASS")
-        || kind.equals("INTERFACE")
-        || kind.equals("ENUM")
-        || kind.equals("RECORD")
-        || kind.equals("ANNOTATION_TYPE")
-        || kind.equals("OBJECT_DECLARATION")
-        || kind.equals("OBJECT_LITERAL")
-        || kind.equals("TYPEALIAS")
-        || kind.equals("companion");
+    return isKind(kind, "CLASS", "INTERFACE", "ENUM", "RECORD", "ANNOTATION_TYPE",
+        "OBJECT_DECLARATION", "OBJECT_LITERAL", "TYPEALIAS", "companion");
   }
 
   private static boolean isMethodKind(String kind) {
-    return kind.equals("METHOD")
-        || kind.equals("FUN")
-        || kind.equals("SECONDARY_CONSTRUCTOR")
-        || kind.equals("PRIMARY_CONSTRUCTOR");
+    // FUN / PRIMARY_CONSTRUCTOR / SECONDARY_CONSTRUCTOR 经 NodeKind 归一到 METHOD。
+    return isKind(kind, NodeKind.METHOD);
   }
 
   private static boolean isConditionKind(String kind) {
-    return kind.equals("IF")
-        || kind.equals("WHILE_LOOP")
-        || kind.equals("FOR_LOOP")
-        || kind.equals("ENHANCED_FOR_LOOP")
-        || kind.equals("WHILE")
-        || kind.equals("FOR")
-        || kind.equals("DO_WHILE")
-        || kind.equals("WHEN");
+    // WHILE/FOR/DO_WHILE 归一到 WHILE_LOOP/FOR_LOOP/DO_WHILE_LOOP；Kotlin WHEN 透传。
+    return isKind(kind, "IF", NodeKind.WHILE_LOOP, NodeKind.FOR_LOOP, "ENHANCED_FOR_LOOP",
+        NodeKind.DO_WHILE_LOOP, "WHEN");
   }
 
   private static boolean isLoopKind(String kind) {
-    return kind.equals("WHILE_LOOP")
-        || kind.equals("FOR_LOOP")
-        || kind.equals("ENHANCED_FOR_LOOP")
-        || kind.equals("WHILE")
-        || kind.equals("FOR")
-        || kind.equals("DO_WHILE");
+    return isKind(kind, NodeKind.WHILE_LOOP, NodeKind.FOR_LOOP, "ENHANCED_FOR_LOOP",
+        NodeKind.DO_WHILE_LOOP);
   }
 
   private static boolean isInvocationKind(String kind) {
-    return kind.equals("METHOD_INVOCATION")
-        || kind.equals("NEW_CLASS")
-        || kind.equals("CALL_EXPRESSION")
-        || kind.equals("CONSTRUCTOR_CALL");
+    // CALL_EXPRESSION→METHOD_INVOCATION，CONSTRUCTOR_CALL→NEW_CLASS。
+    return isKind(kind, NodeKind.METHOD_INVOCATION, NodeKind.NEW_CLASS);
   }
 
   private static boolean isMemberSelectKind(String kind) {
-    return kind.equals("DOT_QUALIFIED_EXPRESSION")
-        || kind.equals("SAFE_ACCESS_EXPRESSION")
-        || kind.equals("MEMBER_SELECT");
+    // DOT_QUALIFIED_EXPRESSION / SAFE_ACCESS_EXPRESSION 归一到 MEMBER_SELECT。
+    return isKind(kind, NodeKind.MEMBER_SELECT);
   }
 
   private static boolean isIndexAccessKind(String kind) {
-    return kind.equals("ARRAY_ACCESS_EXPRESSION") || kind.equals("ARRAY_ACCESS");
+    // ARRAY_ACCESS_EXPRESSION 归一到 ARRAY_ACCESS。
+    return isKind(kind, NodeKind.ARRAY_ACCESS);
   }
 
   /**
@@ -2010,7 +2000,7 @@ public final class GraphExtractor {
       for (SyntaxTree.Node k : kids) {
         if (k.kind.equals("WHEN_ENTRY")) out.add(k);
       }
-    } else if (node.kind.equals("DO_WHILE")) {
+    } else if (isKind(node.kind, NodeKind.DO_WHILE_LOOP)) {
       // do { body } while (cond):body 先执行、条件在末，故主体是 do 体(通常为 BLOCK)，不能像 while/for 那样
       // 取"最后一个孩子"(那是条件)。取主体块；若主体是单语句(非块)则回退到倒数第二个孩子。
       for (SyntaxTree.Node k : kids) {
@@ -2263,13 +2253,8 @@ public final class GraphExtractor {
   }
 
   private static boolean isBlockBodyKind(String kind) {
-    return kind.equals("BLOCK")
-        || kind.equals("CLASS_BODY")
-        || kind.equals("BODY")
-        || kind.equals("FILE")
-        || kind.equals("COMPILATION_UNIT")
-        || kind.equals("METHOD")
-        || kind.equals("FUN");
+    return isMethodKind(kind)
+        || isKind(kind, "BLOCK", "CLASS_BODY", "BODY", "FILE", "COMPILATION_UNIT");
   }
 
   private static int rangeCol(SyntaxTree.OccurrenceData occ) {

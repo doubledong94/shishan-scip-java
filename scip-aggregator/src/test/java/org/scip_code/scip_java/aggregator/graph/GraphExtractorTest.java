@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.scip_code.scip.SymbolInformation;
+import org.scip_code.scip_java.shared.NodeKind;
 import org.scip_code.scip_java.shared.ScipRange;
 import org.scip_code.scip_java.shared.SyntaxTree;
 
@@ -217,6 +218,32 @@ class GraphExtractorTest {
             .filter(v -> GraphModel.VALUE_KIND_CALLED_PARAM.equals(v.get("kind")))
             .anyMatch(v -> hasEdge(sink, GraphModel.REL_ARG_OF, (String) v.get("_id"), callId));
     assertTrue(argLinked, "kotlin argument ARG_OF the call");
+  }
+
+  @Test
+  void nodeKindCanonicalUnifiesJavaAndKotlin() {
+    // 统一节点词表：Kotlin 原生 kind 映射到规范名；规范名 / 未知名（Kotlin 独有构造）透传。
+    assertEquals(NodeKind.METHOD, NodeKind.canonical("FUN"));
+    assertEquals(NodeKind.METHOD, NodeKind.canonical("PRIMARY_CONSTRUCTOR"));
+    assertEquals(NodeKind.METHOD, NodeKind.canonical("SECONDARY_CONSTRUCTOR"));
+    assertEquals(NodeKind.WHILE_LOOP, NodeKind.canonical("WHILE"));
+    assertEquals(NodeKind.FOR_LOOP, NodeKind.canonical("FOR"));
+    assertEquals(NodeKind.DO_WHILE_LOOP, NodeKind.canonical("DO_WHILE"));
+    assertEquals(NodeKind.METHOD_INVOCATION, NodeKind.canonical("CALL_EXPRESSION"));
+    assertEquals(NodeKind.NEW_CLASS, NodeKind.canonical("CONSTRUCTOR_CALL"));
+    assertEquals(NodeKind.MEMBER_SELECT, NodeKind.canonical("DOT_QUALIFIED_EXPRESSION"));
+    assertEquals(NodeKind.MEMBER_SELECT, NodeKind.canonical("SAFE_ACCESS_EXPRESSION"));
+    assertEquals(NodeKind.ARRAY_ACCESS, NodeKind.canonical("ARRAY_ACCESS_EXPRESSION"));
+    assertEquals(NodeKind.INT_LITERAL, NodeKind.canonical("INTEGER_CONSTANT"));
+    assertEquals(NodeKind.FLOAT_LITERAL, NodeKind.canonical("REAL_CONSTANT"));
+    assertEquals(NodeKind.BOOLEAN_LITERAL, NodeKind.canonical("BOOLEAN_CONSTANT"));
+    assertEquals(NodeKind.CHAR_LITERAL, NodeKind.canonical("CHARACTER_CONSTANT"));
+    assertEquals(NodeKind.STRING_LITERAL, NodeKind.canonical("STRING_TEMPLATE"));
+    assertEquals(NodeKind.NULL_LITERAL, NodeKind.canonical("NULL"));
+    // 规范名 / Kotlin 独有构造透传
+    assertEquals(NodeKind.METHOD, NodeKind.canonical("METHOD"));
+    assertEquals("WHEN", NodeKind.canonical("WHEN"));
+    assertEquals("OBJECT_LITERAL", NodeKind.canonical("OBJECT_LITERAL"));
   }
 
   @Test
