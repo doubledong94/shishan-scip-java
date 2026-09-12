@@ -2437,4 +2437,138 @@ class GraphExtractorTest {
     }
     return false;
   }
+
+  @Test
+  void catchParameterRegistersNameWithoutDisturbingChain() {
+    // Kotlin: `try { a() } catch (e: IOException) { b() }`，异常参数 e 是 per-file 的 `local 12`
+    // （IdentifierParameter）。handleTryCatch 只 walk catch 体块、不 walk catch 头，故此前该符号
+    // 没有声明节点、名字也无人登记，其读节点只能退回裸数字 `12`。
+    // 修法：在 catch 头单独登记声明（只建节点、不入链），从而读节点拿到源码名，且不破坏 TRY 时序。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 2, def("pkg/A#m().", "IdentifierFunctionDefinition", 2));
+    SyntaxTree.Node mBody = node("BLOCK", 3);
+    mBody.children.add(node("IDENTIFIER", 9, ref("pkg/A#e0.", "IdentifierConstant", 9)));
+
+    SyntaxTree.Node tryNode = node("TRY", 10);
+    SyntaxTree.Node tryBody = node("BLOCK", 11);
+    tryBody.children.add(node("IDENTIFIER", 12, ref("pkg/A#a.", "IdentifierConstant", 12)));
+    tryNode.children.add(tryBody);
+    SyntaxTree.Node catchNode = node("CATCH", 13);
+    // catch 头的异常参数：定义 occurrence，局部符号 local 12。
+    catchNode.children.add(node("IDENTIFIER", 13, def("local 12", "IdentifierParameter", 13)));
+    SyntaxTree.Node catchBody = node("BLOCK", 15);
+    // catch 体里对 e 的一次读。
+    catchBody.children.add(node("IDENTIFIER", 16, ref("local 12", "IdentifierParameter", 16)));
+    catchNode.children.add(catchBody);
+    tryNode.children.add(catchNode);
+    mBody.children.add(tryNode);
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"e0.", "a."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+    symbols.put("Foo.kt local 12", info(SymbolInformation.Kind.Parameter, "e"));
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "kotest", symbols);
+    extractor.extractFile("Foo.kt", cu);
+    extractor.emitRelationships();
+
+    // 1) 读节点用源码名 e，而不是裸数字 12。
+    List<Map<String, Object>> reads =
+        nodesOf(sink, GraphModel.LABEL_VALUE).stream()
+            .filter(v -> "local 12".equals(v.get("symbol")) && "read".equals(v.get("access")))
+            .toList();
+    assertEquals(1, reads.size(), "one read of the catch parameter");
+    assertEquals("e", reads.get(0).get("name"), "catch param read uses source name, not bare number");
+
+    // 2) TRY 时序不被破坏：e0 → TRY → try 体首 a，且 TRY → catch 体首（异常路径）。
+    List<Map<String, Object>> conds = nodesOf(sink, GraphModel.LABEL_CONDITION);
+    String tryId = null;
+    for (Map<String, Object> n : conds) {
+      if ("TRY".equals(n.get("kind"))) tryId = (String) n.get("_id");
+    }
+    assertTrue(tryId != null, "TRY condition node exists");
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.BiPredicate<String, String> next =
+        (from, to) -> nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+    String e0 = "kotest::Foo.kt#9:0:FIELD";
+    String a = "kotest::Foo.kt#12:0:FIELD";
+    assertTrue(next.test(e0, tryId), "preceding event still flows into TRY (chain not disturbed)");
+    assertTrue(next.test(tryId, a), "TRY still flows into try body first event");
+  }
+
+  @Test
+  void localReadFallsBackToIndexDisplayNameWhenNoDeclarationWalked() {
+    // 有些局部符号没有"被 walk 到的声明"（如只出现在未展开表达式里的中间变量），
+    // localNamesByFile 因此没有它；此时应回退到索引里的 display_name，而不是裸数字。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/Foo#", "IdentifierType", 1));
+    SyntaxTree.Node fun = node("FUN", 2, def("pkg/Foo#bar().", "IdentifierFunctionDefinition", 2));
+    // 只有一次读，没有任何声明（模拟声明未被 walk 到）。
+    fun.children.add(node("IDENTIFIER", 5, ref("local 15", "IdentifierLocal", 5)));
+    cls.children.add(fun);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/Foo#", info(SymbolInformation.Kind.Class, "Foo"));
+    symbols.put("pkg/Foo#bar().", info(SymbolInformation.Kind.Method, "bar"));
+    symbols.put("Foo.kt" + String.valueOf((char) 0) + "local 15", info(SymbolInformation.Kind.Variable, "callsToExecute"));
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "kotest", symbols);
+    extractor.extractFile("Foo.kt", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> reads =
+        nodesOf(sink, GraphModel.LABEL_VALUE).stream()
+            .filter(v -> "local 15".equals(v.get("symbol")) && "read".equals(v.get("access")))
+            .toList();
+    assertEquals(1, reads.size(), "one read of local 15");
+    assertEquals(
+        "callsToExecute",
+        reads.get(0).get("name"),
+        "local read falls back to index display_name, not bare number");
+  }
+
+  @Test
+  void localParameterReadsUseSourceNameNotBareNumber() {
+    // Kotlin 的 lambda 形参 / catch 参数都是 IdentifierParameter，但符号是 per-file 的 `local N`。
+    // 声明处必须把源码名登记进 localNamesByFile，否则同符号的读节点只能退回裸数字 `N`。
+    // 这里模拟 `fun bar() { list.forEach { sink -> sink.flush() } }`：
+    // local 67 的声明（sink）与读（sink.flush() 里的 sink）都要显示为 sink。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/Foo#", "IdentifierType", 1));
+    SyntaxTree.Node fun = node("FUN", 2, def("pkg/Foo#bar().", "IdentifierFunctionDefinition", 2));
+    // lambda 形参声明：local 67，源码名 sink。
+    fun.children.add(node("IDENTIFIER", 3, def("local 67", "IdentifierParameter", 3)));
+    // 对 local 67 的一次读（如 sink.flush() 的接收者）。
+    fun.children.add(node("IDENTIFIER", 4, ref("local 67", "IdentifierParameter", 4)));
+    cls.children.add(fun);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/Foo#", info(SymbolInformation.Kind.Class, "Foo"));
+    symbols.put("pkg/Foo#bar().", info(SymbolInformation.Kind.Method, "bar"));
+    // 局部符号按 (文件, 符号) 复合键查找，与 ScipAggregator 的收集口径一致。
+    symbols.put("Foo.kt local 67", info(SymbolInformation.Kind.Parameter, "sink"));
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "kotest", symbols);
+    extractor.extractFile("Foo.kt", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> reads =
+        nodesOf(sink, GraphModel.LABEL_VALUE).stream()
+            .filter(v -> "local 67".equals(v.get("symbol")) && "read".equals(v.get("access")))
+            .toList();
+    assertEquals(1, reads.size(), "one read of local 67");
+    assertEquals("sink", reads.get(0).get("name"), "local param read uses source name, not bare number");
+  }
 }

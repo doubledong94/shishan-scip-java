@@ -720,6 +720,25 @@ public final class GraphExtractor {
     return path.replace('/', '.');
   }
 
+  /**
+   * catch 头里的异常参数定义 occurrence（`catch (e: IOException)` 的 e）。只看 catch 头、不下潜
+   * 体块(BLOCK)——体里的局部定义不属于 catch 参数。Kotlin 把 catch 参数归为 IdentifierParameter、
+   * javac 归为 IdentifierLocal，两者都接受；只取role=definition 的 occurrence。
+   */
+  private static SyntaxTree.OccurrenceData localDefinitionIn(SyntaxTree.Node cat) {
+    for (SyntaxTree.OccurrenceData occ : cat.occurrences) {
+      if (occ.role == 1 && occ.symbol != null && !occ.symbol.isEmpty()) return occ;
+    }
+    for (SyntaxTree.Node c : cat.children) {
+      if (c.kind == null || c.kind.isEmpty() || c.kind.equals("WHITE_SPACE") || c.kind.equals("BLOCK")) {
+        continue;
+      }
+      SyntaxTree.OccurrenceData r = localDefinitionIn(c);
+      if (r != null) return r;
+    }
+    return null;
+  }
+
   private SyntaxTree.OccurrenceData catchTypeOccurrence(SyntaxTree.Node cat) {
     SyntaxTree.OccurrenceData occ = findTypeOccurrence(cat);
     if (occ != null) return occ;
@@ -794,6 +813,12 @@ public final class GraphExtractor {
         String exceptionType = catchExceptionType(file, cat);
         Map<String, Object> entryProps =
             exceptionType != null ? Map.of("exception", exceptionType) : null;
+        // 异常参数（`catch (e: IOException)` 的 e）只登记声明、不 walk：walk 会把它的读写成
+        // 顺序事件 append 到父块、把 try 体末的 pendingJoin 合并点消费掉。但完全不登记则
+        // 该 local 符号没有声明节点、localNamesByFile 也无从得知源码名，其读节点只能退回裸数字。
+        // createDeclaration 只建节点（形参分支不写 pendingLocalWrites），不入链，正好满足。
+        SyntaxTree.OccurrenceData paramDef = localDefinitionIn(cat);
+        if (paramDef != null) createDeclaration(file, cat, paramDef, cat);
         // catch 体从 TRY 锚定（走 startFrom 边，带 exception 属性）。只 walk 体块(BLOCK)：
         // 异常参数若按顺序事件 walk 会 appendChainEvent 到父块、把 try 体末的 pendingJoin 合并点消费掉。
         for (SyntaxTree.Node cc : cat.children) {
@@ -1553,7 +1578,14 @@ public final class GraphExtractor {
     } else if ("IdentifierParameter".equals(syntaxKind)) {
       props.put("kind", GraphModel.VALUE_KIND_PARAM);
       label = GraphModel.LABEL_VALUE;
-      if (!ScipSymbols.isLocal(symbol)) {
+      if (ScipSymbols.isLocal(symbol)) {
+        // 局部形参：Kotlin 的 lambda 形参 / catch 参数都归到 IdentifierParameter，但符号是
+        // per-file 的 "local N"。它们同样要登记源码名，否则该符号的读节点只能退回裸数字
+        // （如 `use { sink -> … }` 的 sink 全被显示成 67）。与 IdentifierLocal 同一张表。
+        localNamesByFile
+            .computeIfAbsent(file, k -> new java.util.HashMap<>())
+            .put(symbol, name);
+      } else {
         // Record the param against its method (declaration walk order == param order).
         String owner = ownerOf(symbol);
         if (owner != null && !owner.isEmpty()) {
@@ -2497,9 +2529,15 @@ public final class GraphExtractor {
   private String valueName(String file, String symbol) {
     if (symbol == null || symbol.isEmpty()) return symbol;
     if (ScipSymbols.isLocal(symbol)) {
+      // 优先用走树时登记的源码名（最贴近该处用法）。
       Map<String, String> fileNames = localNamesByFile.get(file);
       String n = fileNames == null ? null : fileNames.get(symbol);
       if (n != null && !n.isEmpty()) return n;
+      // 其次回退到索引里的 SymbolInformation：并非所有局部符号都有"被 walk 到的声明"
+      // （如只出现在未展开的表达式里的中间变量），但索引里仍有 display_name。
+      // 无此回退时这些读节点只能显示裸数字（shortName 对 "local N" 砍前缀）。
+      SymbolInformation info = infoOf(file, symbol);
+      if (info != null && !info.getDisplayName().isEmpty()) return info.getDisplayName();
       return shortName(symbol);
     }
     SymbolInformation info = symbols.get(symbol);
