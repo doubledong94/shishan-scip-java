@@ -102,10 +102,12 @@ class GraphExtractorTest {
         node("METHOD", 3, def("pkg/A#a().", "IdentifierFunctionDefinition", 3));
     SyntaxTree.Node methodM =
         node("METHOD", 4, def("pkg/A#m().", "IdentifierFunctionDefinition", 4));
-    methodM.children.add(node("VARIABLE", 5, def("local 0", "IdentifierLocal", 5)));
+    SyntaxTree.Node mBody = node("BLOCK", 4);
+    mBody.children.add(node("VARIABLE", 5, def("local 0", "IdentifierLocal", 5)));
     SyntaxTree.Node ifNode = node("IF", 6);
     ifNode.children.add(node("METHOD_INVOCATION", 7, ref("pkg/A#a().", "IdentifierFunction", 7)));
-    methodM.children.add(ifNode);
+    mBody.children.add(ifNode);
+    methodM.children.add(mBody);
     cls.children.add(methodA);
     cls.children.add(methodM);
     cu.children.add(cls);
@@ -141,25 +143,28 @@ class GraphExtractorTest {
     String callId = (String) calls.get(0).get("_id");
     assertTrue(hasEdge(sink, GraphModel.REL_CALLS, callId, "test::pkg/A#a()."));
 
-    // Branch layer: each method gets a METHOD-kind root condition; the IF is a branch of m's root.
+    // Branch layer: only real branch/loop/try conditions are materialized; no METHOD-kind root
+    // condition. Method m anchors its body chain directly (Method -[:NEXT]-> 首事件).
     List<Map<String, Object>> conditions = nodesOf(sink, GraphModel.LABEL_CONDITION);
-    assertEquals(3, conditions.size(), "two method roots + one if condition");
+    assertEquals(1, conditions.size(), "one if condition (no METHOD-kind root conditions)");
     String ifCond =
         conditions.stream()
             .filter(c -> GraphModel.CONDITION_KIND_IF.equals(c.get("kind")))
             .map(c -> (String) c.get("_id"))
             .findFirst()
             .orElseThrow();
-    String mRoot =
-        conditions.stream()
-            .filter(c -> GraphModel.CONDITION_KIND_METHOD.equals(c.get("kind")))
-            .map(c -> (String) c.get("_id"))
-            .filter(id -> hasEdge(sink, GraphModel.REL_ROOT, "test::pkg/A#m().", id))
-            .findFirst()
-            .orElseThrow();
-    // 顺序链：m 根条件 → if 条件的守卫读 → if 条件(条件也入链)。SUB 已移除。
-    assertTrue(hasEdge(sink, GraphModel.REL_ROOT, "test::pkg/A#m().", mRoot), "m root condition");
     assertTrue(ifCond != null && !ifCond.isEmpty(), "if condition exists");
+    // 方法入口：Method 经 NEXT 直连方法体首事件（不再有 ROOT 边、不再有 METHOD 根条件）。
+    assertFalse(
+        sink.edges.stream().anyMatch(e -> GraphModel.REL_ROOT.equals(e.get("_type"))),
+        "no ROOT edges remain");
+    assertTrue(
+        sink.edges.stream()
+            .anyMatch(
+                e ->
+                    GraphModel.REL_NEXT.equals(e.get("_type"))
+                        && "test::pkg/A#m().".equals(e.get("_from"))),
+        "method m enters its body chain via NEXT");
   }
 
   @Test
@@ -218,6 +223,116 @@ class GraphExtractorTest {
             .filter(v -> GraphModel.VALUE_KIND_CALLED_PARAM.equals(v.get("kind")))
             .anyMatch(v -> hasEdge(sink, GraphModel.REL_ARG_OF, (String) v.get("_id"), callId));
     assertTrue(argLinked, "kotlin argument ARG_OF the call");
+  }
+
+  @Test
+  void expressionBodiedMethodEntersBodyFromMethodNode() {
+    // Kotlin 表达式体方法（无体 BLOCK）：`fun f(x: Int): Int = if (flag) { a; } else { b; }`
+    // 回归：其分支块曾是 blockStack 深度 1，被误判成"方法体主块"，把分支首事件错接成
+    // `IF -[:NEXT]-> 方法链首` 的反向边（历史上 okhttp 这类 88 条回边的成因）。
+    // 现在链首 = Method 节点，且只由方法体（或首个块）认领一次：应为 Method→分支首事件，
+    // 绝不能出现"分支首事件→Method"。
+    SyntaxTree.Node cls = node("CLASS", 0);
+    cls.children.add(node("IDENTIFIER", 1, def("pkg/Foo#", "IdentifierType", 1)));
+    SyntaxTree.Node fun = node("FUN", 2);
+    fun.children.add(node("IDENTIFIER", 3, def("pkg/Foo#f().", "IdentifierFunctionDefinition", 3)));
+    // 注意：没有包住方法体的 BLOCK，方法体直接是 IF。
+    SyntaxTree.Node ifNode = node("IF", 4);
+    ifNode.children.add(node("IDENTIFIER", 5, ref("pkg/Foo#flag.", "IdentifierConstant", 5)));
+    SyntaxTree.Node thenB = node("BLOCK", 6);
+    thenB.children.add(node("IDENTIFIER", 7, ref("pkg/Foo#a.", "IdentifierConstant", 7)));
+    ifNode.children.add(thenB);
+    SyntaxTree.Node elseB = node("BLOCK", 8);
+    elseB.children.add(node("IDENTIFIER", 9, ref("pkg/Foo#b.", "IdentifierConstant", 9)));
+    ifNode.children.add(elseB);
+    fun.children.add(ifNode);
+    cls.children.add(fun);
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/Foo#", info(SymbolInformation.Kind.Class, "Foo"));
+    symbols.put("pkg/Foo#f().", info(SymbolInformation.Kind.Method, "f"));
+    for (String f : new String[] {"flag.", "a.", "b."}) {
+      symbols.put("pkg/Foo#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "kotest", symbols);
+    extractor.extractFile("Foo.kt", cu);
+    extractor.emitRelationships();
+
+    String methodId = "kotest::pkg/Foo#f().";
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+
+    // 方法入口：Method 经 NEXT 进入其方法体，且**有且仅有一条**这样的出边（入口只有一个）。
+    long entries = nexts.stream().filter(e -> methodId.equals(e.get("_from"))).count();
+    assertEquals(1, entries, "Method enters its body exactly once via NEXT");
+    // 关键回归：不得有任何 NEXT 反向指回 Method。表达式体方法的分支块曾因 blockStack 深度 1
+    // 被误判成方法体主块，把分支首事件接成 `IF -[:NEXT]-> 方法链首`（历史上 88 条回边的成因）。
+    assertTrue(
+        nexts.stream().noneMatch(e -> methodId.equals(e.get("_to"))),
+        "nothing may point back into the Method node");
+    // 且不再有 ROOT 边、不再有 METHOD-kind 的假条件节点。
+    assertTrue(
+        sink.edges.stream().noneMatch(e -> GraphModel.REL_ROOT.equals(e.get("_type"))),
+        "no ROOT edges remain");
+    assertTrue(
+        nodesOf(sink, GraphModel.LABEL_CONDITION).stream()
+            .noneMatch(c -> GraphModel.CONDITION_KIND_METHOD.equals(c.get("kind"))),
+        "no METHOD-kind root conditions remain");
+  }
+
+  @Test
+  void nestedMethodBodyDoesNotStealEnclosingBodyBlock() {
+    // 嵌套方法（lambda / 匿名对象成员）的体压在外层方法之上。此形状曾让"按栈顶认领体块"的收尾
+    // 弹错对象：内层方法弹掉外层的隐式体块，外层再弹一次 → ArrayDeque.pop() 抛
+    // NoSuchElementException（真实 okhttp 索引时崩在 GraphExtractor.exitBlock）。
+    // 注：本用例断言的是"跑完不抛 + 外层入口边正确"，把旧的栈顶收尾改回去它**仍会通过**——
+    // 即它没有精确复现那次崩溃。真正验证该修复的是 okhttp 全量索引跑通。
+    SyntaxTree.Node cls = node("CLASS", 0);
+    cls.children.add(node("IDENTIFIER", 1, def("pkg/Foo#", "IdentifierType", 1)));
+    SyntaxTree.Node outer = node("FUN", 2);
+    outer.children.add(node("IDENTIFIER", 3, def("pkg/Foo#outer().", "IdentifierFunctionDefinition", 3)));
+    SyntaxTree.Node outerBody = node("BLOCK", 4);
+    outerBody.children.add(node("IDENTIFIER", 5, ref("pkg/Foo#e0.", "IdentifierConstant", 5)));
+    // 内层方法：local 符号（匿名对象成员），直接挂在外层体里。
+    SyntaxTree.Node inner = node("FUN", 6);
+    inner.children.add(node("IDENTIFIER", 7, def("local 9", "IdentifierFunctionDefinition", 7)));
+    SyntaxTree.Node innerBody = node("BLOCK", 8);
+    innerBody.children.add(node("IDENTIFIER", 9, ref("pkg/Foo#e1.", "IdentifierConstant", 9)));
+    inner.children.add(innerBody);
+    outerBody.children.add(inner);
+    outerBody.children.add(node("IDENTIFIER", 10, ref("pkg/Foo#e2.", "IdentifierConstant", 10)));
+    outer.children.add(outerBody);
+    cls.children.add(outer);
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/Foo#", info(SymbolInformation.Kind.Class, "Foo"));
+    symbols.put("pkg/Foo#outer().", info(SymbolInformation.Kind.Method, "outer"));
+    symbols.put("local 9", info(SymbolInformation.Kind.Variable, "localFn"));
+    for (String f : new String[] {"e0.", "e1.", "e2."}) {
+      symbols.put("pkg/Foo#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    {
+      GraphExtractor extractor = new GraphExtractor(sink, "kotest", symbols);
+      extractor.extractFile("Foo.kt", cu);   // 不得抛 NoSuchElementException
+      extractor.emitRelationships();
+    }
+    String outerId = "kotest::pkg/Foo#outer().";
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    // 外层方法的链首边存在，且方法体链仍连续：Method → e0 读。
+    assertTrue(
+        nexts.stream()
+            .anyMatch(
+                e ->
+                    outerId.equals(e.get("_from"))
+                        && "kotest::Foo.kt#5:0:FIELD".equals(e.get("_to"))),
+        "outer method enters its body from the Method node");
   }
 
   @Test
@@ -346,10 +461,11 @@ class GraphExtractorTest {
     extractor.extractFile("Foo.kt", cu);
     extractor.emitRelationships();
 
-    // 匿名 peek 成为独立方法：有 METHOD 节点 + ROOT 锚点。
+    // 匿名 peek 成为独立方法：有 METHOD 节点；其方法体自成一条链，不回并外层函数块。
+    // （其符号是 per-file 的 `local 1`，没有可锚定的 Method 节点，故不建 Method→首事件 边——
+    //  isolation 保证它不与外层 bar 的 NEXT 链相连即可，见下方断言。）
     String peekId = "kotest::Foo.kt::local 1";
     assertTrue(hasNode(sink, GraphModel.LABEL_METHOD, peekId), "anonymous peek method node");
-    assertTrue(hasEdge(sink, GraphModel.REL_ROOT, peekId, null), "anonymous peek has ROOT anchor");
 
     // peek 体里的 peekTrailers 调用点，不应从主流程 trailers() 直接 NEXT 到达（方法体已隔离）。
     List<Map<String, Object>> calls = nodesOf(sink, GraphModel.LABEL_CALLED_METHOD);
@@ -916,12 +1032,12 @@ class GraphExtractorTest {
     // 这类跨函数 NEXT）。被调 foo 自己的链（Method 根→q）独立成立；调用方 m 的链在调用点后继续
     // （calledReturn→y）。跨函数关联由 CALLS 等逻辑边表达，不再用 NEXT 串起来。
     String calledMethod = "test::Foo.java#20:0";
-    String fooRoot = "test::Foo.java#2:0:root"; // callee foo 的 METHOD 根条件（顺序链首事件）
+    String fooMethod = "test::pkg/A#foo()."; // callee foo 的 Method 节点即其链首（不再有根条件）
     String q = "test::Foo.java#5:0:FIELD";
     String calledReturn = "test::Foo.java#20:0:CALLED_RETURN";
     String y = "test::Foo.java#25:0:FIELD";
-    assertTrue(!next.test(calledMethod, fooRoot), "no cross-function NEXT into callee METHOD-root");
-    assertTrue(next.test(fooRoot, q), "callee body starts after METHOD root (within callee)");
+    assertTrue(!next.test(calledMethod, fooMethod), "no cross-function NEXT into callee Method");
+    assertTrue(next.test(fooMethod, q), "callee body starts at its Method node (within callee)");
     assertTrue(!next.test(q, calledReturn), "no cross-function NEXT from callee exit to calledReturn");
     assertTrue(next.test(calledReturn, y), "caller continues after the call (within caller)");
   }

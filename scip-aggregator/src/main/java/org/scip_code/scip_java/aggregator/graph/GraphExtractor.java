@@ -78,7 +78,21 @@ public final class GraphExtractor {
   // any placeholder Method targets are queued, so batch flushes never write an edge to a missing node.
   private final java.util.List<java.util.List<String>> deferredCalls = new java.util.ArrayList<>();
 
-  private final Deque<String> methodRootConds = new ArrayDeque<>();
+  // 每个方法压一个"隐式体块"承载其方法体内的链（见 pushMethodScope），与 methodSymbols 平行。
+  // 不再物化 kind=METHOD 的"根条件"假节点、不建 ROOT 边：那个节点没有自己的语义（无守卫值、
+  // 不参与 CONTROLS/逻辑维度、位置还是借方法的 range）。方法体链首改为 Method 节点自身——
+  // 体块的 startFrom = Method，于是方法体首事件经 "Method -[:NEXT]-> 首事件" 进入（跨函数展开
+  // 只剩 CALLS→NEXT 两跳）。
+  //
+  // 为什么必须有这个块：Kotlin 表达式体方法（`override fun f() = if(…) {…}`）**没有体 BLOCK**，
+  // 先前它的表达式内容落在 blockStack 为空的状态里 → 守卫读/分支全成孤立节点，而老代码用在
+  // "深度 1"块里塞根条件的办法硬接，导致分支首事件被接成 `IF -[:NEXT]-> 方法链首` 的反向边
+  // （okhttp 实测 88 条这类回边）。隐式块让表达式体方法与块体方法走同一条路径：
+  // 方法有真体 BLOCK 时由该 BLOCK 接管（见 enterBlock，并置 methodBodyTakenOver = true），
+  // 没有时隐式块一直承载到方法出口——出口靠**对象同一性**认领，不能只看栈顶（嵌套方法会把
+  // 外层的隐式块误当自己的）。
+  private final Deque<BlockBuilder> implicitBodies = new ArrayDeque<>();
+  private final Deque<Boolean> methodBodyTakenOver = new ArrayDeque<>();
   private final Deque<String> conds = new ArrayDeque<>();
   private final Deque<String> methodSymbols = new ArrayDeque<>();
   // 独立方法单元：被调方为 `local N` 的方法（匿名对象成员/lambda/局部函数）不应把方法体并进
@@ -1377,7 +1391,9 @@ public final class GraphExtractor {
       // 进入块(如 try/嵌套块)前先冲掉更早行的延迟写(如 val x = … 的写)，否则该块的起点/续接
       // 会锚到"写之前"的最后链事件(如 equals()#)，导致后续分支分叉/续接定位到错误节点。
       flushLocalWrites(file, rangeLine(node));
-      enterBlock(node, file);
+      // 方法体块 = 直接挂在方法节点下的 BLOCK。据此认领方法链首（Method）——不能按栈深/栈顶判定：
+      // 前者会被表达式体方法的分支块误判，后者会被嵌套方法抢走外层的体块。
+      enterBlock(node, file, parent != null && isMethodKind(parent.kind));
     }
 
     SyntaxTree.OccurrenceData def = definition(node);
@@ -1440,9 +1456,22 @@ public final class GraphExtractor {
     appendChainEvent(file, id, GraphModel.LABEL_VALUE, rangeLine(node)); // 顺序 NEXT
   }
 
-  private void enterBlock(SyntaxTree.Node node, String file) {
+  /**
+   * @param isMethodBody 本 BLOCK 是否直接挂在方法节点下（即方法体块）。是则接管该方法在
+   *     pushMethodScope 里压下的隐式体块：继承其链首（Method），隐式块退场。
+   */
+  private void enterBlock(SyntaxTree.Node node, String file, boolean isMethodBody) {
     BlockBuilder b = new BlockBuilder();
-    if (!pendingBranchStartFrom.isEmpty()) {
+    if (isMethodBody && !implicitBodies.isEmpty() && !methodBodyTakenOver.peek()) {
+      // 方法体不是"分支块"：先于 pendingBranchStartFrom 判定——即便该方法定义在某个分支里
+      // （如 lambda 体内），它的体也不该从那个分支条件进入。
+      BlockBuilder imb = implicitBodies.pop();
+      b.startFrom = imb.startFrom;
+      blockStack.pop();
+      if (isolatedBodies.remove(imb)) isolatedBodies.add(b);
+      methodBodyTakenOver.pop();
+      methodBodyTakenOver.push(true);
+    } else if (!pendingBranchStartFrom.isEmpty()) {
       // 分支块起点取栈顶（当前分支压入的），弹出使该分支后续的嵌套块不误用同一起点。
       b.startFrom = pendingBranchStartFrom.pop();
     } else if (!blockStack.isEmpty()) {
@@ -1457,33 +1486,33 @@ public final class GraphExtractor {
         EventRef prev = parent.lastEvent();
         if (prev != null) b.startFrom = prev;
         else if (isolatedBodies.contains(parent) && parent.startFrom != null) {
-          // 独立方法体的首块：从该方法的根条件起链（不含外层函数块），保证独立方法自成一条时序。
+          // 独立方法体的首块：从该方法自身起链（不含外层函数块），保证独立方法自成一条时序。
           b.startFrom = parent.startFrom;
           parent.startFrom = null;
         }
       }
     }
     blockStack.push(b);
-    // 方法体主块（blockStack 深度 1）：把 METHOD 根条件作为该函数顺序链的首事件（方法入口），
-    // 使函数体第一个运行时事件的前置 = METHOD 条件。
-    if (blockStack.size() == 1 && !methodRootConds.isEmpty()) {
-      appendChainEvent(file, methodRootConds.peek(), GraphModel.LABEL_CONDITION, rangeLine(node));
-    }
   }
 
   private void exit(String file, SyntaxTree.Node node) {
     if (isConditionKind(node.kind) && !conds.isEmpty()) conds.pop();
     if (isMethodKind(node.kind)) {
-      if (!methodRootConds.isEmpty()) methodRootConds.pop();
-      if (!conds.isEmpty()) conds.pop(); // method root condition
+      // 方法体块（隐式体块，或已接管的真体 BLOCK）在 exitBlock 中随 BLOCK 弹出；
+      // 表达式体方法没有体 BLOCK，其隐式体块要在此收尾。按**对象同一性**认领自己那一块——
+      // 不能只看栈顶：嵌套方法（lambda/匿名对象）的方法体会压在外层之上，用栈顶会弹错外层的块。
+      boolean takenOver = !methodBodyTakenOver.isEmpty() && methodBodyTakenOver.pop();
+      if (!takenOver && !implicitBodies.isEmpty()) {
+        BlockBuilder imb = implicitBodies.pop();
+        if (!blockStack.isEmpty() && blockStack.peek() == imb) {
+          blockStack.pop().finish();
+        }
+        isolatedBodies.remove(imb);
+      }
+      // 方法顶层不压 conds（见 pushMethodScope），故此处不弹。
       if (!scopeStack.isEmpty()) scopeStack.pop();
       if (!methodSymbols.isEmpty()) methodSymbols.pop();
-      if (!isolatedStack.isEmpty() && isolatedStack.pop()) {
-        // 独立方法体出口：链末端不回并外层函数块（该方法是独立单元，不在外层执行序中）。
-        BlockBuilder iso = blockStack.pop();
-        iso.finish();
-        isolatedBodies.remove(iso);
-      }
+      if (!isolatedStack.isEmpty()) isolatedStack.pop();
     }
     if (node.kind.equals("BLOCK")) {
       exitBlock(file, rangeEndLine(node));
@@ -1516,6 +1545,10 @@ public final class GraphExtractor {
     flushLocalWritesUpTo(file, endLine);
     BlockBuilder b = blockStack.pop();
     List<Join> ends = b.finish();
+    if (isolatedBodies.remove(b)) {
+      // 独立方法体（lambda/匿名对象成员/局部函数）：链末端不回并外层函数块（自成一条时序）。
+      return;
+    }
     if (blockStack.isEmpty()) {
       String m = methodSymbols.isEmpty() ? null : methodSymbols.peek();
       if (m != null && !m.isEmpty()) {
@@ -1560,35 +1593,20 @@ public final class GraphExtractor {
     } else {
       methodSymbols.push("");
     }
-    // The root condition anchors LEADS_TO for body-level runtime nodes; created in all cases so
-    // the enter/exit stacks stay symmetric.
-    ScipRange range = def != null && def.range != null ? def.range : node.range;
-    String rootCond = runtimeId(project, file, range, "root");
-    Map<String, Object> rootProps = new LinkedHashMap<>();
-    rootProps.put("file", file);
-    rootProps.put("line", range == null ? 0 : range.startLine());
-    rootProps.put("col", range == null ? 0 : range.startCharacter());
-    rootProps.put("colEnd", range == null ? 0 : range.endCharacter());
-    rootProps.put("kind", GraphModel.CONDITION_KIND_METHOD);
-    writer.addNode(GraphModel.LABEL_CONDITION, rootCond, rootProps);
+    // 方法体链首 = Method 节点自身：压一个隐式体块，其 startFrom = Method。
+    // 方法若有真体 BLOCK，该 BLOCK 进来时接管它（见 enterBlock）；表达式体方法则由它承载到底。
+    // 不再物化 kind=METHOD 的"根条件"假节点、不建 ROOT 边（见字段注释）。
+    // conds 是"当前条件作用域"栈：方法体顶层不属于任何条件，故不压栈（栈空即"无当前条件"）。
+    BlockBuilder body = new BlockBuilder();
     if (hasSymbol) {
-      writer.addEdge(
-          GraphModel.REL_ROOT,
-          GraphModel.LABEL_METHOD, declId(project, file, symbol),
-          GraphModel.LABEL_CONDITION, rootCond);
+      body.startFrom = new EventRef(declId(project, file, symbol), GraphModel.LABEL_METHOD);
     }
-    methodRootConds.push(rootCond);
-    conds.push(rootCond);
+    blockStack.push(body);
+    implicitBodies.push(body);
+    methodBodyTakenOver.push(false);
     if (isolated) {
-      // 独立方法体的链记录器：其链从本方法根条件起（方法入口），且出口不回并外层函数块。
-      BlockBuilder iso = new BlockBuilder();
-      iso.startFrom = new EventRef(rootCond, GraphModel.LABEL_CONDITION);
-      blockStack.push(iso);
-      isolatedBodies.add(iso);
-      // 匿名/局部方法自身作为独立方法单元：加 ROOT 锚点（作为独立方法可发现）。
-      writer.addEdge(
-          GraphModel.REL_ROOT, GraphModel.LABEL_METHOD, declId(project, file, symbol),
-          GraphModel.LABEL_CONDITION, rootCond);
+      // 独立方法体：出口不回并外层函数块（该方法是独立单元，不在外层执行序中）。
+      isolatedBodies.add(body);
     }
   }
 
