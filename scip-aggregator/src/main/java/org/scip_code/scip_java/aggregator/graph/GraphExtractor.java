@@ -816,9 +816,10 @@ public final class GraphExtractor {
         // 异常参数（`catch (e: IOException)` 的 e）只登记声明、不 walk：walk 会把它的读写成
         // 顺序事件 append 到父块、把 try 体末的 pendingJoin 合并点消费掉。但完全不登记则
         // 该 local 符号没有声明节点、localNamesByFile 也无从得知源码名，其读节点只能退回裸数字。
-        // createDeclaration 只建节点（形参分支不写 pendingLocalWrites），不入链，正好满足。
+        // asParameter=true：按「参数绑定」建节点（kind=PARAM、不入 NEXT 链）。若按变量声明处理，
+        // 它会被当成一次延迟写入链，导致 try 体尾多出一条 NEXT 指向它（把参数绑定误作赋值）。
         SyntaxTree.OccurrenceData paramDef = localDefinitionIn(cat);
-        if (paramDef != null) createDeclaration(file, cat, paramDef, cat);
+        if (paramDef != null) createDeclaration(file, cat, paramDef, cat, true);
         // catch 体从 TRY 锚定（走 startFrom 边，带 exception 属性）。只 walk 体块(BLOCK)：
         // 异常参数若按顺序事件 walk 会 appendChainEvent 到父块、把 try 体末的 pendingJoin 合并点消费掉。
         for (SyntaxTree.Node cc : cat.children) {
@@ -1548,9 +1549,22 @@ public final class GraphExtractor {
 
   private void createDeclaration(
       String file, SyntaxTree.Node node, SyntaxTree.OccurrenceData def, SyntaxTree.Node parent) {
+    createDeclaration(file, node, def, parent, false);
+  }
+
+  /**
+   * @param asParameter 该定义是「参数绑定」（如 catch 参数），而非「带初始化的变量声明」（{@code val/var x = …}）。
+   *     catch 参数在 SCIP 里可能落成 IdentifierLocal（javac 的 EXCEPTION_PARAMETER、Kotlin 的 catch 头），
+   *     若按变量声明处理，它会被登记成一次「延迟写」并入 NEXT 链——于是 try 体尾会连一条 NEXT 到它，
+   *     等于在图上说「try 体执行完 → 写下 e」。实际 e 由异常本身写入、且在进入 catch 体时即已绑定，
+   *     不属于 try 体的执行序。故按参数语义建节点（kind=PARAM、不入链）。
+   */
+  private void createDeclaration(
+      String file, SyntaxTree.Node node, SyntaxTree.OccurrenceData def, SyntaxTree.Node parent,
+      boolean asParameter) {
     String symbol = def.symbol;
     if (symbol.isEmpty()) return;
-    String syntaxKind = def.syntaxKind;
+    String syntaxKind = asParameter ? "IdentifierParameter" : def.syntaxKind;
     // 局部符号（"local N"）按文件区分查找，避免跨文件同号折叠成错误的 displayName。
     SymbolInformation info = infoOf(file, symbol);
     String name = displayName(info, symbol);

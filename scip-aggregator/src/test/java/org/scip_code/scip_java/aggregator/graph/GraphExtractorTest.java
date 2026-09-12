@@ -2502,6 +2502,20 @@ class GraphExtractorTest {
     String a = "kotest::Foo.kt#12:0:FIELD";
     assertTrue(next.test(e0, tryId), "preceding event still flows into TRY (chain not disturbed)");
     assertTrue(next.test(tryId, a), "TRY still flows into try body first event");
+
+    // 3) 参数绑定不当作赋值：声明节点是 kind=PARAM 且不入 NEXT 链。
+    //    若按变量声明处理（IdentifierLocal 分支的延迟写），try 体尾会多一条 NEXT 指向它，
+    //    等于在图上说「try 体执行完 → 写下 e」——而 e 由异常本身写入、不属于 try 体执行序。
+    List<Map<String, Object>> decls =
+        nodesOf(sink, GraphModel.LABEL_VALUE).stream()
+            .filter(v -> "local 12".equals(v.get("symbol")) && v.get("access") == null)
+            .toList();
+    assertEquals(1, decls.size(), "catch param declaration node exists");
+    assertEquals(GraphModel.VALUE_KIND_PARAM, decls.get(0).get("kind"), "catch param is kind=PARAM");
+    String declId = (String) decls.get(0).get("_id");
+    assertTrue(
+        nexts.stream().noneMatch(e -> declId.equals(e.get("_from")) || declId.equals(e.get("_to"))),
+        "catch param declaration is not on the NEXT chain (no spurious write edge from try body)");
   }
 
   @Test
@@ -2535,6 +2549,101 @@ class GraphExtractorTest {
         "callsToExecute",
         reads.get(0).get("name"),
         "local read falls back to index display_name, not bare number");
+  }
+
+  @Test
+  void catchParameterWithLocalSyntaxKindIsNotChainedAsWrite() {
+    // 真实语料里 catch 参数常落成 IdentifierLocal（javac 的 EXCEPTION_PARAMETER、Kotlin catch 头）。
+    // 该分支会把定义当成「声明式赋值」登记进 pendingLocalWrites 并入 NEXT 链，于是 try 体尾多出
+    // 一条 NEXT 指向 catch 参数——把「参数绑定」误作「写」。catch 头登记时须按参数语义处理。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 2, def("pkg/A#m().", "IdentifierFunctionDefinition", 2));
+    SyntaxTree.Node mBody = node("BLOCK", 3);
+    mBody.children.add(node("IDENTIFIER", 9, ref("pkg/A#e0.", "IdentifierConstant", 9)));
+
+    SyntaxTree.Node tryNode = node("TRY", 10);
+    SyntaxTree.Node tryBody = node("BLOCK", 11);
+    tryBody.children.add(node("IDENTIFIER", 12, ref("pkg/A#a.", "IdentifierConstant", 12)));
+    tryNode.children.add(tryBody);
+    SyntaxTree.Node catchNode = node("CATCH", 13);
+    // 关键：catch 参数的定义 occurrence 是 IdentifierLocal（而非 IdentifierParameter）。
+    catchNode.children.add(node("IDENTIFIER", 13, def("local 12", "IdentifierLocal", 13)));
+    SyntaxTree.Node catchBody = node("BLOCK", 15);
+    catchBody.children.add(node("IDENTIFIER", 16, ref("local 12", "IdentifierParameter", 16)));
+    catchNode.children.add(catchBody);
+    tryNode.children.add(catchNode);
+    mBody.children.add(tryNode);
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    symbols.put("pkg/A#e0.", info(SymbolInformation.Kind.Field, "e0."));
+    symbols.put("pkg/A#a.", info(SymbolInformation.Kind.Field, "a."));
+    symbols.put("Foo.kt" + String.valueOf((char) 0) + "local 12",
+        info(SymbolInformation.Kind.Parameter, "e"));
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "kotest", symbols);
+    extractor.extractFile("Foo.kt", cu);
+    extractor.emitRelationships();
+
+    // 声明节点按参数建：kind=PARAM、无 access（不是写）。
+    List<Map<String, Object>> decls =
+        nodesOf(sink, GraphModel.LABEL_VALUE).stream()
+            .filter(v -> "local 12".equals(v.get("symbol")) && v.get("access") == null)
+            .toList();
+    assertEquals(1, decls.size(), "catch param declaration node exists");
+    assertEquals(GraphModel.VALUE_KIND_PARAM, decls.get(0).get("kind"), "catch param is kind=PARAM");
+    String declId = (String) decls.get(0).get("_id");
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    assertTrue(
+        nexts.stream().noneMatch(e -> declId.equals(e.get("_from")) || declId.equals(e.get("_to"))),
+        "catch param is not chained as a write (no spurious try-tail -> param edge)");
+    // 读节点仍取到源码名。
+    List<Map<String, Object>> reads =
+        nodesOf(sink, GraphModel.LABEL_VALUE).stream()
+            .filter(v -> "local 12".equals(v.get("symbol")) && "read".equals(v.get("access")))
+            .toList();
+    assertEquals("e", reads.get(0).get("name"), "catch param read uses source name");
+  }
+
+  @Test
+  void localVariableDeclarationStillChainsAsWrite() {
+    // 回归护栏：真正的声明式赋值（val x = …）仍须作为「写」入 NEXT 链，未被 catch 参数的修法误伤。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 2, def("pkg/A#m().", "IdentifierFunctionDefinition", 2));
+    SyntaxTree.Node mBody = node("BLOCK", 3);
+    mBody.children.add(node("IDENTIFIER", 9, ref("pkg/A#e0.", "IdentifierConstant", 9)));
+    // val x = … 的 LHS 定义 occurrence（IdentifierLocal，且不在 catch 头）。
+    mBody.children.add(node("IDENTIFIER", 10, def("local 3", "IdentifierLocal", 10)));
+    mBody.children.add(node("IDENTIFIER", 20, ref("pkg/A#tail.", "IdentifierConstant", 20)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    symbols.put("pkg/A#e0.", info(SymbolInformation.Kind.Field, "e0."));
+    symbols.put("pkg/A#tail.", info(SymbolInformation.Kind.Field, "tail."));
+    symbols.put("Foo.kt" + String.valueOf((char) 0) + "local 3",
+        info(SymbolInformation.Kind.Variable, "x"));
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "kotest", symbols);
+    extractor.extractFile("Foo.kt", cu);
+    extractor.emitRelationships();
+
+    String declId = "kotest::Foo.kt::local 3";
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    assertTrue(
+        nexts.stream().anyMatch(e -> declId.equals(e.get("_from")) || declId.equals(e.get("_to"))),
+        "val x = ... declaration is still on the NEXT chain (guard against over-fixing)");
   }
 
   @Test
