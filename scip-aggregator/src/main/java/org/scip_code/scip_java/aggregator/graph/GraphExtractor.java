@@ -87,9 +87,10 @@ public final class GraphExtractor {
   private final Deque<Boolean> isolatedStack = new ArrayDeque<>();
   private final java.util.Set<BlockBuilder> isolatedBodies = new java.util.HashSet<>();
   // switch case 体首事件捕获：非负时，blockStack 深度 == 该值+1 的块首事件记入 capturedBodyHead
-  // （供 fall-through 连边）；-1 表示不捕获。
+  // （供 fall-through 连边）；-1 表示不捕获。label 一并记下，连边时才能给出正确的 from 标签。
   private int captureBodyHeadDepth = -1;
   private String capturedBodyHead = null;
+  private String capturedBodyHeadLabel = null;
   // Cross-method binding: callee method symbol → its params in declaration order.
   private final Map<String, java.util.List<String>> paramsByMethod = new java.util.HashMap<>();
   // CALLED_PARAM 槽的形参后置补正：paramsByMethod 在处理到被调文件时才填充，调用点可能在它
@@ -319,6 +320,7 @@ public final class GraphExtractor {
     if (captureBodyHeadDepth >= 0 && blockStack.size() == captureBodyHeadDepth + 1
         && b.events.size() == 1) {
       capturedBodyHead = id;
+      capturedBodyHeadLabel = label;
     }
     // First event of the outermost (method body) block → cross-function entry.
     if (blockStack.size() == 1 && b.events.size() == 1) {
@@ -963,6 +965,10 @@ public final class GraphExtractor {
     }
 
     // 2) 逐个非 default 的 case 建条件节点并链成 if-else-if（对齐 when：default 不建条件节点）。
+    //    空 case 体（`case L1: case L2: B;` 里的 L1、`case L1: break;` 之外的裸标签）不建条件节点：
+    //    没有体可承载真路径，条件会变成一个真路径无出边的悬挂节点。语义上它只是"与下一个 case 合并"，
+    //    故折叠进下一个非空 case —— 即"命中本标签等价于命中下一个非空 case"，这正是合并标签的含义。
+    //    condCases 因此只收非空 case，step 3/5 的数组都按 condCases 的序，彼此对齐。
     List<Scope> branchScopes = new ArrayList<>();
     List<SyntaxTree.Node> condCases = new ArrayList<>();
     List<String> condIds = new ArrayList<>();
@@ -970,6 +976,8 @@ public final class GraphExtractor {
     EventRef prevCond = null;
     for (SyntaxTree.Node c : cases) {
       if (isDefaultCase(c)) { defaultCase = c; continue; }
+      // 空 case 体：不建条件节点，折叠进下一个非空 case（见上）。condCases 因此只含非空 case。
+      if (caseBodyNodes(c).isEmpty()) continue;
       List<SyntaxTree.Node> labels = caseLabels(c);
       SyntaxTree.Node anchor = labels.isEmpty() ? c : labels.get(0);
       String condId = runtimeId(project, file, anchor.range, null);
@@ -1004,23 +1012,26 @@ public final class GraphExtractor {
     //    exitBlock 像 when 的块体一样把链尾登记为 pendingJoin。分支体首事件单独捕获，供 fall-through 连边。
     int n = condCases.size();
     String[] bodyHeads = new String[n];
+    String[] bodyHeadLabels = new String[n]; // 体首事件的节点标签，连 fall-through 边时要给出正确的 from 标签
     boolean[] fallsThrough = new boolean[n];
     List<List<Join>> caseTails = new ArrayList<>(); // 每个 case 各自体尾（fall-through 只连自己这条）
     for (int i = 0; i < n; i++) {
       SyntaxTree.Node c = condCases.get(i);
       List<SyntaxTree.Node> bodyNodes = caseBodyNodes(c);
-      if (bodyNodes.isEmpty()) continue;
       pushBranchScope();
       int depth = pendingBranchStartFrom.size();
       pendingBranchStartFrom.push(new EventRef(condIds.get(i), GraphModel.LABEL_CONDITION,
           Map.of("branch", "true")));
       capturedBodyHead = null;
+      capturedBodyHeadLabel = null;
       captureBodyHeadDepth = blockStack.size();
       int before = blockStack.peek().pendingJoins.size();
       walk(file, syntheticBlock(c, bodyNodes), c, 0);
       captureBodyHeadDepth = -1;
       bodyHeads[i] = capturedBodyHead;
+      bodyHeadLabels[i] = capturedBodyHeadLabel;
       // 本 case 体尾（本块新增的 pendingJoin）单独留存，供 fall-through 只连自己这一条。
+      // 体为空时 tail 为空列表（不是不追加）——caseTails 必须与 condCases 同长同序，否则按下标取会错位。
       List<Join> tail = new ArrayList<>(blockStack.peek().pendingJoins.subList(
           before, blockStack.peek().pendingJoins.size()));
       caseTails.add(tail);
@@ -1034,15 +1045,18 @@ public final class GraphExtractor {
     List<SyntaxTree.Node> defaultBody = defaultCase == null
         ? java.util.Collections.emptyList() : caseBodyNodes(defaultCase);
     String defaultHead = null;
+    String defaultHeadLabel = null;
     if (!defaultBody.isEmpty() && prevCond != null) {
       pushBranchScope();
       int depth = pendingBranchStartFrom.size();
       pendingBranchStartFrom.push(new EventRef(prevCond.id, prevCond.label, Map.of("branch", "false")));
       capturedBodyHead = null;
+      capturedBodyHeadLabel = null;
       captureBodyHeadDepth = blockStack.size();
       walk(file, syntheticBlock(defaultCase, defaultBody), defaultCase, 0);
       captureBodyHeadDepth = -1;
       defaultHead = capturedBodyHead;
+      defaultHeadLabel = capturedBodyHeadLabel;
       while (pendingBranchStartFrom.size() > depth) pendingBranchStartFrom.pop();
       branchScopes.add(scopeStack.pop());
       // default 无 break 而坠出 switch（default 是最后一个标签）→ 体尾自然汇入 switch 之后（无需处理）。
@@ -1057,14 +1071,21 @@ public final class GraphExtractor {
     //    switch 之后。
     if (!blockStack.isEmpty()) {
       BlockBuilder swBlock = blockStack.peek();
-      for (int i = 0; i < n - 1; i++) {
+      for (int i = 0; i < n; i++) {
         if (!fallsThrough[i]) continue;
-        String nextHead = bodyHeads[i + 1] != null ? bodyHeads[i + 1] : defaultHead;
-        if (nextHead == null) continue;
-        if (i >= caseTails.size()) continue;
+        // 下一个承接体：跳过空体 case（其体在更后面的 case 里，合并标签语义），走到第一个非空体首；
+        // 一个都没有则落到 default 体首。这就是 `case L1: A; case L2: case L3: C;` 里 A 应坠到 C。
+        EventRef nextHead = null;
+        for (int j = i + 1; j < n && nextHead == null; j++) {
+          if (bodyHeads[j] != null) nextHead = new EventRef(bodyHeads[j], bodyHeadLabels[j]);
+        }
+        if (nextHead == null && defaultHead != null) {
+          nextHead = new EventRef(defaultHead, defaultHeadLabel);
+        }
+        if (nextHead == null || nextHead.id == null) continue;
         List<Join> tail = caseTails.get(i);
         for (Join j : tail) {
-          writer.addEdge(GraphModel.REL_NEXT, j.label, j.id, GraphModel.LABEL_VALUE, nextHead);
+          writer.addEdge(GraphModel.REL_NEXT, j.label, j.id, nextHead.label, nextHead.id);
         }
         swBlock.pendingJoins.removeAll(tail); // 该分支尾已坠入下一 case，不再汇入 switch 之后
       }
@@ -1081,24 +1102,48 @@ public final class GraphExtractor {
   }
 
   /**
-   * case 体是否 fall-through（执行完坠入下一个 case）。Java 语义：体末语句若为 break/return/throw/
-   * continue（含其包装语句如 EXPRESSION_STATEMENT 包裹的 BREAK），则控制流离开本 case，不坠落；
-   * 否则（普通语句结尾）坠入下一 case。体的最后一条语句决定，空体视为坠落（合并标签）。
+   * case 体是否 fall-through（执行完坠入下一个 case）。Java 语义：体末语句<b>必然</b>离开本 case
+   * （break/return/throw/continue）时不坠落，否则坠入下一 case。空体视为坠落（合并标签）。
+   *
+   * <p>关键是"必然"：末条为 {@code if (c) return;} 时，c 为假仍会坠入下一个 case，故仍算坠落——
+   * 若按"存在 abrupt 路径"判定，这条坠落边会丢，控制流被错误地截断。
    */
   private static boolean bodyFallsThrough(List<SyntaxTree.Node> bodyNodes) {
     if (bodyNodes.isEmpty()) return true;
     SyntaxTree.Node last = bodyNodes.get(bodyNodes.size() - 1);
-    return !isAbruptStatement(last);
+    return !alwaysAbrupt(last);
   }
 
-  /** 该语句（或其后代，不进入内层循环——其 break 属于循环不属于 switch）是否为 abrupt 离开。 */
-  private static boolean isAbruptStatement(SyntaxTree.Node n) {
+  /**
+   * 该语句是否<b>必然</b> abrupt 离开（所有路径都离开）。不进入内层循环/匿名函数（其 break/return
+   * 属于它们自己，不离开本 switch）。条件语句(if/switch/when)只在<b>所有</b>分支都必然 abrupt、
+   * 且无隐式坠落出口时才必然 abrupt；try 不视为必然（异常路径之外仍可能正常完成）。
+   */
+  private static boolean alwaysAbrupt(SyntaxTree.Node n) {
     if (n == null) return false;
     if (isAbruptKind(n.kind)) return true;
     if (isLoopKind(n.kind)) return false; // 内层循环的 break/continue 不离开 switch
     if (n.kind.equals("LAMBDA_EXPRESSION") || n.kind.equals("FUN")) return false;
+    if (isConditionKind(n.kind)) {
+      // if(c) return; 只有一条分支且无 else → c 为假时坠落，不必然 abrupt。
+      // if(c) return; else throw; 两条分支都 abrupt 且无坠落出口 → 必然 abrupt。
+      // 循环/switch 型条件不在此保证（switch 另有 handleSwitch；这里保守判为不必然）。
+      if (!n.kind.equals("IF")) return false;
+      List<SyntaxTree.Node> branches = branchChildren(n);
+      if (branches.size() < 2) return false; // 无 else：存在坠落出口
+      for (SyntaxTree.Node b : branches) {
+        if (!alwaysAbrupt(b)) return false;
+      }
+      return true;
+    }
+    // 其余包装语句（EXPRESSION_STATEMENT / BLOCK / 语句序列）：
+    // BLOCK 取最后一条语句判定；其它容器取"存在必然 abrupt 的后代"。
+    if (n.kind.equals("BLOCK")) {
+      List<SyntaxTree.Node> stmts = nonWhitespaceChildren(n);
+      return !stmts.isEmpty() && alwaysAbrupt(stmts.get(stmts.size() - 1));
+    }
     for (SyntaxTree.Node c : n.children) {
-      if (isAbruptStatement(c)) return true;
+      if (alwaysAbrupt(c)) return true;
     }
     return false;
   }

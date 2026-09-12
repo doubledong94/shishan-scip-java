@@ -1456,6 +1456,176 @@ class GraphExtractorTest {
     assertTrue(next.test(B, end), "case ending in break merges after switch");
   }
 
+  /** 建一个带单个标签与若干语句的 CASE（stmts 为符号短名，行号自增；brk 决定末尾是否加 BREAK）。 */
+  private static SyntaxTree.Node caseNode(int line, String labelSym, String[] stmts, boolean brk) {
+    SyntaxTree.Node c = node("CASE", line);
+    if (labelSym != null) {
+      c.children.add(node("IDENTIFIER", line, ref("pkg/A#" + labelSym, "IdentifierConstant", line)));
+    } else {
+      c.children.add(node("DEFAULT", line));
+    }
+    int l = line + 1;
+    for (String s : stmts) {
+      SyntaxTree.Node st = node("EXPRESSION_STATEMENT", l);
+      st.children.add(node("IDENTIFIER", l, ref("pkg/A#" + s, "IdentifierConstant", l)));
+      c.children.add(st);
+      l++;
+    }
+    if (brk) c.children.add(node("BREAK", l));
+    return c;
+  }
+
+  /** 把若干 CASE 组装进 `void m() { e0; switch (s) { … } end; }`，跑完后返回本次的 sink。 */
+  private static MemorySink runSwitchSink(SyntaxTree.Node[] caseNodes, String[] fieldNames) {
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+    mBody.children.add(node("IDENTIFIER", 12, ref("pkg/A#e0.", "IdentifierConstant", 12)));
+    SyntaxTree.Node s = node("SWITCH", 13);
+    s.children.add(node("IDENTIFIER", 13, ref("pkg/A#s.", "IdentifierConstant", 13)));
+    for (SyntaxTree.Node c : caseNodes) s.children.add(c);
+    mBody.children.add(s);
+    mBody.children.add(node("IDENTIFIER", 90, ref("pkg/A#end.", "IdentifierConstant", 90)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : fieldNames) symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+    return sink;
+  }
+
+  /** 同 {@link #runSwitchSink}，但返回 NEXT 边判定器。 */
+  private static java.util.function.BiPredicate<String, String> runSwitch(
+      SyntaxTree.Node[] caseNodes, String[] fieldNames) {
+    MemorySink sink = runSwitchSink(caseNodes, fieldNames);
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    return (from, to) -> nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+  }
+
+  @Test
+  void javaSwitchFallThroughSkipsEmptyCases() {
+    // switch (s) { case L1: A; case L2: case L3: C; break; }
+    // L2 是空体（合并标签）：L1 的坠落边应穿过它直达 L3 的体首 C，而不是停在中途或汇入 end。
+    java.util.function.BiPredicate<String, String> next =
+        runSwitch(
+            new SyntaxTree.Node[] {
+              caseNode(14, "L1", new String[] {"a"}, false),
+              caseNode(16, "L2", new String[] {}, false),
+              caseNode(17, "L3", new String[] {"c"}, true)
+            },
+            new String[] {"e0.", "s.", "L1.", "L2.", "L3.", "a.", "c.", "end."});
+
+    String A = "test::Foo.java#15:0:FIELD";
+    String C = "test::Foo.java#18:0:FIELD";
+    String end = "test::Foo.java#90:0:FIELD";
+    assertTrue(next.test(A, C), "fall-through skips empty case and lands on next non-empty body");
+    assertTrue(!next.test(A, end), "fall-through tail does not merge after switch");
+    assertTrue(next.test(C, end), "break case merges after switch");
+  }
+
+  @Test
+  void javaSwitchFallThroughFromNonEmptyToNextCase() {
+    // switch (s) { case L1: case L2: A; case L3: C; break; }
+    // L2 体无 break → A 坠到 L3 体首 C；且不得产生 A→A 自环。
+    java.util.function.BiPredicate<String, String> next =
+        runSwitch(
+            new SyntaxTree.Node[] {
+              caseNode(14, "L1", new String[] {}, false),
+              caseNode(15, "L2", new String[] {"a"}, false),
+              caseNode(17, "L3", new String[] {"c"}, true)
+            },
+            new String[] {"e0.", "s.", "L1.", "L2.", "L3.", "a.", "c.", "end."});
+
+    String A = "test::Foo.java#16:0:FIELD";
+    String C = "test::Foo.java#18:0:FIELD";
+    String end = "test::Foo.java#90:0:FIELD";
+    assertTrue(next.test(A, C), "fall-through chains to next case body");
+    assertTrue(!next.test(A, A), "fall-through must not create a self edge");
+    assertTrue(!next.test(A, end), "fall-through tail does not merge after switch");
+    assertTrue(next.test(C, end), "break case merges after switch");
+  }
+
+  @Test
+  void javaSwitchMergedLabelCaseHasTruePathIntoNextBody() {
+    // switch (s) { case L1: case L2: B; break; }
+    // L1 是空体（合并标签）：命中 L1 等价于命中 L2，故 L1 折叠进 L2——只有一个条件节点，
+    // 其真路径必须进入 B（空体若建条件节点，真路径会悬挂无出边）。
+    MemorySink sink =
+        runSwitchSink(
+            new SyntaxTree.Node[] {
+              caseNode(14, "L1", new String[] {}, false),
+              caseNode(16, "L2", new String[] {"b"}, true)
+            },
+            new String[] {"e0.", "s.", "L1.", "L2.", "b.", "end."});
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.BiPredicate<String, String> next =
+        (from, to) -> nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+
+    String cond = "test::Foo.java#16:0";
+    String B = "test::Foo.java#17:0:FIELD";
+    // 空体的 L1 不建自己的条件节点（每一行至多一个条件节点）；若建了，其真路径会悬挂无出边。
+    assertEquals(1, conditionsOfKind(sink, GraphModel.CONDITION_KIND_IF).size(),
+        "empty merged-label case creates no dangling condition of its own");
+    assertTrue(next.test(cond, B), "merged label's condition true path enters the shared body");
+  }
+
+  @Test
+  void javaSwitchConditionalAbruptStillFallsThrough() {
+    // switch (s) { case L1: A; if (c) return; case L2: B; break; }
+    // 末条 if(c) return 只在 c 为真时离开：c 为假仍坠入 L2，故本条应 fall-through（假路径 → B）。
+    SyntaxTree.Node case1 = node("CASE", 14);
+    case1.children.add(node("IDENTIFIER", 14, ref("pkg/A#L1.", "IdentifierConstant", 14)));
+    SyntaxTree.Node aStmt = node("EXPRESSION_STATEMENT", 15);
+    aStmt.children.add(node("IDENTIFIER", 15, ref("pkg/A#a.", "IdentifierConstant", 15)));
+    case1.children.add(aStmt);
+    SyntaxTree.Node iff = node("IF", 16);
+    iff.children.add(node("IDENTIFIER", 16, ref("pkg/A#c.", "IdentifierConstant", 16)));
+    iff.children.add(node("RETURN", 16));
+    case1.children.add(iff);
+
+    java.util.function.BiPredicate<String, String> next =
+        runSwitch(
+            new SyntaxTree.Node[] {case1, caseNode(17, "L2", new String[] {"b"}, true)},
+            new String[] {"e0.", "s.", "L1.", "L2.", "c.", "a.", "b.", "end."});
+
+    String cond = "test::Foo.java#16:0";
+    String B = "test::Foo.java#18:0:FIELD";
+    String end = "test::Foo.java#90:0:FIELD";
+    assertTrue(next.test(cond, B), "conditional abrupt leaves a fall-through path to the next case");
+    assertTrue(!next.test(cond, end), "conditional abrupt must not be treated as always-abrupt");
+  }
+
+  @Test
+  void javaSwitchAllBranchesAbruptIsNotFallThrough() {
+    // switch (s) { case L1: if (c) return; else throw; case L2: B; break; }
+    // 两条分支都 abrupt 且无隐式出口 → 该 case 必然离开，不坠落（不应连到 L2）。
+    SyntaxTree.Node case1 = node("CASE", 14);
+    case1.children.add(node("IDENTIFIER", 14, ref("pkg/A#L1.", "IdentifierConstant", 14)));
+    SyntaxTree.Node iff = node("IF", 15);
+    iff.children.add(node("IDENTIFIER", 15, ref("pkg/A#cl1.", "IdentifierConstant", 15)));
+    iff.children.add(node("RETURN", 15));
+    iff.children.add(node("THROW", 15));
+    case1.children.add(iff);
+
+    java.util.function.BiPredicate<String, String> next =
+        runSwitch(
+            new SyntaxTree.Node[] {case1, caseNode(17, "L2", new String[] {"b"}, true)},
+            new String[] {"e0.", "s.", "L1.", "L2.", "cl1.", "b.", "end."});
+
+    String L2 = "test::Foo.java#17:0:FIELD";
+    String B = "test::Foo.java#18:0:FIELD";
+    assertTrue(!next.test(L2, B), "always-abrupt case (if/else both abrupt) does not fall through");
+  }
+
   @Test
   void nestedWithElseIfAsLastStatementFansTailsIntoOuterMerge() {
     // void m() { e0; if (c1) { X; if (c2) { A } else { B } } else { D } end; }
