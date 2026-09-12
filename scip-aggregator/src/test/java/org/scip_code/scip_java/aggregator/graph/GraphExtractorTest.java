@@ -1396,6 +1396,67 @@ class GraphExtractorTest {
   }
 
   @Test
+  void javaSwitchFallThroughChainsToNextCaseAndBreakDoesNot() {
+    // void m() { switch (s) { case L1: A; case L2: B; break; } end; }
+    // L1 体以普通语句 A 结尾 → fall-through：A 尾 NEXT 到 L2 体首 B（而非汇入 end）。
+    // L2 体以 break 结尾 → 不 fall-through：B 尾汇入 end。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+    mBody.children.add(node("IDENTIFIER", 12, ref("pkg/A#e0.", "IdentifierConstant", 12)));
+
+    SyntaxTree.Node sw = node("SWITCH", 13);
+    sw.children.add(node("IDENTIFIER", 13, ref("pkg/A#s.", "IdentifierConstant", 13)));
+    // case L1: A;   (无 break → fall-through)
+    SyntaxTree.Node case1 = node("CASE", 14);
+    case1.children.add(node("IDENTIFIER", 14, ref("pkg/A#L1.", "IdentifierConstant", 14)));
+    SyntaxTree.Node aStmt = node("EXPRESSION_STATEMENT", 15);
+    aStmt.children.add(node("IDENTIFIER", 15, ref("pkg/A#a.", "IdentifierConstant", 15)));
+    case1.children.add(aStmt);
+    sw.children.add(case1);
+    // case L2: B; break;   (有 break → 不 fall-through)
+    SyntaxTree.Node case2 = node("CASE", 16);
+    case2.children.add(node("IDENTIFIER", 16, ref("pkg/A#L2.", "IdentifierConstant", 16)));
+    SyntaxTree.Node bStmt = node("EXPRESSION_STATEMENT", 17);
+    bStmt.children.add(node("IDENTIFIER", 17, ref("pkg/A#b.", "IdentifierConstant", 17)));
+    case2.children.add(bStmt);
+    case2.children.add(node("BREAK", 17));
+    sw.children.add(case2);
+    mBody.children.add(sw);
+    mBody.children.add(node("IDENTIFIER", 19, ref("pkg/A#end.", "IdentifierConstant", 19)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"e0.", "s.", "L1.", "L2.", "a.", "b.", "end."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.BiPredicate<String, String> next =
+        (from, to) -> nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+
+    String A = "test::Foo.java#15:0:FIELD";
+    String B = "test::Foo.java#17:0:FIELD";
+    String end = "test::Foo.java#19:0:FIELD";
+    // L1 无 break → fall-through：A 尾 → L2 体首 B
+    assertTrue(next.test(A, B), "case without break falls through to next case body");
+    // A 尾不汇入 end（它坠入了下一个 case）
+    assertTrue(!next.test(A, end), "fall-through case tail does NOT merge after switch");
+    // L2 有 break → 不 fall-through：B 尾汇入 end
+    assertTrue(next.test(B, end), "case ending in break merges after switch");
+  }
+
+  @Test
   void nestedWithElseIfAsLastStatementFansTailsIntoOuterMerge() {
     // void m() { e0; if (c1) { X; if (c2) { A } else { B } } else { D } end; }
     // 内层有 else 的 if(c2) 是 c1-then 的最后一条语句：它在本块内没有"之后的事件"，故不在块内

@@ -86,6 +86,10 @@ public final class GraphExtractor {
   // 出口不回并父块。
   private final Deque<Boolean> isolatedStack = new ArrayDeque<>();
   private final java.util.Set<BlockBuilder> isolatedBodies = new java.util.HashSet<>();
+  // switch case 体首事件捕获：非负时，blockStack 深度 == 该值+1 的块首事件记入 capturedBodyHead
+  // （供 fall-through 连边）；-1 表示不捕获。
+  private int captureBodyHeadDepth = -1;
+  private String capturedBodyHead = null;
   // Cross-method binding: callee method symbol → its params in declaration order.
   private final Map<String, java.util.List<String>> paramsByMethod = new java.util.HashMap<>();
   // CALLED_PARAM 槽的形参后置补正：paramsByMethod 在处理到被调文件时才填充，调用点可能在它
@@ -310,6 +314,12 @@ public final class GraphExtractor {
       b.startFrom = null;
     }
     b.events.add(new EventRef(id, label));
+    // switch case 体首事件捕获：fall-through 的体尾要连到下一 case 体首；仅捕获合成体块的最外层首事件
+    // （blockStack 深度 = 进入体块前的深度 +1，且是该块的首事件）。
+    if (captureBodyHeadDepth >= 0 && blockStack.size() == captureBodyHeadDepth + 1
+        && b.events.size() == 1) {
+      capturedBodyHead = id;
+    }
     // First event of the outermost (method body) block → cross-function entry.
     if (blockStack.size() == 1 && b.events.size() == 1) {
       String m = methodSymbols.isEmpty() ? null : methodSymbols.peek();
@@ -989,10 +999,14 @@ public final class GraphExtractor {
       condIds.add(condId);
     }
 
-    // 3) 走每条非 default case 的体（真路径从各自条件进入）。javac 的 CASE 子节点是
-    //    [标签, 语句..., BREAK] 平铺；包一层合成 BLOCK，使分支体经 enterBlock/exitBlock 像 when 的块体
-    //    一样把链尾登记为 pendingJoin → 正确汇入 switch 之后（真路径 mark branch="true"）。
-    for (int i = 0; i < condCases.size(); i++) {
+    // 3) 走每条 case 的体（非 default 真路径从各自条件进入；default 从末条件假路径进入，对齐 when else）。
+    //    javac 的 CASE 子节点是 [标签, 语句..., BREAK] 平铺；包一层合成 BLOCK，使分支体经 enterBlock/
+    //    exitBlock 像 when 的块体一样把链尾登记为 pendingJoin。分支体首事件单独捕获，供 fall-through 连边。
+    int n = condCases.size();
+    String[] bodyHeads = new String[n];
+    boolean[] fallsThrough = new boolean[n];
+    List<List<Join>> caseTails = new ArrayList<>(); // 每个 case 各自体尾（fall-through 只连自己这条）
+    for (int i = 0; i < n; i++) {
       SyntaxTree.Node c = condCases.get(i);
       List<SyntaxTree.Node> bodyNodes = caseBodyNodes(c);
       if (bodyNodes.isEmpty()) continue;
@@ -1000,26 +1014,60 @@ public final class GraphExtractor {
       int depth = pendingBranchStartFrom.size();
       pendingBranchStartFrom.push(new EventRef(condIds.get(i), GraphModel.LABEL_CONDITION,
           Map.of("branch", "true")));
+      capturedBodyHead = null;
+      captureBodyHeadDepth = blockStack.size();
+      int before = blockStack.peek().pendingJoins.size();
       walk(file, syntheticBlock(c, bodyNodes), c, 0);
+      captureBodyHeadDepth = -1;
+      bodyHeads[i] = capturedBodyHead;
+      // 本 case 体尾（本块新增的 pendingJoin）单独留存，供 fall-through 只连自己这一条。
+      List<Join> tail = new ArrayList<>(blockStack.peek().pendingJoins.subList(
+          before, blockStack.peek().pendingJoins.size()));
+      caseTails.add(tail);
       while (pendingBranchStartFrom.size() > depth) pendingBranchStartFrom.pop();
       branchScopes.add(scopeStack.pop());
+      fallsThrough[i] = bodyFallsThrough(bodyNodes);
     }
 
     // 4) default 体从末条件假路径进入（对齐 when 的 else）；无 default 时末条件假路径 fall-through
     //    汇入 switch 之后（"全部不匹配"的出口）。
     List<SyntaxTree.Node> defaultBody = defaultCase == null
         ? java.util.Collections.emptyList() : caseBodyNodes(defaultCase);
+    String defaultHead = null;
     if (!defaultBody.isEmpty() && prevCond != null) {
       pushBranchScope();
       int depth = pendingBranchStartFrom.size();
       pendingBranchStartFrom.push(new EventRef(prevCond.id, prevCond.label, Map.of("branch", "false")));
+      capturedBodyHead = null;
+      captureBodyHeadDepth = blockStack.size();
       walk(file, syntheticBlock(defaultCase, defaultBody), defaultCase, 0);
+      captureBodyHeadDepth = -1;
+      defaultHead = capturedBodyHead;
       while (pendingBranchStartFrom.size() > depth) pendingBranchStartFrom.pop();
       branchScopes.add(scopeStack.pop());
+      // default 无 break 而坠出 switch（default 是最后一个标签）→ 体尾自然汇入 switch 之后（无需处理）。
     } else if (prevCond != null && !blockStack.isEmpty()) {
       // 无 default：全部不匹配则落入 switch 之后，fall-through 汇入边即假路径，标 branch="false"。
       blockStack.peek().pendingJoins.add(
           new Join(prevCond.id, prevCond.label, Map.of("branch", "false")));
+    }
+
+    // 5) 显式 fall-through：case 体未以 break/return/throw 结束 → 该 case 自己的体尾 NEXT 到下一个
+    //    case 体首（而非汇入 switch 之后）。非 fall-through（break/return 结尾）的体尾保留，照常汇入
+    //    switch 之后。
+    if (!blockStack.isEmpty()) {
+      BlockBuilder swBlock = blockStack.peek();
+      for (int i = 0; i < n - 1; i++) {
+        if (!fallsThrough[i]) continue;
+        String nextHead = bodyHeads[i + 1] != null ? bodyHeads[i + 1] : defaultHead;
+        if (nextHead == null) continue;
+        if (i >= caseTails.size()) continue;
+        List<Join> tail = caseTails.get(i);
+        for (Join j : tail) {
+          writer.addEdge(GraphModel.REL_NEXT, j.label, j.id, GraphModel.LABEL_VALUE, nextHead);
+        }
+        swBlock.pendingJoins.removeAll(tail); // 该分支尾已坠入下一 case，不再汇入 switch 之后
+      }
     }
     mergeBranchScopes(branchScopes, node);
   }
@@ -1030,6 +1078,35 @@ public final class GraphExtractor {
     block.range = src.range;
     block.children.addAll(stmts);
     return block;
+  }
+
+  /**
+   * case 体是否 fall-through（执行完坠入下一个 case）。Java 语义：体末语句若为 break/return/throw/
+   * continue（含其包装语句如 EXPRESSION_STATEMENT 包裹的 BREAK），则控制流离开本 case，不坠落；
+   * 否则（普通语句结尾）坠入下一 case。体的最后一条语句决定，空体视为坠落（合并标签）。
+   */
+  private static boolean bodyFallsThrough(List<SyntaxTree.Node> bodyNodes) {
+    if (bodyNodes.isEmpty()) return true;
+    SyntaxTree.Node last = bodyNodes.get(bodyNodes.size() - 1);
+    return !isAbruptStatement(last);
+  }
+
+  /** 该语句（或其后代，不进入内层循环——其 break 属于循环不属于 switch）是否为 abrupt 离开。 */
+  private static boolean isAbruptStatement(SyntaxTree.Node n) {
+    if (n == null) return false;
+    if (isAbruptKind(n.kind)) return true;
+    if (isLoopKind(n.kind)) return false; // 内层循环的 break/continue 不离开 switch
+    if (n.kind.equals("LAMBDA_EXPRESSION") || n.kind.equals("FUN")) return false;
+    for (SyntaxTree.Node c : n.children) {
+      if (isAbruptStatement(c)) return true;
+    }
+    return false;
+  }
+
+  private static boolean isAbruptKind(String kind) {
+    return kind.equals("BREAK") || kind.equals("RETURN")
+        || kind.equals("THROW") || kind.equals("CONTINUE")
+        || kind.equals("YIELD");
   }
 
   private static boolean isSwitchKind(String kind) {
