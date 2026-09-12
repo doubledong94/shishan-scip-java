@@ -1319,6 +1319,83 @@ class GraphExtractorTest {
   }
 
   @Test
+  void javaSwitchForksLikeKotlinWhen() {
+    // void m() { e0; switch (s) { case L1: A; break; default: B; } end; }
+    // switch 与 when 对齐：选择器读 s 先入链；每个 case 的条件(标签读)恒 2 分叉
+    // (真→case 体首、假→下一 case 条件)；default 从末条件假路径进入；各分支尾汇入 end。
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 10, def("pkg/A#m().", "IdentifierFunctionDefinition", 10));
+    SyntaxTree.Node mBody = node("BLOCK", 11);
+    mBody.children.add(node("IDENTIFIER", 12, ref("pkg/A#e0.", "IdentifierConstant", 12)));
+
+    SyntaxTree.Node sw = node("SWITCH", 13);
+    // 选择器 s
+    sw.children.add(node("IDENTIFIER", 13, ref("pkg/A#s.", "IdentifierConstant", 13)));
+    // case L1: A; break;
+    SyntaxTree.Node case1 = node("CASE", 14);
+    case1.children.add(node("IDENTIFIER", 14, ref("pkg/A#L1.", "IdentifierConstant", 14)));
+    SyntaxTree.Node aStmt = node("EXPRESSION_STATEMENT", 15);
+    aStmt.children.add(node("IDENTIFIER", 15, ref("pkg/A#a.", "IdentifierConstant", 15)));
+    case1.children.add(aStmt);
+    case1.children.add(node("BREAK", 15));
+    sw.children.add(case1);
+    // default: B;
+    SyntaxTree.Node case2 = node("CASE", 16);
+    case2.children.add(node("DEFAULT", 16));
+    SyntaxTree.Node bStmt = node("EXPRESSION_STATEMENT", 17);
+    bStmt.children.add(node("IDENTIFIER", 17, ref("pkg/A#b.", "IdentifierConstant", 17)));
+    case2.children.add(bStmt);
+    sw.children.add(case2);
+    mBody.children.add(sw);
+    mBody.children.add(node("IDENTIFIER", 19, ref("pkg/A#end.", "IdentifierConstant", 19)));
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"e0.", "s.", "L1.", "a.", "b.", "end."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+
+    List<Map<String, Object>> nexts = edgesOf(sink, GraphModel.REL_NEXT);
+    java.util.function.Function<String, Long> nextOutCount =
+        id -> nexts.stream().filter(e -> id.equals(e.get("_from"))).count();
+    java.util.function.Function<String, Long> nextInCount =
+        id -> nexts.stream().filter(e -> id.equals(e.get("_to"))).count();
+    java.util.function.BiPredicate<String, String> next =
+        (from, to) -> nexts.stream().anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+
+    // case L1 的条件节点在 L1 标签行(14)。
+    String cond1 = "test::Foo.java#14:0";
+    String s = "test::Foo.java#13:0:FIELD";
+    String L1 = "test::Foo.java#14:0:FIELD";
+    String A = "test::Foo.java#15:0:FIELD";
+    String B = "test::Foo.java#17:0:FIELD";
+    String end = "test::Foo.java#19:0:FIELD";
+
+    // 选择器读先入链（先求值），再是标签读，然后才是 case 条件节点。
+    assertTrue(next.test(s, L1), "switch selector read precedes the case label read");
+    // 标签读先入链：L1 → case 条件
+    assertTrue(next.test(L1, cond1), "case label read precedes the case condition");
+    // case 条件恒 2 分叉：真→case 体首 A，假→default 分支首 B
+    assertEquals(2L, (long) nextOutCount.apply(cond1), "switch case condition forks exactly 2");
+    assertTrue(next.test(cond1, A), "case true path -> case body");
+    assertTrue(next.test(cond1, B), "case false path -> default branch");
+    assertTrue(!next.test(cond1, L1), "case label read is not a branch target");
+    // 合并点 end 汇入 A 尾 + B 尾
+    assertTrue(next.test(A, end), "case body tail merges into after-switch");
+    assertTrue(next.test(B, end), "default body tail merges into after-switch");
+  }
+
+  @Test
   void nestedWithElseIfAsLastStatementFansTailsIntoOuterMerge() {
     // void m() { e0; if (c1) { X; if (c2) { A } else { B } } else { D } end; }
     // 内层有 else 的 if(c2) 是 c1-then 的最后一条语句：它在本块内没有"之后的事件"，故不在块内

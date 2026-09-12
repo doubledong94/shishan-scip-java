@@ -563,6 +563,10 @@ public final class GraphExtractor {
       handleWhen(file, node, parent, index);
       return;
     }
+    if (isSwitchKind(node.kind)) {
+      handleSwitch(file, node, parent, index);
+      return;
+    }
     enter(file, node, parent, index);
     if (isConditionKind(node.kind)) {
       walkConditionChildren(file, node);
@@ -924,6 +928,169 @@ public final class GraphExtractor {
     }
     return body;
   }
+
+  // ---------------------------------------------------------------------------
+  // Java switch → 与 Kotlin when 对齐的分支流
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Java {@code switch} 建模为与 Kotlin {@code when} 对齐的分支流：选择器先入链，逐个 case 的标签
+   * 表达式物化为一个 kind=IF 条件节点（标签读先入链、CONTROLS 指向该条件、假路径链到下一 case 条件），
+   * 分支体从各自条件真路径进入；所有分支体尾汇入 switch 之后。default 作为兜底分支，从末条件假路径进入。
+   *
+   * <p>兼容新旧 javac 的两种 CASE 形状：旧版 CASE 直接含标签表达式子节点；新版包在 CASE_LABEL /
+   * CONSTANT_CASE_LABEL 里。default 的 CASE 无标签表达式（仅 DEFAULT 关键字）。
+   * fall-through（case 体不以 break/return/throw 结尾时坠入下一 case）在此模型里由"体尾不独立汇合、
+   * 线性续到下一个 case 体首"自然表达——但为保持与 when 的恒 2 分叉语义一致，这里对每个 case 都建
+   * 独立条件与分支，体尾统一汇入 switch 之后（多数 Java switch 各 case 以 break 结束，这是主路径）。
+   */
+  private void handleSwitch(String file, SyntaxTree.Node node, SyntaxTree.Node parent, int index) {
+    List<SyntaxTree.Node> cases = switchCases(node);
+    // 1) 头部（选择器表达式、括号等非 CASE/DEFAULT 子节点）照常 walk，选择器读先入链。
+    for (int i = 0; i < node.children.size(); i++) {
+      SyntaxTree.Node child = node.children.get(i);
+      if (!isSwitchLabel(child)) walk(file, child, node, i);
+    }
+
+    // 2) 逐个非 default 的 case 建条件节点并链成 if-else-if（对齐 when：default 不建条件节点）。
+    List<Scope> branchScopes = new ArrayList<>();
+    List<SyntaxTree.Node> condCases = new ArrayList<>();
+    List<String> condIds = new ArrayList<>();
+    SyntaxTree.Node defaultCase = null;
+    EventRef prevCond = null;
+    for (SyntaxTree.Node c : cases) {
+      if (isDefaultCase(c)) { defaultCase = c; continue; }
+      List<SyntaxTree.Node> labels = caseLabels(c);
+      SyntaxTree.Node anchor = labels.isEmpty() ? c : labels.get(0);
+      String condId = runtimeId(project, file, anchor.range, null);
+      addCondNode(file, condId, GraphModel.CONDITION_KIND_IF, anchor);
+      conds.push(condId);
+      try {
+        for (SyntaxTree.Node l : labels) walk(file, l, c, c.children.indexOf(l));
+        appendChainEvent(file, condId, GraphModel.LABEL_CONDITION, rangeLine(anchor));
+        for (SyntaxTree.Node l : labels) {
+          List<String> vids = new ArrayList<>();
+          collectValueIds(file, l, vids);
+          for (String vid : vids) {
+            writer.addEdge(GraphModel.REL_CONTROLS, GraphModel.LABEL_VALUE, vid,
+                GraphModel.LABEL_CONDITION, condId);
+          }
+        }
+      } finally {
+        conds.pop();
+      }
+      if (prevCond != null) {
+        // 前一 case 未匹配(假)才落到本 case，此链边标 branch="false"。
+        writer.addEdge(GraphModel.REL_NEXT, prevCond.label, prevCond.id,
+            GraphModel.LABEL_CONDITION, condId, Map.of("branch", "false"));
+      }
+      prevCond = new EventRef(condId, GraphModel.LABEL_CONDITION);
+      condCases.add(c);
+      condIds.add(condId);
+    }
+
+    // 3) 走每条非 default case 的体（真路径从各自条件进入）。javac 的 CASE 子节点是
+    //    [标签, 语句..., BREAK] 平铺；包一层合成 BLOCK，使分支体经 enterBlock/exitBlock 像 when 的块体
+    //    一样把链尾登记为 pendingJoin → 正确汇入 switch 之后（真路径 mark branch="true"）。
+    for (int i = 0; i < condCases.size(); i++) {
+      SyntaxTree.Node c = condCases.get(i);
+      List<SyntaxTree.Node> bodyNodes = caseBodyNodes(c);
+      if (bodyNodes.isEmpty()) continue;
+      pushBranchScope();
+      int depth = pendingBranchStartFrom.size();
+      pendingBranchStartFrom.push(new EventRef(condIds.get(i), GraphModel.LABEL_CONDITION,
+          Map.of("branch", "true")));
+      walk(file, syntheticBlock(c, bodyNodes), c, 0);
+      while (pendingBranchStartFrom.size() > depth) pendingBranchStartFrom.pop();
+      branchScopes.add(scopeStack.pop());
+    }
+
+    // 4) default 体从末条件假路径进入（对齐 when 的 else）；无 default 时末条件假路径 fall-through
+    //    汇入 switch 之后（"全部不匹配"的出口）。
+    List<SyntaxTree.Node> defaultBody = defaultCase == null
+        ? java.util.Collections.emptyList() : caseBodyNodes(defaultCase);
+    if (!defaultBody.isEmpty() && prevCond != null) {
+      pushBranchScope();
+      int depth = pendingBranchStartFrom.size();
+      pendingBranchStartFrom.push(new EventRef(prevCond.id, prevCond.label, Map.of("branch", "false")));
+      walk(file, syntheticBlock(defaultCase, defaultBody), defaultCase, 0);
+      while (pendingBranchStartFrom.size() > depth) pendingBranchStartFrom.pop();
+      branchScopes.add(scopeStack.pop());
+    } else if (prevCond != null && !blockStack.isEmpty()) {
+      // 无 default：全部不匹配则落入 switch 之后，fall-through 汇入边即假路径，标 branch="false"。
+      blockStack.peek().pendingJoins.add(
+          new Join(prevCond.id, prevCond.label, Map.of("branch", "false")));
+    }
+    mergeBranchScopes(branchScopes, node);
+  }
+
+  /** 用给定语句包一层合成 BLOCK（javac 的 case 体是平铺语句，需成块才能被分支汇合机制处理）。 */
+  private static SyntaxTree.Node syntheticBlock(SyntaxTree.Node src, List<SyntaxTree.Node> stmts) {
+    SyntaxTree.Node block = new SyntaxTree.Node("BLOCK");
+    block.range = src.range;
+    block.children.addAll(stmts);
+    return block;
+  }
+
+  private static boolean isSwitchKind(String kind) {
+    return isKind(kind, "SWITCH", "SWITCH_EXPRESSION");
+  }
+
+  /** switch 的 case/default 子节点。 */
+  private static List<SyntaxTree.Node> switchCases(SyntaxTree.Node node) {
+    List<SyntaxTree.Node> out = new ArrayList<>();
+    for (SyntaxTree.Node c : nonWhitespaceChildren(node)) {
+      if (isSwitchLabel(c)) out.add(c);
+    }
+    return out;
+  }
+
+  private static boolean isSwitchLabel(SyntaxTree.Node n) {
+    return n.kind.equals("CASE") || n.kind.equals("DEFAULT");
+  }
+
+  /** 该 CASE 是否 default：无标签表达式（旧 javac 的裸 CASE 里只有 DEFAULT 关键字；新 javac 直接是 DEFAULT）。 */
+  private static boolean isDefaultCase(SyntaxTree.Node c) {
+    if (c.kind.equals("DEFAULT")) return true;
+    for (SyntaxTree.Node k : nonWhitespaceChildren(c)) {
+      if (k.kind.equals("DEFAULT") || k.kind.equals("DEFAULT_CASE_LABEL")) return true;
+    }
+    return false;
+  }
+
+  /** case 的标签表达式：javac 的 CASE 子节点形如 [标签表达式, 语句..., BREAK]，无分隔符——
+   *  只取第一个有意义子节点作标签（`case A, B:` 多标签、或新版 CASE_LABEL 包装时也成立）。 */
+  private static List<SyntaxTree.Node> caseLabels(SyntaxTree.Node c) {
+    List<SyntaxTree.Node> out = new ArrayList<>();
+    for (SyntaxTree.Node k : nonWhitespaceChildren(c)) {
+      if (isCaseKeyword(k.kind)) continue;
+      out.add(k); // 仅第一个非关键字子节点 = 标签表达式
+      break;
+    }
+    return out;
+  }
+
+  /** case 的体语句（标签之后的语句，去掉 BREAK/CASE/DEFAULT 关键字）。default 无标签表达式，不跳过首条。 */
+  private static List<SyntaxTree.Node> caseBodyNodes(SyntaxTree.Node c) {
+    List<SyntaxTree.Node> kids = nonWhitespaceChildren(c);
+    List<SyntaxTree.Node> out = new ArrayList<>();
+    boolean skipLabel = !isDefaultCase(c); // 非 default：首个非关键字子节点是标签表达式，跳过
+    for (SyntaxTree.Node k : kids) {
+      if (isCaseKeyword(k.kind)) continue;
+      if (skipLabel) { skipLabel = false; continue; }
+      out.add(k);
+    }
+    return out;
+  }
+
+  private static boolean isCaseKeyword(String kind) {
+    return kind.equals("DEFAULT") || kind.equals("DEFAULT_CASE_LABEL")
+        || kind.equals("CASE") || kind.equals("CASE_LABEL")
+        || kind.equals("CONSTANT_CASE_LABEL");
+  }
+
+
+
 
 
   private void pushBranchScope() {
