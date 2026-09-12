@@ -215,6 +215,16 @@ public final class GraphExtractor {
     final List<Join> pendingJoins = new ArrayList<>();
     EventRef startFrom = null; // event this block continues from (enclosing chain's last event)
     /**
+     * 隐式体块在"方法体真正开始"前为 false：期间不接收任何入链事件。
+     * 方法节点下、方法体之前的子节点（`@Throws(IOException::class)` 这类**注解**、修饰符、名字、
+     * 形参表、返回类型）会先被 walk 到，若此时就入链，注解里的字面量会成为方法入口的目标——
+     * 而它通常没有后继，于是 `Method-[:NEXT]->注解字面量` 成了一条死边，真正的函数体链反而从
+     * 方法入口接不上（okhttp 实测 392 条这种入口边，如 `CallServerInterceptor.intercept` 指向
+     * @Throws 的 "IOException::class"）。老实现因方法体前 blockStack 为空而天然不入链，
+     * 改用隐式体块后需要这个闸门保持同样的边界。激活点见 walk() 里"最后一个子节点=方法体"处。
+     */
+    boolean active = true;
+    /**
      * 本块是否已由 abrupt 语句（return/throw）终止。终止后块内后续事件不可达，
      * 且本块的链尾不得作为"续接末端"泄漏到父块的下一个事件——否则会连出
      * "return/throw → 之后不可达的代码"这种假边。
@@ -334,6 +344,8 @@ public final class GraphExtractor {
     // 在遍历到子节点时补链，整体连通。
     BlockBuilder b = blockStack.peek();
     if (b == null) return;
+    // 隐式体块尚未激活（方法体还没开始）：方法头部的子节点（注解/修饰符/名/形参/返回类型）不入链。
+    if (!b.active) return;
     // 本块已因 abrupt 语句终止：其后同块事件不可达，不再续接。
     // 槽自身入链时 abruptTail 尚为 false（标记发生在该子语句 walk 完之后），故它仍正常入链成为链尾。
     if (b.abruptTail) return;
@@ -628,6 +640,14 @@ public final class GraphExtractor {
       List<SyntaxTree.Node> children = node.children;
       boolean seq = isStatementSequence(node.kind);
       for (int i = 0; i < children.size(); i++) {
+        // 方法体 = 方法节点的**最后一个**子节点（块体是 BLOCK；Kotlin 表达式体 `fun f() = expr`
+        // 就是那个 expr）。走到它即方法体开始 → 激活隐式体块，此后事件才入链。
+        // 头部的子节点（`@Throws(IOException::class)` 注解、修饰符、名字、形参表、返回类型）在此之前
+        // 走过，此时块未激活、不入链——否则注解里的字面量会抢走"方法体首事件"的位置，
+        // 而它没有后继，于是入口边成死边、函数体链从 Method 接不上（okhttp 实测 392 条）。
+        if (isMethodKind(node.kind) && i == children.size() - 1 && !implicitBodies.isEmpty()) {
+          implicitBodies.peek().active = true;
+        }
         walk(file, children.get(i), node, i);
         // 语句级终止：语句序列(块体)里一旦走过一条必然 abrupt 的直接子语句（return/throw 语句），
         // 其后同块语句即不可达——立刻标记本块，使后续事件不再续接（含 RETURN/THROW 槽 → 后续代码）。
@@ -1598,6 +1618,9 @@ public final class GraphExtractor {
     // 不再物化 kind=METHOD 的"根条件"假节点、不建 ROOT 边（见字段注释）。
     // conds 是"当前条件作用域"栈：方法体顶层不属于任何条件，故不压栈（栈空即"无当前条件"）。
     BlockBuilder body = new BlockBuilder();
+    // 出生即休眠：方法头部的子节点（注解/修饰符/名/形参/返回类型）在方法体之前被 walk 到，
+    // 此时不得入链，否则注解里的字面量会抢走"方法体首事件"的位置（见 walk 里激活处）。
+    body.active = false;
     if (hasSymbol) {
       body.startFrom = new EventRef(declId(project, file, symbol), GraphModel.LABEL_METHOD);
     }
