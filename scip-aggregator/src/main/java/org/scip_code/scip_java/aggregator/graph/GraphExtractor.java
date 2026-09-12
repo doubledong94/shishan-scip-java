@@ -116,6 +116,14 @@ public final class GraphExtractor {
   private final Deque<Scope> scopeStack = new ArrayDeque<>();
   // Runtime ids that are assignment targets (writes).
   private final java.util.Set<String> writeRuntimeIds = new java.util.HashSet<>();
+  /**
+   * abrupt 出口槽（return/throw）的运行时 id。这些节点是链的<b>末端</b>：控制流在此离开，
+   * 故任何 NEXT 都不得<b>从</b>它们出发（`return/throw → 后续代码` 恒为假边）。
+   * 用全局集合而非块级标记，因槽可能经多条路径被后续事件续接——块尾汇合、延迟局部写冲排、
+   * 分支 join 等；只要在唯一的 NEXT 出口处统一拦截，即可覆盖全部路径。
+   * 入边不受影响（…→x 读→RETURN 仍正常）。
+   */
+  private final java.util.Set<String> abruptSlotIds = new java.util.HashSet<>();
   // 赋值/声明的"写"延迟到 RHS 求值后再入链：`x = <跨行 RHS>`(如 when/if 表达式)的写要等整个 RHS
   // 求值完才能作为"写"入链，否则会把写排到 RHS 读之前(先写后读)。记录每个写对应的 flush 行 =
   // 赋值语句末行，emitReferenceValues 用它冲排(缺省回退 LHS 行)。
@@ -192,6 +200,13 @@ public final class GraphExtractor {
     final List<EventRef> events = new ArrayList<>();
     final List<Join> pendingJoins = new ArrayList<>();
     EventRef startFrom = null; // event this block continues from (enclosing chain's last event)
+    /**
+     * 本块是否已由 abrupt 语句（return/throw）终止。终止后块内后续事件不可达，
+     * 且本块的链尾不得作为"续接末端"泄漏到父块的下一个事件——否则会连出
+     * "return/throw → 之后不可达的代码"这种假边。
+     */
+    /** 本块链尾若为 abrupt 槽（return/throw），不得作为续接末端泄漏给父块（见 finish()）。 */
+    boolean abruptTail = false;
 
     EventRef lastEvent() {
       return events.isEmpty() ? null : events.get(events.size() - 1);
@@ -204,6 +219,12 @@ public final class GraphExtractor {
       // 真正的续接末端；此时 lastEvent 往往是被 fork 后遗留的分叉条件自身，不应作为末端泄漏到
       // 父块的下一个事件(否则有 else 兜底的 if 会额外连一条"条件→下一事件")。无 else 的 if
       // 由 walkConditionChildren 的 cond-as-join 把条件也放入 pendingJoin，其 fall-through 不受影响。
+      // 链尾是 abrupt 槽（return/throw）时，控制流已离开本块，不续接父块下一事件。
+      // 这使"分支在此结束"成立：不会连出 `return/throw → 之后不可达的代码`。
+      if (ends.isEmpty() && abruptTail) {
+        pendingJoins.clear();
+        return ends;
+      }
       if (ends.isEmpty()) {
         EventRef last = lastEvent();
         if (last != null) {
@@ -252,6 +273,8 @@ public final class GraphExtractor {
   // RETURN 的链入延迟到其子节点(返回值)读取之后(在 exit 时才入链)：`return x` 先读 x 再返回，故
   // 链序应为 …→x 读→RETURN，而非 RETUREN→x(当前 enter 时即入链导致 NEXT 方向反了)。
   private final Deque<String> pendingReturnChains = new ArrayDeque<>();
+  // THROW 同 RETURN：延迟到抛出表达式读取之后入链（`throw new E()` → …→E 读→THROW）。
+  private final Deque<String> pendingThrowChains = new ArrayDeque<>();
   // 赋值/声明的"写"延迟到 RHS 读之后再入链：`x = rhs` / `val x = rhs` 执行顺序是"先求值 RHS（读），
   // 再写 LHS"。Write 在遍历 LHS（或声明）时最先遇到，若立刻入链会把写排到 RHS 读之前。
   // 用"行"作语句边界：同一行内的写先挂着，待链推进到下一行（该语句的 RHS 读及之后的语句）再统一入链。
@@ -297,14 +320,19 @@ public final class GraphExtractor {
     // 在遍历到子节点时补链，整体连通。
     BlockBuilder b = blockStack.peek();
     if (b == null) return;
+    // 本块已因 abrupt 语句终止：其后同块事件不可达，不再续接。
+    // 槽自身入链时 abruptTail 尚为 false（标记发生在该子语句 walk 完之后），故它仍正常入链成为链尾。
+    if (b.abruptTail) return;
     boolean hasJoins = !b.pendingJoins.isEmpty();
     for (Join j : b.pendingJoins) {
+      // abrupt 槽不作为任何 NEXT 的起点（控制流已离开）；见 abruptSlotIds。
+      if (abruptSlotIds.contains(j.id)) continue;
       writer.addEdge(GraphModel.REL_NEXT, j.label, j.id, label, id, j.props);
     }
     b.pendingJoins.clear();
     EventRef prev = b.lastEvent();
     if (prev != null) {
-      if (!hasJoins && !prev.id.equals(id)) {
+      if (!hasJoins && !prev.id.equals(id) && !abruptSlotIds.contains(prev.id)) {
         writer.addEdge(GraphModel.REL_NEXT, prev.label, prev.id, label, id);
       }
     } else if (b.startFrom != null) {
@@ -584,8 +612,16 @@ public final class GraphExtractor {
       walkConditionChildren(file, node);
     } else {
       List<SyntaxTree.Node> children = node.children;
+      boolean seq = isStatementSequence(node.kind);
       for (int i = 0; i < children.size(); i++) {
         walk(file, children.get(i), node, i);
+        // 语句级终止：语句序列(块体)里一旦走过一条必然 abrupt 的直接子语句（return/throw 语句），
+        // 其后同块语句即不可达——立刻标记本块，使后续事件不再续接（含 RETURN/THROW 槽 → 后续代码）。
+        // 判定只看"直接子语句"这一层，不深入条件分支/表达式，故 `if (c) return;`（条件为假时仍继续）
+        // 与 `val x = y ?: throw …`（throw 嵌在 elvis 里，该声明语句本身正常完成）都不会误判。
+        if (seq && isAbruptStatementNode(children.get(i)) && !blockStack.isEmpty()) {
+          blockStack.peek().abruptTail = true;
+        }
       }
     }
     exit(file, node);
@@ -647,6 +683,7 @@ public final class GraphExtractor {
       // 使循环再次执行时从条件求值进入。
       String loopEventId = loopConditionEventId(file, node);
       for (Join j : parent.pendingJoins) {
+        if (abruptSlotIds.contains(j.id)) continue; // 循环体以 return/throw 结尾：不回边
         if (loopEventId != null) {
           writer.addEdge(GraphModel.REL_NEXT, j.label, j.id, GraphModel.LABEL_VALUE, loopEventId);
         } else {
@@ -1111,6 +1148,7 @@ public final class GraphExtractor {
         if (nextHead == null || nextHead.id == null) continue;
         List<Join> tail = caseTails.get(i);
         for (Join j : tail) {
+          if (abruptSlotIds.contains(j.id)) continue; // case 体以 return/throw 结尾：不坠落
           writer.addEdge(GraphModel.REL_NEXT, j.label, j.id, nextHead.label, nextHead.id);
         }
         swBlock.pendingJoins.removeAll(tail); // 该分支尾已坠入下一 case，不再汇入 switch 之后
@@ -1363,6 +1401,9 @@ public final class GraphExtractor {
     if (isReturnKind(node.kind)) {
       handleReturn(file, node);
     }
+    if (isThrowKind(node.kind)) {
+      handleThrow(file, node);
+    }
 
     emitReferenceValues(file, node);
     emitLiteralIfAny(file, node); // 字面量是树里的节点(非 occurrence)，单独建 LITERAL 节点
@@ -1457,6 +1498,10 @@ public final class GraphExtractor {
     // RETURN exit: 在返回值读取之后把 RETURN 入链(…→x 读→RETURN)，修复 NEXT 方向颠倒。
     if (isReturnKind(node.kind) && !pendingReturnChains.isEmpty()) {
       appendChainEvent(file, pendingReturnChains.pop(), GraphModel.LABEL_VALUE, rangeLine(node));
+    }
+    // THROW 同 RETURN：在抛出表达式读取之后把 THROW 入链（…→new E() 读→THROW）。
+    if (isThrowKind(node.kind) && !pendingThrowChains.isEmpty()) {
+      appendChainEvent(file, pendingThrowChains.pop(), GraphModel.LABEL_VALUE, rangeLine(node));
     }
   }
 
@@ -1885,6 +1930,7 @@ public final class GraphExtractor {
     // Always create a return slot (even for `return;`), so the order chain has an explicit exit
     // event and the cross-function exit is precise.
     String returnId = runtimeId(project, file, node.range, GraphModel.VALUE_KIND_RETURN);
+    abruptSlotIds.add(returnId);
     SyntaxTree.OccurrenceData valueOcc = null;
     List<SyntaxTree.Node> operands = nonWhitespaceChildren(node);
     if (!operands.isEmpty()) {
@@ -1913,6 +1959,46 @@ public final class GraphExtractor {
     if (methodSymbol != null && !methodSymbol.isEmpty()) {
       returnsByMethod.computeIfAbsent(methodSymbol, k -> new ArrayList<>()).add(returnId);
     }
+  }
+
+  /**
+   * {@code throw}：与 {@link #handleReturn} 对称——非正常出口，同样终止本块。
+   *
+   * <p>建 THROW 槽节点（即使 `throw;` 不合法，`throw new E()` 也总有一个操作数），
+   * 延迟到抛出表达式读取之后入链（`…→ new E() 读 → THROW`），与 RETURN 的 `…→x 读→RETURN` 一致。
+   * 槽的 symbol 记为抛出表达式的符号，便于回溯"抛的是什么"。
+   *
+   * <p>与 return 的差别：throw 不写 returnsByMethod（它不是"返回"），但仍标记 hasReturn，
+   * 因为对数据流合并而言它同样是"该分支未正常落到后续代码"。
+   */
+  private void handleThrow(String file, SyntaxTree.Node node) {
+    Scope cur = currentScope();
+    if (cur != null) cur.hasReturn = true;
+    String throwId = runtimeId(project, file, node.range, GraphModel.VALUE_KIND_THROW);
+    abruptSlotIds.add(throwId);
+    SyntaxTree.OccurrenceData valueOcc = null;
+    List<SyntaxTree.Node> operands = nonWhitespaceChildren(node);
+    if (!operands.isEmpty()) {
+      valueOcc = firstValueReference(operands.get(operands.size() - 1));
+    }
+    Map<String, Object> props = new LinkedHashMap<>();
+    props.put("name", "throw");
+    props.put("symbol", valueOcc != null ? valueOcc.symbol : "");
+    props.put("file", file);
+    props.put("line", rangeLine(node));
+    props.put("col", rangeCol(node));
+    props.put("colEnd", rangeColEnd(node));
+    props.put("kind", GraphModel.VALUE_KIND_THROW);
+    props.put("access", "write");
+    writer.addNode(GraphModel.LABEL_VALUE, throwId, props);
+    if (valueOcc != null) {
+      String valueId = firstValueRuntimeId(file, operands.get(operands.size() - 1));
+      if (valueId != null && !valueId.equals(throwId)) {
+        writer.addEdge(GraphModel.REL_FLOWS, GraphModel.LABEL_VALUE, valueId, GraphModel.LABEL_VALUE, throwId);
+      }
+    }
+    // 与 RETURN 同样延迟到操作数读取之后入链（exit 时 flush）。
+    pendingThrowChains.push(throwId);
   }
 
   // ---------------------------------------------------------------------------
@@ -2282,6 +2368,66 @@ public final class GraphExtractor {
 
   private static boolean isReturnKind(String kind) {
     return kind.equals("RETURN");
+  }
+
+  private static boolean isThrowKind(String kind) {
+    return kind.equals("THROW");
+  }
+
+  /** 该节点是否是"语句序列"（其 children 是同级语句，末条 abrupt 即后续不可达）。 */
+  private static boolean isStatementSequence(String kind) {
+    return isKind(kind, "BLOCK", "CLASS_BODY", "BODY", "FILE", "COMPILATION_UNIT")
+        || isMethodKind(kind);
+  }
+
+  /**
+   * 语句序列的<b>末条</b>语句是否必然 abrupt 地离开（return/throw 语句）。
+   *
+   * <p>刻意只认"裸的、或仅由语句包装层包裹的" return/throw——即该语句本身无条件离开。
+   * 以下都<b>不</b>算：
+   * <ul>
+   *   <li>{@code if (c) return;} / 循环 / when —— 条件分支，条件不成立时仍会继续；
+   *   <li>表达式里的 throw（如 {@code val x = y ?: throw …}）—— 该语句整体是"声明/赋值"，
+   *       不是"抛出语句"；按其语义该变量仍被声明、后续语句可达。
+   * </ul>
+   * 故判定只看"直接子语句"这一层，且遇到条件/循环/表达式即停，不深入下潜。
+   */
+  private static boolean hasAbruptStatement(List<SyntaxTree.Node> children) {
+    for (SyntaxTree.Node n : nonWhitespaceChildren(children)) {
+      if (isAbruptStatementNode(n)) return true;
+    }
+    return false;
+  }
+
+  /** 该语句节点是否就是一条 return/throw 语句（允许透过语句包装层，但不深入条件/表达式）。 */
+  private static boolean isAbruptStatementNode(SyntaxTree.Node n) {
+    if (n == null) return false;
+    if (isReturnKind(n.kind) || isThrowKind(n.kind)) return true;
+    // 条件/循环/switch/when：可能有不进入分支的路径，不算必然离开。
+    if (isConditionKind(n.kind) || isLoopKind(n.kind)) return false;
+    // 语句包装层（如 javac 的 EXPRESSION_STATEMENT 包 BREAK 那类）：其子若恰为单条语句则透传。
+    // 只透传"语句容器"，不透传表达式——表达式里的 throw（elvis 等）不属于抛出语句。
+    if (isStatementWrapper(n.kind)) {
+      List<SyntaxTree.Node> kids = nonWhitespaceChildren(n);
+      return kids.size() == 1 && isAbruptStatementNode(kids.get(0));
+    }
+    return false;
+  }
+
+  /** 仅包裹一条语句的包装节点（可透传其子以判定 abrupt）。 */
+  private static boolean isStatementWrapper(String kind) {
+    return kind.equals("LABELED_STATEMENT") || kind.equals("EXPRESSION_STATEMENT");
+  }
+
+  /** nonWhitespaceChildren 的列表重载。 */
+  private static List<SyntaxTree.Node> nonWhitespaceChildren(List<SyntaxTree.Node> nodes) {
+    List<SyntaxTree.Node> out = new ArrayList<>();
+    for (SyntaxTree.Node n : nodes) {
+      if (n == null) continue;
+      if (n.kind == null || n.kind.isEmpty() || n.kind.equals("WHITE_SPACE")) continue;
+      out.add(n);
+    }
+    return out;
   }
 
   private static boolean isAssignment(SyntaxTree.Node node) {

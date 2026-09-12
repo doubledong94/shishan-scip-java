@@ -46,6 +46,8 @@ public final class GraphModel {
   // Value kinds (mirror the old viewer's KEY_TYPE_* concepts, subset relevant to the indexer).
   public static final String VALUE_KIND_PARAM = "PARAM";
   public static final String VALUE_KIND_RETURN = "RETURN";
+  /** 抛出点槽（与 RETURN 对称：显式终止事件，非正常出口）。symbol=抛出的异常类型（可空）。 */
+  public static final String VALUE_KIND_THROW = "THROW";
   public static final String VALUE_KIND_FIELD = "FIELD";
   public static final String VALUE_KIND_LOCAL_VAR = "LOCAL_VAR";
   public static final String VALUE_KIND_CALLED_PARAM = "CALLED_PARAM";

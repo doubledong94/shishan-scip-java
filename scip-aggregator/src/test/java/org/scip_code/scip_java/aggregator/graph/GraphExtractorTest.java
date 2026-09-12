@@ -2646,6 +2646,142 @@ class GraphExtractorTest {
         "val x = ... declaration is still on the NEXT chain (guard against over-fixing)");
   }
 
+  /** 造 `void m() { <mBody> }` 并返回 sink（mBody 由调用方填充）。 */
+  private static MemorySink runBody(java.util.function.Consumer<SyntaxTree.Node> buildMbody) {
+    SyntaxTree.Node cu = node("COMPILATION_UNIT", 0);
+    SyntaxTree.Node cls = node("CLASS", 1, def("pkg/A#", "IdentifierType", 1));
+    SyntaxTree.Node m = node("METHOD", 2, def("pkg/A#m().", "IdentifierFunctionDefinition", 2));
+    SyntaxTree.Node mBody = node("BLOCK", 3);
+    buildMbody.accept(mBody);
+    m.children.add(mBody);
+    cls.children.add(m);
+    cu.children.add(cls);
+    Map<String, SymbolInformation> symbols = new LinkedHashMap<>();
+    symbols.put("pkg/A#", info(SymbolInformation.Kind.Class, "A"));
+    symbols.put("pkg/A#m().", info(SymbolInformation.Kind.Method, "m"));
+    for (String f : new String[] {"e0.", "x.", "E.", "z.", "y."}) {
+      symbols.put("pkg/A#" + f, info(SymbolInformation.Kind.Field, f));
+    }
+    MemorySink sink = new MemorySink();
+    GraphExtractor extractor = new GraphExtractor(sink, "test", symbols);
+    extractor.extractFile("Foo.java", cu);
+    extractor.emitRelationships();
+    return sink;
+  }
+
+  private static boolean hasNext(MemorySink sink, String from, String to) {
+    return edgesOf(sink, GraphModel.REL_NEXT).stream()
+        .anyMatch(e -> from.equals(e.get("_from")) && to.equals(e.get("_to")));
+  }
+
+  @Test
+  void throwTerminatesBranchAndGetsSlotNode() {
+    // void m() { e0; if (x) { throw new E(); } z; }
+    // throw 是非正常出口：应与 return 对称——有 THROW 槽节点，且其后同分支代码不可达。
+    MemorySink sink =
+        runBody(
+            mb -> {
+              mb.children.add(node("IDENTIFIER", 9, ref("pkg/A#e0.", "IdentifierConstant", 9)));
+              SyntaxTree.Node iff = node("IF", 10);
+              iff.children.add(node("IDENTIFIER", 10, ref("pkg/A#x.", "IdentifierConstant", 10)));
+              SyntaxTree.Node then = node("BLOCK", 11);
+              SyntaxTree.Node thr = node("THROW", 12);
+              thr.children.add(node("IDENTIFIER", 12, ref("pkg/A#E.", "IdentifierConstant", 12)));
+              then.children.add(thr);
+              iff.children.add(then);
+              mb.children.add(iff);
+              mb.children.add(node("IDENTIFIER", 20, ref("pkg/A#z.", "IdentifierConstant", 20)));
+            });
+
+    // 1) THROW 槽节点存在，且抛出表达式读取在其之前入链（…→E 读→THROW）。
+    List<Map<String, Object>> throwsNodes =
+        nodesOf(sink, GraphModel.LABEL_VALUE).stream()
+            .filter(v -> GraphModel.VALUE_KIND_THROW.equals(v.get("kind")))
+            .toList();
+    assertEquals(1, throwsNodes.size(), "throw slot node exists");
+    String throwId = (String) throwsNodes.get(0).get("_id");
+    String eRead = "test::Foo.java#12:0:FIELD";
+    assertTrue(hasNext(sink, eRead, throwId), "thrown expression read precedes the THROW slot");
+
+    // 2) throw 分支终止：其槽不再续接 switch/if 之后的不可达代码。
+    String z = "test::Foo.java#20:0:FIELD";
+    assertTrue(!hasNext(sink, throwId, z), "throw does not fall through to code after the branch");
+
+    // 3) 假路径仍可达（条件不真时正常落到 z）。
+    String cond = "test::Foo.java#10:0";
+    assertTrue(hasNext(sink, cond, z), "false path still reaches code after the branch");
+  }
+
+  @Test
+  void returnTerminatesBranchChain() {
+    // void m() { e0; return x; z; }  —— 同块内 return 之后的代码不可达。
+    MemorySink sink =
+        runBody(
+            mb -> {
+              mb.children.add(node("IDENTIFIER", 9, ref("pkg/A#e0.", "IdentifierConstant", 9)));
+              SyntaxTree.Node ret = node("RETURN", 12);
+              ret.children.add(node("IDENTIFIER", 12, ref("pkg/A#E.", "IdentifierConstant", 12)));
+              mb.children.add(ret);
+              mb.children.add(node("IDENTIFIER", 20, ref("pkg/A#z.", "IdentifierConstant", 20)));
+            });
+
+    String retId = "test::Foo.java#12:0:RETURN";
+    String z = "test::Foo.java#20:0:FIELD";
+    assertTrue(hasNext(sink, "test::Foo.java#12:0:FIELD", retId), "returned value read precedes RETURN");
+    assertTrue(!hasNext(sink, retId, z), "return does not chain to unreachable code in the same block");
+  }
+
+  @Test
+  void throwInOneBranchDoesNotBlockOtherBranchFallThrough() {
+    // void m() { if (c) { x; } else { throw new E(); } y; }
+    // else 分支终止，但其终止不得影响 then 分支正常落到 y。
+    MemorySink sink =
+        runBody(
+            mb -> {
+              SyntaxTree.Node iff = node("IF", 10);
+              iff.children.add(node("IDENTIFIER", 10, ref("pkg/A#x.", "IdentifierConstant", 10)));
+              SyntaxTree.Node then = node("BLOCK", 11);
+              then.children.add(node("IDENTIFIER", 11, ref("pkg/A#x.", "IdentifierConstant", 11)));
+              SyntaxTree.Node els = node("BLOCK", 13);
+              SyntaxTree.Node thr = node("THROW", 14);
+              thr.children.add(node("IDENTIFIER", 14, ref("pkg/A#E.", "IdentifierConstant", 14)));
+              els.children.add(thr);
+              iff.children.add(then);
+              iff.children.add(els);
+              mb.children.add(iff);
+              mb.children.add(node("IDENTIFIER", 20, ref("pkg/A#y.", "IdentifierConstant", 20)));
+            });
+
+    String xRead = "test::Foo.java#11:0:FIELD";
+    String y = "test::Foo.java#20:0:FIELD";
+    String throwId = "test::Foo.java#14:0:THROW";
+    assertTrue(hasNext(sink, xRead, y), "non-throwing branch still falls through to code after the if");
+    assertTrue(!hasNext(sink, throwId, y), "throwing branch does not fall through");
+  }
+
+  @Test
+  void conditionalAbruptDoesNotTerminateEnclosingBlock() {
+    // void m() { e0; if (c) return; z; }
+    // `if (c) return;`（无大括号）的 return 是外层块的子节点，但只在分支作用域里执行：
+    // 条件为假时仍会落到 z。故它不得终止外层块——否则 `cond --false--> z` 这条路径会丢。
+    MemorySink sink =
+        runBody(
+            mb -> {
+              mb.children.add(node("IDENTIFIER", 9, ref("pkg/A#e0.", "IdentifierConstant", 9)));
+              SyntaxTree.Node iff = node("IF", 10);
+              iff.children.add(node("IDENTIFIER", 10, ref("pkg/A#x.", "IdentifierConstant", 10)));
+              SyntaxTree.Node ret = node("RETURN", 11);
+              ret.children.add(node("IDENTIFIER", 11, ref("pkg/A#E.", "IdentifierConstant", 11)));
+              iff.children.add(ret); // then 分支是裸语句（无 BLOCK），与外层同块
+              mb.children.add(iff);
+              mb.children.add(node("IDENTIFIER", 20, ref("pkg/A#z.", "IdentifierConstant", 20)));
+            });
+
+    String cond = "test::Foo.java#10:0";
+    String z = "test::Foo.java#20:0:FIELD";
+    assertTrue(hasNext(sink, cond, z), "conditional return leaves the false path to later code");
+  }
+
   @Test
   void localParameterReadsUseSourceNameNotBareNumber() {
     // Kotlin 的 lambda 形参 / catch 参数都是 IdentifierParameter，但符号是 per-file 的 `local N`。
