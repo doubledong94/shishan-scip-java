@@ -412,10 +412,17 @@ public class ScipAggregator {
    * Builds {@code overridden-symbol → [overriding-symbols]} for every method-style relationship.
    * Class/interface parent relationships are excluded because they shouldn't surface as
    * find-references results (TODO: drop once sourcegraph#50927 is fixed).
+   *
+   * <p><b>图模式（{@code NEO4J_URI} 已配置）下恒不生成</b>：这批边是给 Sourcegraph 的
+   * find-references/find-implementations 用的反向补丁，在图谱里是纯污染——它给<b>每个</b>被覆写
+   * 的接口方法都补一条指向各实现方法的 {@code is_implementation}，使得图谱里同名方法的
+   * {@code OVERRIDES} 成对出现（实测 okhttp：1363 条里 678 对双向），无界 {@code OVERRIDES*}
+   * 会在两节点间来回弹而挂死。图谱本就按 {@code EXTENDS} 的类层级给方法边定向，不需要这一层反边。
    */
   private Map<String, List<String>> computeInverseReferences(
       List<Path> shards, SymbolRewriter rewriter) {
     if (!options.emitInverseRelationships()) return Collections.emptyMap();
+    if (Neo4jGraphConfig.fromEnv().enabled) return Collections.emptyMap();
     Map<String, List<String>> result = new HashMap<>();
     for (Path shard : shards) {
       for (Index shardIndex : readShards(shard)) {
